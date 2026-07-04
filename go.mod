@@ -1,4 +1,4 @@
-module github.com/looprig/e2e
+module github.com/looprig/tests
 
 go 1.26.4
 
