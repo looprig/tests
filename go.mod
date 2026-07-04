@@ -5,7 +5,7 @@ go 1.26.4
 require (
 	github.com/looprig/core v0.1.0
 	github.com/looprig/fsstore v0.1.0
-	github.com/looprig/harness v0.5.0
+	github.com/looprig/harness v0.5.1
 	github.com/looprig/inference v0.1.0
 )
 
