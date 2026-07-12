@@ -1,12 +1,12 @@
 .PHONY: test fmt-check vet check
 
 test:
-	GOWORK=off go test -race ./...
+	GOWORK=off go test -tags integration -race ./...
 
 fmt-check:
 	@test -z "$$(gofmt -l .)" || (gofmt -l . && exit 1)
 
 vet:
-	GOWORK=off go vet ./...
+	GOWORK=off go vet -tags integration ./...
 
 check: fmt-check vet test

@@ -9,7 +9,11 @@ require (
 	github.com/looprig/inference v0.1.0
 )
 
-require github.com/looprig/storage v0.1.0 // indirect
+require (
+	github.com/looprig/storage v0.1.0
+	golang.org/x/net v0.55.0 // indirect
+	golang.org/x/text v0.37.0 // indirect
+)
 
 replace github.com/looprig/core => ../core
 
