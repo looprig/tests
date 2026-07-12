@@ -57,6 +57,7 @@ func TestRigLifecycleAcrossFreshFSStore(t *testing.T) {
 	if err := waitIdle(ctx, sess); err != nil {
 		t.Fatalf("WaitIdle: %v", err)
 	}
+	assertPrimerTurnDone(t, eventsFor(t, stores.sessions, id), ids["planner"], ids["builder"])
 	builder, ok := sess.LoopController(ids["builder"])
 	if !ok {
 		t.Fatal("builder controller missing")
@@ -81,7 +82,8 @@ func TestRigLifecycleAcrossFreshFSStore(t *testing.T) {
 		t.Fatal("fresh leg reused process-local store state")
 	}
 	baseTwo := filepath.Join(t.TempDir(), "workspaces-two")
-	freshRig := defineSessionRig(t, freshStores, baseTwo, true, rig.SnapshotPolicy{Trigger: rig.SnapshotOnIdle, Priority: rig.SnapshotRequired})
+	freshInference := &recordingLLM{}
+	freshRig := defineSessionRigWithClient(t, freshStores, baseTwo, true, rig.SnapshotPolicy{Trigger: rig.SnapshotOnIdle, Priority: rig.SnapshotRequired}, freshInference)
 	restored, err := freshRig.RestoreSession(ctx, id)
 	if err != nil {
 		t.Fatalf("RestoreSession: %v", err)
@@ -105,16 +107,21 @@ func TestRigLifecycleAcrossFreshFSStore(t *testing.T) {
 	if latestCheckpoint(t, eventsFor(t, freshStores.sessions, id)).Ref != checkpoint.Ref {
 		t.Fatal("restore changed journal-authoritative checkpoint")
 	}
-	if _, err := restored.Submit(ctx, textBlock("continue")); err != nil {
+	if _, err := restored.SubmitToLoop(ctx, ids["planner"], textBlock("plan-continue")); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := restored.SubmitToLoop(ctx, ids["builder"], textBlock("build-continue")); err != nil {
 		t.Fatal(err)
 	}
 	waitEvent[event.WorkspaceCheckpointed](t, ctx, restoredSub)
 	if err := waitIdle(ctx, restored); err != nil {
 		t.Fatal(err)
 	}
-	if got := countEvents[event.TurnDone](eventsFor(t, freshStores.sessions, id)); got != turnsBefore+1 {
-		t.Fatalf("TurnDone count = %d, want %d", got, turnsBefore+1)
+	if got := countEvents[event.TurnDone](eventsFor(t, freshStores.sessions, id)); got != turnsBefore+2 {
+		t.Fatalf("TurnDone count = %d, want %d", got, turnsBefore+2)
 	}
+	assertCapturedHistory(t, freshInference, "planner", "user:plan", "assistant:done", "user:plan-continue")
+	assertCapturedHistory(t, freshInference, "builder-routed", "user:build", "assistant:done", "user:build-continue")
 }
 
 func TestRigSeededSessionsDivergeAndRestoreJournalAuthoritativeTrees(t *testing.T) {
@@ -141,10 +148,26 @@ func TestRigSeededSessionsDivergeAndRestoreJournalAuthoritativeTrees(t *testing.
 	}
 	rootOne := filepath.Join(canonical(t, baseOne), one.SessionID().String())
 	rootTwo := filepath.Join(canonical(t, baseOne), two.SessionID().String())
-	if err := os.WriteFile(filepath.Join(rootOne, "branch.txt"), []byte("one\n"), 0o600); err != nil {
+	if err := os.WriteFile(filepath.Join(rootOne, "branch.txt"), []byte("one-intermediate\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(rootOne, "intermediate-only.txt"), []byte("remove me\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	if err := os.WriteFile(filepath.Join(rootTwo, "branch.txt"), []byte("two\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	oneIntermediateRef, err := one.CheckpointWorkspace(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Remove(filepath.Join(rootOne, "intermediate-only.txt")); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(rootOne, "branch.txt"), []byte("one-latest\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(rootOne, "latest-only.txt"), []byte("keep me\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	oneRef, err := one.CheckpointWorkspace(ctx)
@@ -155,9 +178,18 @@ func TestRigSeededSessionsDivergeAndRestoreJournalAuthoritativeTrees(t *testing.
 	if err != nil {
 		t.Fatal(err)
 	}
-	if oneRef == twoRef || oneRef == seedRef || twoRef == seedRef {
-		t.Fatalf("refs seed=%s one=%s two=%s", seedRef, oneRef, twoRef)
+	if oneIntermediateRef == oneRef || oneRef == twoRef || oneRef == seedRef || twoRef == seedRef {
+		t.Fatalf("refs seed=%s one-intermediate=%s one-latest=%s two=%s", seedRef, oneIntermediateRef, oneRef, twoRef)
 	}
+	assertCheckpointSequence(t, eventsFor(t, stores.sessions, one.SessionID()),
+		checkpointWant{Ref: seedRef, Trigger: event.SnapshotTriggerSeed},
+		checkpointWant{Ref: oneIntermediateRef, Trigger: event.SnapshotTriggerManual},
+		checkpointWant{Ref: oneRef, Trigger: event.SnapshotTriggerManual},
+	)
+	assertCheckpointSequence(t, eventsFor(t, stores.sessions, two.SessionID()),
+		checkpointWant{Ref: seedRef, Trigger: event.SnapshotTriggerSeed},
+		checkpointWant{Ref: twoRef, Trigger: event.SnapshotTriggerManual},
+	)
 	oneID, twoID := one.SessionID(), two.SessionID()
 	if err := one.Shutdown(ctx); err != nil {
 		t.Fatal(err)
@@ -188,8 +220,14 @@ func TestRigSeededSessionsDivergeAndRestoreJournalAuthoritativeTrees(t *testing.
 	defer restoredTwo.Shutdown(context.Background())
 	freshOne := filepath.Join(canonical(t, baseTwo), oneID.String())
 	freshTwo := filepath.Join(canonical(t, baseTwo), twoID.String())
-	if body, err := os.ReadFile(filepath.Join(freshOne, "branch.txt")); err != nil || string(body) != "one\n" {
+	if body, err := os.ReadFile(filepath.Join(freshOne, "branch.txt")); err != nil || string(body) != "one-latest\n" {
 		t.Fatalf("one branch = %q err=%v", body, err)
+	}
+	if _, err := os.Stat(filepath.Join(freshOne, "intermediate-only.txt")); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("intermediate-only state survived latest restore: %v", err)
+	}
+	if body, err := os.ReadFile(filepath.Join(freshOne, "latest-only.txt")); err != nil || string(body) != "keep me\n" {
+		t.Fatalf("latest-only state = %q err=%v", body, err)
 	}
 	if body, err := os.ReadFile(filepath.Join(freshTwo, "branch.txt")); err != nil || string(body) != "two\n" {
 		t.Fatalf("two branch = %q err=%v", body, err)
@@ -258,7 +296,11 @@ func TestRigExclusiveRootContentionHandoffAndLoss(t *testing.T) {
 	if _, err := handoff.Submit(ctx, textBlock("running")); err != nil {
 		t.Fatal(err)
 	}
-	<-blocker.started
+	select {
+	case <-blocker.started:
+	case <-ctx.Done():
+		t.Fatalf("blocking inference did not start before lease loss: %v", ctx.Err())
+	}
 	if err := leaser.loseWorkspace(ctx); err != nil {
 		t.Fatal(err)
 	}

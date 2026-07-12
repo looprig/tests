@@ -74,6 +74,10 @@ func (deterministicLLM) Invoke(context.Context, inference.Request) (*inference.R
 }
 
 func (deterministicLLM) Stream(context.Context, inference.Request) (*inference.StreamReader[content.Chunk], error) {
+	return doneStream(), nil
+}
+
+func doneStream() *inference.StreamReader[content.Chunk] {
 	chunks := []content.Chunk{&content.TextChunk{Text: "done"}}
 	index := 0
 	return inference.NewStreamReader(func() (content.Chunk, error) {
@@ -83,7 +87,56 @@ func (deterministicLLM) Stream(context.Context, inference.Request) (*inference.S
 		chunk := chunks[index]
 		index++
 		return chunk, nil
-	}, nil), nil
+	}, nil)
+}
+
+type recordingLLM struct {
+	mu       sync.Mutex
+	requests map[string][][]string
+}
+
+func (*recordingLLM) Invoke(context.Context, inference.Request) (*inference.Response, error) {
+	return nil, errors.New("Invoke not used")
+}
+
+func (l *recordingLLM) Stream(_ context.Context, request inference.Request) (*inference.StreamReader[content.Chunk], error) {
+	history := make([]string, 0, len(request.Messages))
+	for _, message := range request.Messages {
+		history = append(history, conversationText(message))
+	}
+	l.mu.Lock()
+	if l.requests == nil {
+		l.requests = make(map[string][][]string)
+	}
+	l.requests[request.Model.Name] = append(l.requests[request.Model.Name], history)
+	l.mu.Unlock()
+	return doneStream(), nil
+}
+
+func conversationText(message content.Conversation) string {
+	var blocks []content.Block
+	var role content.Role
+	switch typed := message.(type) {
+	case *content.UserMessage:
+		blocks = typed.Blocks
+		role = typed.Role
+	case *content.AIMessage:
+		blocks = typed.Blocks
+		role = typed.Role
+	case *content.SystemMessage:
+		blocks = typed.Blocks
+		role = typed.Role
+	case *content.ToolResultMessage:
+		blocks = typed.Blocks
+		role = typed.Role
+	}
+	var result string
+	for _, block := range blocks {
+		if text, ok := block.(*content.TextBlock); ok {
+			result += text.Text
+		}
+	}
+	return string(role) + ":" + result
 }
 
 type blockingLLM struct {
@@ -114,9 +167,13 @@ func definition(t *testing.T, name string, client inference.Client) loop.Definit
 }
 
 func defineSessionRig(t *testing.T, stores fsStores, base string, allowMismatch bool, policy rig.SnapshotPolicy) *rig.Rig {
+	return defineSessionRigWithClient(t, stores, base, allowMismatch, policy, deterministicLLM{})
+}
+
+func defineSessionRigWithClient(t *testing.T, stores fsStores, base string, allowMismatch bool, policy rig.SnapshotPolicy, client inference.Client) *rig.Rig {
 	t.Helper()
 	opts := []rig.Option{
-		rig.WithLoops(definition(t, "planner", deterministicLLM{}), definition(t, "builder", deterministicLLM{})),
+		rig.WithLoops(definition(t, "planner", client), definition(t, "builder", client)),
 		rig.WithPrimers("planner", "builder"),
 		rig.WithActivePrimer("planner"),
 		rig.WithSessionStore(stores.sessions),
@@ -194,6 +251,52 @@ func countEvents[T event.Event](events []event.Event) int {
 	return count
 }
 
+func assertPrimerTurnDone(t *testing.T, events []event.Event, loopIDs ...uuid.UUID) {
+	t.Helper()
+	counts := make(map[uuid.UUID]int)
+	for _, ev := range events {
+		if done, ok := ev.(event.TurnDone); ok {
+			counts[done.LoopID]++
+		}
+	}
+	for _, loopID := range loopIDs {
+		if counts[loopID] != 1 {
+			t.Fatalf("loop %s durable TurnDone count = %d, want exactly 1", loopID, counts[loopID])
+		}
+	}
+}
+
+func assertCapturedHistory(t *testing.T, recorder *recordingLLM, model string, want ...string) {
+	t.Helper()
+	recorder.mu.Lock()
+	requests := append([][]string(nil), recorder.requests[model]...)
+	recorder.mu.Unlock()
+	if len(requests) != 1 {
+		t.Fatalf("model %q request count = %d, want 1; requests=%v", model, len(requests), requests)
+	}
+	if !reflect.DeepEqual(requests[0], want) {
+		t.Fatalf("model %q restored history = %v, want %v", model, requests[0], want)
+	}
+}
+
+type checkpointWant struct {
+	Ref     workspacestore.Ref
+	Trigger event.SnapshotTriggerKind
+}
+
+func assertCheckpointSequence(t *testing.T, events []event.Event, want ...checkpointWant) {
+	t.Helper()
+	var got []checkpointWant
+	for _, ev := range events {
+		if checkpoint, ok := ev.(event.WorkspaceCheckpointed); ok {
+			got = append(got, checkpointWant{Ref: workspacestore.Ref(checkpoint.Ref), Trigger: checkpoint.Trigger})
+		}
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("checkpoint sequence = %+v, want %+v", got, want)
+	}
+}
+
 func latestCheckpoint(t *testing.T, events []event.Event) event.WorkspaceCheckpointed {
 	t.Helper()
 	for i := len(events) - 1; i >= 0; i-- {
@@ -207,21 +310,20 @@ func latestCheckpoint(t *testing.T, events []event.Event) event.WorkspaceCheckpo
 
 func assertCleanRestore(t *testing.T, events []event.Event) {
 	t.Helper()
-	started, done := -1, -1
-	for i, ev := range events {
+	var lifecycle []string
+	for _, ev := range events {
 		switch ev.(type) {
 		case event.RestoreStarted:
-			started = i
+			lifecycle = append(lifecycle, "RestoreStarted")
 		case event.RestoreDone:
-			done = i
+			lifecycle = append(lifecycle, "RestoreDone")
 		case event.RestoreErrored:
-			if started >= 0 && i > started {
-				t.Fatalf("restore errored after RestoreStarted at journal index %d", i)
-			}
+			lifecycle = append(lifecycle, "RestoreErrored")
 		}
 	}
-	if started < 0 || done <= started {
-		t.Fatalf("clean restore boundary missing or misordered: started=%d done=%d", started, done)
+	want := []string{"RestoreStarted", "RestoreDone"}
+	if !reflect.DeepEqual(lifecycle, want) {
+		t.Fatalf("restore lifecycle tail = %v, want exact %v", lifecycle, want)
 	}
 }
 
