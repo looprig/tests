@@ -30,6 +30,7 @@ func TestRigLifecycleAcrossFreshFSStore(t *testing.T) {
 	baseOne := filepath.Join(t.TempDir(), "workspaces-one")
 	r := defineSessionRig(t, stores, baseOne, false, rig.SnapshotPolicy{Trigger: rig.SnapshotOnIdle, Priority: rig.SnapshotRequired})
 	sess, err := r.NewSession(ctx)
+	shutdownSess := registerSessionCleanup(t, sess)
 	if err != nil {
 		t.Fatalf("NewSession: %v", err)
 	}
@@ -39,7 +40,7 @@ func TestRigLifecycleAcrossFreshFSStore(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer sub.Close()
-	ids := primerIDs(t, stores.sessions, id)
+	ids := primerIDs(t, ctx, stores.sessions, id)
 	if len(ids) != 2 {
 		t.Fatalf("primer ids = %v", ids)
 	}
@@ -57,7 +58,7 @@ func TestRigLifecycleAcrossFreshFSStore(t *testing.T) {
 	if err := waitIdle(ctx, sess); err != nil {
 		t.Fatalf("WaitIdle: %v", err)
 	}
-	assertPrimerTurnDone(t, eventsFor(t, stores.sessions, id), ids["planner"], ids["builder"])
+	assertPrimerTurnDone(t, eventsFor(t, ctx, stores.sessions, id), ids["planner"], ids["builder"])
 	builder, ok := sess.LoopController(ids["builder"])
 	if !ok {
 		t.Fatal("builder controller missing")
@@ -68,8 +69,8 @@ func TestRigLifecycleAcrossFreshFSStore(t *testing.T) {
 	if err := sess.SetActiveLoop(ctx, ids["builder"]); err != nil {
 		t.Fatal(err)
 	}
-	turnsBefore := countEvents[event.TurnDone](eventsFor(t, stores.sessions, id))
-	if err := sess.Shutdown(ctx); err != nil {
+	turnsBefore := countEvents[event.TurnDone](eventsFor(t, ctx, stores.sessions, id))
+	if err := shutdownSess(ctx); err != nil {
 		t.Fatal(err)
 	}
 	if err := stores.fs.Close(); err != nil {
@@ -77,7 +78,6 @@ func TestRigLifecycleAcrossFreshFSStore(t *testing.T) {
 	}
 
 	freshStores := openFSStores(t, persistence)
-	defer freshStores.fs.Close()
 	if freshStores.fs == stores.fs || freshStores.sessions == stores.sessions {
 		t.Fatal("fresh leg reused process-local store state")
 	}
@@ -85,10 +85,10 @@ func TestRigLifecycleAcrossFreshFSStore(t *testing.T) {
 	freshInference := &recordingLLM{}
 	freshRig := defineSessionRigWithClient(t, freshStores, baseTwo, true, rig.SnapshotPolicy{Trigger: rig.SnapshotOnIdle, Priority: rig.SnapshotRequired}, freshInference)
 	restored, err := freshRig.RestoreSession(ctx, id)
+	registerSessionCleanup(t, restored)
 	if err != nil {
 		t.Fatalf("RestoreSession: %v", err)
 	}
-	defer restored.Shutdown(context.Background())
 	restoredSub, err := restored.SubscribeEvents(event.EventFilter{Enduring: event.LoopScope{All: true}})
 	if err != nil {
 		t.Fatal(err)
@@ -104,7 +104,7 @@ func TestRigLifecycleAcrossFreshFSStore(t *testing.T) {
 	if !ok || handle.Model().Name != "builder-routed" || handle.Model().Sampling.Effort != inference.EffortHigh {
 		t.Fatalf("restored builder = %+v", handle)
 	}
-	if latestCheckpoint(t, eventsFor(t, freshStores.sessions, id)).Ref != checkpoint.Ref {
+	if latestCheckpoint(t, eventsFor(t, ctx, freshStores.sessions, id)).Ref != checkpoint.Ref {
 		t.Fatal("restore changed journal-authoritative checkpoint")
 	}
 	if _, err := restored.SubmitToLoop(ctx, ids["planner"], textBlock("plan-continue")); err != nil {
@@ -117,7 +117,7 @@ func TestRigLifecycleAcrossFreshFSStore(t *testing.T) {
 	if err := waitIdle(ctx, restored); err != nil {
 		t.Fatal(err)
 	}
-	if got := countEvents[event.TurnDone](eventsFor(t, freshStores.sessions, id)); got != turnsBefore+2 {
+	if got := countEvents[event.TurnDone](eventsFor(t, ctx, freshStores.sessions, id)); got != turnsBefore+2 {
 		t.Fatalf("TurnDone count = %d, want %d", got, turnsBefore+2)
 	}
 	assertCapturedHistory(t, freshInference, "planner", "user:plan", "assistant:done", "user:plan-continue")
@@ -138,12 +138,13 @@ func TestRigSeededSessionsDivergeAndRestoreJournalAuthoritativeTrees(t *testing.
 	baseOne := filepath.Join(t.TempDir(), "first-base")
 	r := defineSessionRig(t, stores, baseOne, false, rig.SnapshotPolicy{Trigger: rig.SnapshotManual, Priority: rig.SnapshotRequired})
 	one, err := r.NewSession(ctx, rig.WithSeedSnapshot(seedRef))
+	shutdownOne := registerSessionCleanup(t, one)
 	if err != nil {
 		t.Fatal(err)
 	}
 	two, err := r.NewSession(ctx, rig.WithSeedSnapshot(seedRef))
+	shutdownTwo := registerSessionCleanup(t, two)
 	if err != nil {
-		_ = one.Shutdown(ctx)
 		t.Fatal(err)
 	}
 	rootOne := filepath.Join(canonical(t, baseOne), one.SessionID().String())
@@ -181,20 +182,20 @@ func TestRigSeededSessionsDivergeAndRestoreJournalAuthoritativeTrees(t *testing.
 	if oneIntermediateRef == oneRef || oneRef == twoRef || oneRef == seedRef || twoRef == seedRef {
 		t.Fatalf("refs seed=%s one-intermediate=%s one-latest=%s two=%s", seedRef, oneIntermediateRef, oneRef, twoRef)
 	}
-	assertCheckpointSequence(t, eventsFor(t, stores.sessions, one.SessionID()),
+	assertCheckpointSequence(t, eventsFor(t, ctx, stores.sessions, one.SessionID()),
 		checkpointWant{Ref: seedRef, Trigger: event.SnapshotTriggerSeed},
 		checkpointWant{Ref: oneIntermediateRef, Trigger: event.SnapshotTriggerManual},
 		checkpointWant{Ref: oneRef, Trigger: event.SnapshotTriggerManual},
 	)
-	assertCheckpointSequence(t, eventsFor(t, stores.sessions, two.SessionID()),
+	assertCheckpointSequence(t, eventsFor(t, ctx, stores.sessions, two.SessionID()),
 		checkpointWant{Ref: seedRef, Trigger: event.SnapshotTriggerSeed},
 		checkpointWant{Ref: twoRef, Trigger: event.SnapshotTriggerManual},
 	)
 	oneID, twoID := one.SessionID(), two.SessionID()
-	if err := one.Shutdown(ctx); err != nil {
+	if err := shutdownOne(ctx); err != nil {
 		t.Fatal(err)
 	}
-	if err := two.Shutdown(ctx); err != nil {
+	if err := shutdownTwo(ctx); err != nil {
 		t.Fatal(err)
 	}
 	if err := stores.fs.Close(); err != nil {
@@ -205,19 +206,18 @@ func TestRigSeededSessionsDivergeAndRestoreJournalAuthoritativeTrees(t *testing.
 	}
 
 	freshStores := openFSStores(t, persistence)
-	defer freshStores.fs.Close()
 	baseTwo := filepath.Join(t.TempDir(), "fresh-base")
 	freshRig := defineSessionRig(t, freshStores, baseTwo, true, rig.SnapshotPolicy{Trigger: rig.SnapshotManual, Priority: rig.SnapshotRequired})
 	restoredOne, err := freshRig.RestoreSession(ctx, oneID)
+	registerSessionCleanup(t, restoredOne)
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer restoredOne.Shutdown(context.Background())
 	restoredTwo, err := freshRig.RestoreSession(ctx, twoID)
+	registerSessionCleanup(t, restoredTwo)
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer restoredTwo.Shutdown(context.Background())
 	freshOne := filepath.Join(canonical(t, baseTwo), oneID.String())
 	freshTwo := filepath.Join(canonical(t, baseTwo), twoID.String())
 	if body, err := os.ReadFile(filepath.Join(freshOne, "branch.txt")); err != nil || string(body) != "one-latest\n" {
@@ -239,21 +239,20 @@ func TestRigSeededSessionsDivergeAndRestoreJournalAuthoritativeTrees(t *testing.
 		t.Fatal(err)
 	}
 	assertTreesEqual(t, seedWithOneBranch, freshOne)
-	if latestCheckpoint(t, eventsFor(t, freshStores.sessions, oneID)).Ref != string(oneRef) {
+	if latestCheckpoint(t, eventsFor(t, ctx, freshStores.sessions, oneID)).Ref != string(oneRef) {
 		t.Fatal("session one restored the wrong durable ref")
 	}
-	if latestCheckpoint(t, eventsFor(t, freshStores.sessions, twoID)).Ref != string(twoRef) {
+	if latestCheckpoint(t, eventsFor(t, ctx, freshStores.sessions, twoID)).Ref != string(twoRef) {
 		t.Fatal("session two restored the wrong durable ref")
 	}
-	assertCleanRestore(t, eventsFor(t, freshStores.sessions, oneID))
-	assertCleanRestore(t, eventsFor(t, freshStores.sessions, twoID))
+	assertCleanRestore(t, eventsFor(t, ctx, freshStores.sessions, oneID))
+	assertCleanRestore(t, eventsFor(t, ctx, freshStores.sessions, twoID))
 }
 
 func TestRigExclusiveRootContentionHandoffAndLoss(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 	stores := openFSStores(t, filepath.Join(t.TempDir(), "persistence"))
-	defer stores.fs.Close()
 	root := filepath.Join(t.TempDir(), "exclusive")
 	if err := os.MkdirAll(root, 0o700); err != nil {
 		t.Fatal(err)
@@ -275,10 +274,12 @@ func TestRigExclusiveRootContentionHandoffAndLoss(t *testing.T) {
 	}
 	r1, r2 := define(), define()
 	first, err := r1.NewSession(ctx)
+	shutdownFirst := registerSessionCleanup(t, first)
 	if err != nil {
 		t.Fatal(err)
 	}
 	second, err := r2.NewSession(ctx)
+	registerSessionCleanup(t, second)
 	if err == nil || second != nil {
 		t.Fatalf("contending NewSession = (%v, %v)", second, err)
 	}
@@ -286,10 +287,11 @@ func TestRigExclusiveRootContentionHandoffAndLoss(t *testing.T) {
 	if !errors.As(err, &busy) || busy.Root != canonical(t, root) || busy.HolderEpoch == 0 {
 		t.Fatalf("busy error = %T %v", err, err)
 	}
-	if err := first.Shutdown(ctx); err != nil {
+	if err := shutdownFirst(ctx); err != nil {
 		t.Fatal(err)
 	}
 	handoff, err := r2.NewSession(ctx)
+	shutdownHandoff := registerSessionCleanup(t, handoff)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -320,20 +322,21 @@ func TestRigExclusiveRootContentionHandoffAndLoss(t *testing.T) {
 			t.Fatalf("Submit error = %T %v", err, err)
 		}
 	}
-	if err := handoff.Shutdown(ctx); err != nil {
+	if err := shutdownHandoff(ctx); err != nil {
 		t.Fatal(err)
 	}
 }
 
 func TestRigPersistenceOutsideWorkspaceArchiveAndOverlapRejected(t *testing.T) {
-	ctx := context.Background()
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
 	top := t.TempDir()
 	persistence := filepath.Join(top, "persistence")
 	stores := openFSStores(t, persistence)
-	defer stores.fs.Close()
 	base := filepath.Join(top, "workspaces")
 	r := defineSessionRig(t, stores, base, false, rig.SnapshotPolicy{Trigger: rig.SnapshotManual, Priority: rig.SnapshotRequired})
 	sess, err := r.NewSession(ctx)
+	shutdownSess := registerSessionCleanup(t, sess)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -345,7 +348,7 @@ func TestRigPersistenceOutsideWorkspaceArchiveAndOverlapRejected(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := sess.Shutdown(ctx); err != nil {
+	if err := shutdownSess(ctx); err != nil {
 		t.Fatal(err)
 	}
 	if entries, err := os.ReadDir(filepath.Join(persistence, "streams", "sessions")); err != nil || len(entries) == 0 {
@@ -377,8 +380,9 @@ func TestRigPersistenceOutsideWorkspaceArchiveAndOverlapRejected(t *testing.T) {
 }
 
 func TestServeLifecycleWireOverConcreteRigAndFSStore(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
 	stores := openFSStores(t, filepath.Join(t.TempDir(), "persistence"))
-	defer stores.fs.Close()
 	concrete, err := rig.Define(
 		rig.WithLoops(definition(t, "agent", deterministicLLM{})),
 		rig.WithPrimers("agent"),
@@ -390,7 +394,9 @@ func TestServeLifecycleWireOverConcreteRigAndFSStore(t *testing.T) {
 	captured := &captureRig{inner: concrete}
 	handler := serve.Handler[session.SessionController, rig.SessionOption](captured, nil)
 	created := httptest.NewRecorder()
-	handler.ServeHTTP(created, httptest.NewRequest(http.MethodPost, "/v1/sessions", http.NoBody))
+	handler.ServeHTTP(created, httptest.NewRequest(http.MethodPost, "/v1/sessions", http.NoBody).WithContext(ctx))
+	createdSession := captured.captured()
+	shutdownCreated := registerSessionCleanup(t, createdSession)
 	if created.Code != http.StatusCreated {
 		t.Fatalf("create status=%d body=%s", created.Code, created.Body.String())
 	}
@@ -400,15 +406,16 @@ func TestServeLifecycleWireOverConcreteRigAndFSStore(t *testing.T) {
 	if err := json.Unmarshal(created.Body.Bytes(), &createResponse); err != nil {
 		t.Fatal(err)
 	}
-	createdSession := captured.captured()
 	if createdSession == nil || createdSession.SessionID().String() != createResponse.SessionID {
 		t.Fatalf("wire id=%s concrete=%v", createResponse.SessionID, createdSession)
 	}
-	if err := createdSession.Shutdown(context.Background()); err != nil {
+	if err := shutdownCreated(ctx); err != nil {
 		t.Fatal(err)
 	}
 	restored := httptest.NewRecorder()
-	handler.ServeHTTP(restored, httptest.NewRequest(http.MethodPost, "/v1/sessions/"+createResponse.SessionID+"/restore", http.NoBody))
+	handler.ServeHTTP(restored, httptest.NewRequest(http.MethodPost, "/v1/sessions/"+createResponse.SessionID+"/restore", http.NoBody).WithContext(ctx))
+	restoredSession := captured.captured()
+	shutdownRestored := registerSessionCleanup(t, restoredSession)
 	if restored.Code != http.StatusOK {
 		t.Fatalf("restore status=%d body=%s", restored.Code, restored.Body.String())
 	}
@@ -418,10 +425,10 @@ func TestServeLifecycleWireOverConcreteRigAndFSStore(t *testing.T) {
 	if err := json.Unmarshal(restored.Body.Bytes(), &restoreResponse); err != nil {
 		t.Fatal(err)
 	}
-	if restoreResponse.SessionID != createResponse.SessionID || captured.captured().SessionID().String() != createResponse.SessionID {
-		t.Fatalf("restore wire=%s concrete=%v", restoreResponse.SessionID, captured.captured())
+	if restoredSession == nil || restoreResponse.SessionID != createResponse.SessionID || restoredSession.SessionID().String() != createResponse.SessionID {
+		t.Fatalf("restore wire=%s concrete=%v", restoreResponse.SessionID, restoredSession)
 	}
-	if err := captured.captured().Shutdown(context.Background()); err != nil {
+	if err := shutdownRestored(ctx); err != nil {
 		t.Fatal(err)
 	}
 }

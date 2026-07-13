@@ -12,6 +12,7 @@ import (
 	"reflect"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/looprig/core/content"
 	"github.com/looprig/core/uuid"
@@ -27,6 +28,8 @@ import (
 	"github.com/looprig/inference"
 	"github.com/looprig/storage"
 )
+
+const integrationCleanupTimeout = 5 * time.Second
 
 type fsStores struct {
 	fs        *fsstore.Store
@@ -55,7 +58,34 @@ func openFSStores(t *testing.T, root string) fsStores {
 		_ = fs.Close()
 		t.Fatalf("workspacestore.Open: %v", err)
 	}
+	// Registered before any session cleanup, so testing's LIFO cleanup order always
+	// shuts live sessions down before closing their backing store.
+	t.Cleanup(func() { _ = fs.Close() })
 	return fsStores{fs: fs, sessions: sessions, workspace: workspace}
+}
+
+// registerSessionCleanup immediately protects an acquired controller with bounded,
+// exactly-once shutdown. The returned function is used by tests that intentionally hand off
+// or reopen a store; the later t.Cleanup safely observes that explicit shutdown.
+func registerSessionCleanup(t *testing.T, sess session.SessionController) func(context.Context) error {
+	t.Helper()
+	if sess == nil {
+		return func(context.Context) error { return nil }
+	}
+	var once sync.Once
+	var shutdownErr error
+	shutdown := func(ctx context.Context) error {
+		once.Do(func() { shutdownErr = sess.Shutdown(ctx) })
+		return shutdownErr
+	}
+	t.Cleanup(func() {
+		ctx, cancel := context.WithTimeout(context.Background(), integrationCleanupTimeout)
+		defer cancel()
+		if err := shutdown(ctx); err != nil {
+			t.Errorf("session cleanup Shutdown: %v", err)
+		}
+	})
+	return shutdown
 }
 
 func model(name string) inference.Model {
@@ -206,20 +236,20 @@ func canonical(t *testing.T, path string) string {
 	return filepath.Clean(abs)
 }
 
-func eventsFor(t *testing.T, store *sessionstore.Store, id uuid.UUID) []event.Event {
+func eventsFor(t *testing.T, ctx context.Context, store *sessionstore.Store, id uuid.UUID) []event.Event {
 	t.Helper()
 	replayer, err := store.OpenEventReplayer(id, sessionstore.ReplayRequest{FromSeq: 0})
 	if err != nil {
 		t.Fatalf("OpenEventReplayer: %v", err)
 	}
-	cursor, err := replayer.Open(context.Background(), journal.ReplayRequest{From: journal.Beginning()})
+	cursor, err := replayer.Open(ctx, journal.ReplayRequest{From: journal.Beginning()})
 	if err != nil {
 		t.Fatalf("replayer.Open: %v", err)
 	}
 	defer cursor.Close()
 	var events []event.Event
 	for {
-		ev, _, err := cursor.Next(context.Background())
+		ev, _, err := cursor.Next(ctx)
 		if errors.Is(err, io.EOF) {
 			return events
 		}
@@ -230,10 +260,10 @@ func eventsFor(t *testing.T, store *sessionstore.Store, id uuid.UUID) []event.Ev
 	}
 }
 
-func primerIDs(t *testing.T, store *sessionstore.Store, id uuid.UUID) map[string]uuid.UUID {
+func primerIDs(t *testing.T, ctx context.Context, store *sessionstore.Store, id uuid.UUID) map[string]uuid.UUID {
 	t.Helper()
 	result := make(map[string]uuid.UUID)
-	for _, ev := range eventsFor(t, store, id) {
+	for _, ev := range eventsFor(t, ctx, store, id) {
 		if started, ok := ev.(event.LoopStarted); ok && started.Cause.Coordinates.LoopID.IsZero() {
 			result[string(started.AgentName)] = started.LoopID
 		}
