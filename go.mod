@@ -3,17 +3,13 @@ module github.com/looprig/tests
 go 1.26.4
 
 require (
-	github.com/looprig/core v0.1.0
+	github.com/looprig/core v0.2.0
 	github.com/looprig/fsstore v0.2.0
 	github.com/looprig/harness v0.10.0
-	github.com/looprig/inference v0.1.0
+	github.com/looprig/inference v0.3.0
 )
 
-require (
-	github.com/looprig/storage v0.2.0
-	golang.org/x/net v0.55.0 // indirect
-	golang.org/x/text v0.37.0 // indirect
-)
+require github.com/looprig/storage v0.2.0
 
 replace github.com/looprig/core => ../core
 

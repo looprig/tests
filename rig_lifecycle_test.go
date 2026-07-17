@@ -19,7 +19,7 @@ import (
 	"github.com/looprig/harness/pkg/rig"
 	"github.com/looprig/harness/pkg/serve"
 	"github.com/looprig/harness/pkg/session"
-	"github.com/looprig/inference"
+	"github.com/looprig/inference/model"
 )
 
 func TestRigLifecycleAcrossFreshFSStore(t *testing.T) {
@@ -63,7 +63,7 @@ func TestRigLifecycleAcrossFreshFSStore(t *testing.T) {
 	if !ok {
 		t.Fatal("builder controller missing")
 	}
-	if err := builder.Change(ctx, loop.ChangeModel(model("builder-routed")), loop.ChangeEffort(inference.EffortHigh)); err != nil {
+	if err := builder.Change(ctx, loop.ChangeModel(testModel("builder-routed")), loop.ChangeEffort(model.EffortHigh)); err != nil {
 		t.Fatal(err)
 	}
 	if err := sess.SetActiveLoop(ctx, ids["builder"]); err != nil {
@@ -101,7 +101,7 @@ func TestRigLifecycleAcrossFreshFSStore(t *testing.T) {
 		t.Fatalf("active loop = %v, want %v", restored.ActiveLoop().ID(), ids["builder"])
 	}
 	handle, ok := restored.Loop(ids["builder"])
-	if !ok || handle.Model().Name != "builder-routed" || handle.Model().Sampling.Effort != inference.EffortHigh {
+	if !ok || handle.Model().Name != "builder-routed" || handle.Model().Sampling.Effort != model.EffortHigh {
 		t.Fatalf("restored builder = %+v", handle)
 	}
 	if latestCheckpoint(t, eventsFor(t, ctx, freshStores.sessions, id)).Ref != checkpoint.Ref {

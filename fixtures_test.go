@@ -26,6 +26,8 @@ import (
 	"github.com/looprig/harness/pkg/sessionstore"
 	"github.com/looprig/harness/pkg/workspacestore"
 	"github.com/looprig/inference"
+	"github.com/looprig/inference/model"
+	"github.com/looprig/inference/stream"
 	"github.com/looprig/storage"
 )
 
@@ -88,10 +90,10 @@ func registerSessionCleanup(t *testing.T, sess session.SessionController) func(c
 	return shutdown
 }
 
-func model(name string) inference.Model {
-	return inference.Model{
-		Provider:  inference.ProviderName("integration"),
-		APIFormat: inference.APIFormatOpenAI,
+func testModel(name string) model.Model {
+	return model.Model{
+		Provider:  model.ProviderName("integration"),
+		APIFormat: model.APIFormatOpenAI,
 		BaseURL:   "http://127.0.0.1",
 		Name:      name,
 	}
@@ -103,14 +105,14 @@ func (deterministicLLM) Invoke(context.Context, inference.Request) (*inference.R
 	return nil, errors.New("Invoke not used")
 }
 
-func (deterministicLLM) Stream(context.Context, inference.Request) (*inference.StreamReader[content.Chunk], error) {
+func (deterministicLLM) Stream(context.Context, inference.Request) (*stream.StreamReader[content.Chunk], error) {
 	return doneStream(), nil
 }
 
-func doneStream() *inference.StreamReader[content.Chunk] {
+func doneStream() *stream.StreamReader[content.Chunk] {
 	chunks := []content.Chunk{&content.TextChunk{Text: "done"}}
 	index := 0
-	return inference.NewStreamReader(func() (content.Chunk, error) {
+	return stream.NewStreamReader(func() (content.Chunk, error) {
 		if index == len(chunks) {
 			return nil, io.EOF
 		}
@@ -129,7 +131,7 @@ func (*recordingLLM) Invoke(context.Context, inference.Request) (*inference.Resp
 	return nil, errors.New("Invoke not used")
 }
 
-func (l *recordingLLM) Stream(_ context.Context, request inference.Request) (*inference.StreamReader[content.Chunk], error) {
+func (l *recordingLLM) Stream(_ context.Context, request inference.Request) (*stream.StreamReader[content.Chunk], error) {
 	history := make([]string, 0, len(request.Messages))
 	for _, message := range request.Messages {
 		history = append(history, conversationText(message))
@@ -178,7 +180,7 @@ func (*blockingLLM) Invoke(context.Context, inference.Request) (*inference.Respo
 	return nil, errors.New("Invoke not used")
 }
 
-func (l *blockingLLM) Stream(ctx context.Context, _ inference.Request) (*inference.StreamReader[content.Chunk], error) {
+func (l *blockingLLM) Stream(ctx context.Context, _ inference.Request) (*stream.StreamReader[content.Chunk], error) {
 	l.once.Do(func() { close(l.started) })
 	<-ctx.Done()
 	return nil, ctx.Err()
@@ -188,7 +190,7 @@ func definition(t *testing.T, name string, client inference.Client) loop.Definit
 	t.Helper()
 	d, err := loop.Define(
 		loop.WithName(identity.AgentName(name)),
-		loop.WithInference(client, model(name)),
+		loop.WithInference(client, testModel(name)),
 	)
 	if err != nil {
 		t.Fatalf("loop.Define(%q): %v", name, err)
