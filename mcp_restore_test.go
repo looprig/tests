@@ -40,7 +40,9 @@ import (
 	"github.com/looprig/harness/pkg/rig"
 	"github.com/looprig/harness/pkg/session"
 	"github.com/looprig/harness/pkg/sessionstore"
+	"github.com/looprig/mcp/pkg/client"
 	mcpharness "github.com/looprig/mcp/pkg/harness"
+	"github.com/looprig/mcp/pkg/transport/stdio"
 	"github.com/looprig/storage/memstore"
 )
 
@@ -495,4 +497,195 @@ func TestOldJournalWithoutExternalCapabilityRestores(t *testing.T) {
 		t.Fatalf("a journal with no external capability failed to restore: %v", err)
 	}
 	shutdown(t, restored)
+}
+
+// --- the creation side: MCP identity stamped BEFORE the Session exists -------
+
+// composeMCP is an application's MCP phase, in the order
+// 2026-07-16-session-versioning-migration-design.md §Configuration freeze and
+// adoption mandates: build the bindings, connect, discover, and report the
+// identity of what was actually found — all before any Session exists.
+//
+// The Manager it returns has no SessionID, and that is the point. It cannot have
+// one: the digest it produces is an INPUT to rig.Define, which is what
+// rig.NewSession stamps onto SessionStarted, so the Session whose ID it would
+// need is downstream of it. The caller binds it once the Session it serves has
+// been created.
+//
+// The fixture binary is passed in rather than built here so both legs of a
+// restore run the same command: stdio's RedactedOrigin is the command's base name
+// and argument count, and it is part of a binding's identity, so a per-leg build
+// path would be a configuration change this test never meant to make.
+func composeMCP(t *testing.T, bin string, args []string) (*mcpharness.Manager, string) {
+	t.Helper()
+	tr, err := stdio.New(stdio.Config{Command: bin, Args: args})
+	if err != nil {
+		t.Fatalf("stdio.New: %v", err)
+	}
+	mgr, err := mcpharness.NewManager(
+		[]mcpharness.Binding{{
+			Name:   "srv",
+			Server: client.Definition{Name: client.Name("srv"), Transport: tr},
+			Scope:  mcpharness.ScopeSession,
+			// Required: Start returns once the required bindings have settled, so
+			// this is what makes the digest below a fact about a discovered server
+			// rather than a race with one still connecting (see ConfigIdentity).
+			Required:   true,
+			Visibility: mcpharness.AllLoops(),
+		}},
+		mcpharness.Deps{Gates: refusingGates{}, Events: &recordingPublisher{}},
+	)
+	if err != nil {
+		t.Fatalf("NewManager before a Session: %v", err)
+	}
+	t.Cleanup(func() {
+		ctx, cancel := context.WithTimeout(context.Background(), itTimeout)
+		defer cancel()
+		_ = mgr.Close(ctx)
+	})
+	if err := mgr.Start(itCtx(t)); err != nil {
+		t.Fatalf("Start before a Session: %v", err)
+	}
+	return mgr, mgr.ConfigDigest()
+}
+
+// stampedRev returns the ExternalCapabilityRev the Session's journal recorded at
+// SessionStarted.
+func stampedRev(t *testing.T, ctx context.Context, store *sessionstore.Store, id uuid.UUID) string {
+	t.Helper()
+	for _, ev := range eventsFor(t, ctx, store, id) {
+		if started, ok := ev.(event.SessionStarted); ok {
+			return started.Config.ExternalCapabilityRev
+		}
+	}
+	t.Fatalf("no SessionStarted in the journal of session %v", id)
+	return ""
+}
+
+// TestMCPIdentityStampedAtCreationRestoresWithoutDrift is the creation side of
+// the fingerprint story, and it is the one that was broken.
+//
+// TestMCPConfigDriftIsReportedThroughConfigMismatch proves the COMPARISON seam
+// with literal revs. It cannot catch this, because it never builds a Manager: it
+// asserts that two strings an application supplies are compared, which they are.
+// The defect was that a real application could not produce the first of those
+// strings at all — Deps.SessionID was required, so the Manager whose digest
+// rig.Define needs could not exist before rig.NewSession had minted an ID. Every
+// application therefore journaled an empty rev on its first run and computed a
+// real one on its second, and reported drift, forever, on a configuration nobody
+// had touched.
+//
+// So the claim here is the whole round trip an application actually makes:
+// discover → stamp a REAL rev → restore under the SAME servers → no drift.
+func TestMCPIdentityStampedAtCreationRestoresWithoutDrift(t *testing.T) {
+	t.Parallel()
+	ctx := itCtx(t)
+	store, err := sessionstore.Open(memstore.New())
+	if err != nil {
+		t.Fatalf("sessionstore.Open: %v", err)
+	}
+	bin := buildMCPFixture(t)
+
+	// --- run one: discover, then create --------------------------------------
+	mgrOne, revOne := composeMCP(t, bin, []string{"-mutate"})
+	if revOne == "" {
+		t.Fatal("ConfigDigest before the Session is empty though a server was discovered: the application would stamp \"no external capability\" and mismatch against itself on every later run")
+	}
+	sessOne, err := newRestorableRig(t, store, "planner", newScriptLLM(say("one")), revOne).rig.NewSession(ctx)
+	if err != nil {
+		t.Fatalf("NewSession: %v", err)
+	}
+	id := sessOne.SessionID()
+	if err := mgrOne.BindSession(id); err != nil {
+		t.Fatalf("BindSession: %v", err)
+	}
+
+	// The journal really carries the discovered identity. Without this the
+	// no-drift claim below could be two empty strings agreeing with each other,
+	// which is exactly the broken state this test exists to exclude.
+	if got := stampedRev(t, ctx, store, id); got != revOne {
+		t.Fatalf("SessionStarted.Config.ExternalCapabilityRev = %q, want the discovered %q", got, revOne)
+	}
+	shutdown(t, sessOne)
+
+	// --- run two: same servers, so no drift ---------------------------------
+	mgrTwo, revTwo := composeMCP(t, bin, []string{"-mutate"})
+	// The premise: rediscovering an UNCHANGED configuration yields the same
+	// identity. A digest that moved between two identical runs would make the
+	// restore below fail for a reason that is not the one under test.
+	if revTwo != revOne {
+		t.Fatalf("rediscovering the same servers gave %q, want the %q of run one: the digest is not stable across processes", revTwo, revOne)
+	}
+	restored, err := newRestorableRig(t, store, "planner", newScriptLLM(say("two")), revTwo).rig.RestoreSession(ctx, id)
+	if err != nil {
+		t.Fatalf("restore under UNCHANGED MCP configuration was refused: %v\nthis is the spurious mismatch the pre-Session digest exists to prevent: run one journaled its MCP identity, run two recomputed the same one, and they must compare equal", err)
+	}
+	if err := mgrTwo.BindSession(restored.SessionID()); err != nil {
+		t.Fatalf("BindSession on the restored Session: %v", err)
+	}
+	shutdown(t, restored)
+}
+
+// TestChangedMCPServersDriftAtRestore is the other half: the digest must move
+// when the servers really do, and that movement must arrive as the ordinary
+// restore decision rather than as a broken Session.
+//
+// Both legs run the same command with the same number of arguments, so the
+// binding's declared configuration — its transport, its origin, its filter, its
+// limits — is byte-for-byte identical, and the ONLY thing that differs is the
+// catalog the server turned out to serve. That is deliberate: it proves the digest
+// covers what was NEGOTIATED, which is the half no application could compute for
+// itself and the half that needs a live connection before the Session exists.
+func TestChangedMCPServersDriftAtRestore(t *testing.T) {
+	t.Parallel()
+	ctx := itCtx(t)
+	store, err := sessionstore.Open(memstore.New())
+	if err != nil {
+		t.Fatalf("sessionstore.Open: %v", err)
+	}
+	bin := buildMCPFixture(t)
+
+	mgrOne, revOne := composeMCP(t, bin, []string{"-mutate"})
+	sessOne, err := newRestorableRig(t, store, "planner", newScriptLLM(say("one")), revOne).rig.NewSession(ctx)
+	if err != nil {
+		t.Fatalf("NewSession: %v", err)
+	}
+	id := sessOne.SessionID()
+	if err := mgrOne.BindSession(id); err != nil {
+		t.Fatalf("BindSession: %v", err)
+	}
+	shutdown(t, sessOne)
+
+	// A different server: same argv shape, a different toolset.
+	_, revTwo := composeMCP(t, bin, []string{"-crash"})
+	if revTwo == revOne {
+		t.Fatalf("a server offering a different toolset digested to the same %q: the identity does not cover the negotiated catalog, and this test proves nothing", revOne)
+	}
+
+	_, err = newRestorableRig(t, store, "planner", newScriptLLM(say("two")), revTwo).rig.RestoreSession(ctx, id)
+	if err == nil {
+		t.Fatal("restore accepted a changed MCP catalog without a word")
+	}
+	var mismatch *session.ConfigMismatchError
+	if !errors.As(err, &mismatch) {
+		t.Fatalf("restore under changed MCP servers returned %T (%v), want a *session.ConfigMismatchError", err, err)
+	}
+
+	// And an application that means to resume across the change says so, and does.
+	r, err := rig.Define(
+		rig.WithLoops(newLoop(t, "planner", newScriptLLM(say("three")), approveAll())),
+		rig.WithPrimers("planner"),
+		rig.WithActivePrimer("planner"),
+		rig.WithSessionStore(store),
+		rig.WithFingerprintFields(rig.ConfigFingerprintFields{ExternalCapabilityRev: revTwo}),
+		rig.WithAllowConfigMismatch(),
+	)
+	if err != nil {
+		t.Fatalf("rig.Define: %v", err)
+	}
+	resumed, err := r.RestoreSession(ctx, id)
+	if err != nil {
+		t.Fatalf("WithAllowConfigMismatch did not resume across a real MCP catalog change: %v", err)
+	}
+	shutdown(t, resumed)
 }
