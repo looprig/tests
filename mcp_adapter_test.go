@@ -1590,26 +1590,244 @@ func TestFormElicitationReachesTheHostAndAnswersTheServer(t *testing.T) {
 	}
 }
 
-// URL elicitation is NOT covered end to end here, and the reason is a finding
-// rather than an omission: this module never advertises the url elicitation
-// capability, so no real server can send a url-mode request to it.
+// --- url elicitation --------------------------------------------------------
 //
-// internal/protocol/session.go builds mcp.ClientCapabilities.Elicitation as a
-// bare &mcp.ElicitationCapabilities{}. The SDK fills in Form for that on its own
-// (mcp/client.go, addCapabilities), but never URL — that needs an explicit
-// &URLElicitationCapabilities{}. A real fixture asked for mode "url" therefore
-// answers "client does not support \"url\" elicitation" and the adapter's
-// translateURL path is never reached over a real connection. Driving it here
-// would mean asserting on a request no server can make.
+// This path WAS uncovered here, and the note that stood in its place said it was
+// uncoverable: the module advertised elicitation as a bare
+// &mcp.ElicitationCapabilities{}, the SDK infers Form for that but never URL, so
+// a real server asking for mode "url" was answered "client does not support
+// \"url\" elicitation" and translateURL was unreachable over a real connection.
 //
-// The path itself is covered by this package's unit tests, which hand the
-// elicitor a url-mode request directly (TestURLElicitation* in
-// elicitation_test.go). See the report accompanying this stage.
+// That is no longer true. internal/protocol/session.go now names both modes
+// explicitly, so a real fixture CAN send a url-mode request and the two tests
+// below drive one — through a real subprocess server, a real stdio transport, and
+// a real turn.
+
+// urlElicit* are the canaries. The action URL is a stand-in for the real thing an
+// OAuth server sends: an origin a human can reason about, plus query parameters
+// that are CREDENTIALS — `state` is a CSRF token and `code_challenge` is the PKCE
+// challenge. Neither may ever reach a durable record, so they are spelled as
+// values no other part of the system could produce by accident, and swept for.
+const (
+	urlElicitOrigin    = "https://auth.example.com"
+	urlElicitState     = "state-canary-must-not-be-journaled"
+	urlElicitChallenge = "pkce-canary-must-not-be-journaled"
+	urlElicitPath      = "/authorize"
+)
+
+// urlElicitAction is the full action URL the fixture server sends.
+func urlElicitAction() string {
+	return urlElicitOrigin + urlElicitPath + "?state=" + urlElicitState + "&code_challenge=" + urlElicitChallenge
+}
+
+// driveURLElicitation runs one real url-mode elicitation end to end and returns
+// the envelope the host was handed.
+func driveURLElicitation(t *testing.T) mcpharness.GateRequest {
+	t.Helper()
+	ctx := itCtx(t)
+
+	gates := &hostGates{answer: func(mcpharness.GateRequest) (mcpharness.GateResponse, error) {
+		// A url gate's accept carries no values: the human went and did the thing.
+		return mcpharness.GateResponse{Action: gate.FormActionAccept}, nil
+	}}
+	args, err := json.Marshal(map[string]string{"mode": "url", "url": urlElicitAction()})
+	if err != nil {
+		t.Fatalf("marshalling the elicit call's arguments: %v", err)
+	}
+	llm := newScriptLLM(call("c1", mcpName("srv", fixtureToolElicit), string(args)), say("ok"))
+	sess := newSession(t, newStore(t), "planner", newLoop(t, "planner", llm, approveAll()))
+
+	f := attach(t, sess, gates, fixtureBinding(t, "srv", mcpharness.ScopeSession, []string{"-elicit"}, func(b *mcpharness.Binding) {
+		b.Server.Capabilities = client.ClientCapabilities{Elicitation: true}
+	}))
+	if err := f.start(t); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	if err := f.adopter.Install(ctx, sess.ActiveLoop().ID(), "planner"); err != nil {
+		t.Fatalf("Install: %v", err)
+	}
+	if _, err := sess.Submit(ctx, []content.Block{&content.TextBlock{Text: "go"}}); err != nil {
+		t.Fatalf("Submit: %v", err)
+	}
+	reqs := llm.waitRequests(t, 2)
+
+	// The answer travelled back to the server that asked. If the host had never
+	// been reached — the old capability bug — the fixture would report the SDK's
+	// "elicit failed: ... does not support" instead.
+	if got := toolResults(reqs[1]); len(got) != 1 || got[0] != fixtureElicitAnswerPrefix+"accept" {
+		t.Fatalf("the server reported %q, want %q: a real url-mode elicitation did not reach the host and come back",
+			got, fixtureElicitAnswerPrefix+"accept")
+	}
+
+	asked := gates.requests()
+	if len(asked) != 1 {
+		t.Fatalf("the host was asked %d times, want 1", len(asked))
+	}
+	return asked[0]
+}
+
+// TestURLElicitationBuildsAGateRealHarnessAccepts is the contract half: what the
+// adapter hands a host for a url-mode request must be an envelope real Harness
+// would open.
+//
+// This is the assertion whose absence let a live defect ship. gate.ValidateGate
+// REQUIRES a bare Prompt.Origin on a KindOpenURL gate — it is the only kind with
+// a real rule — and the adapter built gates without one, putting the origin in
+// Body prose instead. Nothing caught it: the module's own unit test validated a
+// Gate with the Prompt dropped, and this suite's assertRealHarnessGate had only
+// ever been pointed at KindForm, which ValidateGate no-ops on.
+func TestURLElicitationBuildsAGateRealHarnessAccepts(t *testing.T) {
+	t.Parallel()
+
+	req := driveURLElicitation(t)
+
+	// The envelope, Prompt included, against Harness's own validator.
+	assertRealHarnessGate(t, req, gate.KindOpenURL)
+
+	if req.Binding != "srv" {
+		t.Errorf("the gate is attributed to %q, want srv", req.Binding)
+	}
+	// The origin arrives as a validated FIELD, not as prose a renderer would have
+	// to parse back out of Body. This is the value a human's trust decision is
+	// made on, and the field is the contract that carries it.
+	if req.Prompt.Origin != urlElicitOrigin {
+		t.Errorf("the prompt's origin is %q, want %q: a renderer has nothing trustworthy to label",
+			req.Prompt.Origin, urlElicitOrigin)
+	}
+	// Never restorable: the action target is not journaled, so a restored open-url
+	// gate could only ever present an origin with no URL behind it. ValidateGate
+	// refuses one, and this pins the adapter's side of that.
+	if req.Restorable {
+		t.Error("the open-url gate is marked restorable; its action target is not journaled, so a restored one is a broken prompt")
+	}
+	// The payload really does still carry the full URL — the host has to have
+	// something to open. This is the control for the sweep below: it proves the
+	// URL was present to leak, so the absences asserted there are real.
+	payload, ok := req.Payload.(gate.OpenURLPayload)
+	if !ok {
+		t.Fatalf("the payload is %T, want gate.OpenURLPayload", req.Payload)
+	}
+	if payload.URL != urlElicitAction() {
+		t.Errorf("the private payload's URL is %q, want the server's action URL: the host has nothing to open", payload.URL)
+	}
+}
+
+// TestURLElicitationKeepsTheURLOutOfDurableRecords is the security half: the
+// action URL is a credential — it carries the `state` token and the PKCE
+// challenge — and it must reach NO durable record, while the origin must reach
+// every one of them.
+//
+// The sweep is over MARSHALLED bytes, not field by field, and that is the point:
+// a field added to Prompt or to the durable payload tomorrow is covered by
+// construction rather than by someone remembering to extend this test.
+//
+// # What is swept, and why these are the durable records
+//
+// There is no public Harness route to open a KindOpenURL gate (see this file's
+// header), so this cannot read the URL's absence out of a live gate directory.
+// It does the next thing, which is stronger than it sounds: it builds the durable
+// records Harness ITSELF would write for this gate, from this gate, using
+// Harness's own codecs — and those codecs are the boundary the property lives at.
+//
+//   - the private payload, through gate.MarshalPayload — the GatePreparedRecord.
+//   - the public envelope, through event.MarshalEvent of a real event.GateOpened —
+//     what fans out to SSE, history, and the journal.
+//   - the resolution, through event.MarshalEvent of a real event.GateResolved.
+func TestURLElicitationKeepsTheURLOutOfDurableRecords(t *testing.T) {
+	t.Parallel()
+
+	req := driveURLElicitation(t)
+	g := assertRealHarnessGate(t, req, gate.KindOpenURL)
+
+	// The durable payload record.
+	payloadBytes, err := gate.MarshalPayload(req.Payload)
+	if err != nil {
+		t.Fatalf("gate.MarshalPayload: %v", err)
+	}
+	// The public envelope record: a real GateOpened carrying the real gate.
+	openedBytes, err := event.MarshalEvent(event.GateOpened{
+		Header: gateEventHeader(t),
+		Gate:   g,
+	})
+	if err != nil {
+		t.Fatalf("event.MarshalEvent(GateOpened): %v", err)
+	}
+	// The resolution record, as the host answered it.
+	resolvedBytes, err := event.MarshalEvent(event.GateResolved{
+		Header: gateEventHeader(t),
+		GateID: g.ID,
+		Action: gate.FormActionAccept,
+		Source: gate.ResponseSource{Kind: gate.ResponseFromUser},
+	})
+	if err != nil {
+		t.Fatalf("event.MarshalEvent(GateResolved): %v", err)
+	}
+
+	records := map[string][]byte{
+		"the private payload (GatePreparedRecord)": payloadBytes,
+		"the public envelope (GateOpened)":         openedBytes,
+		"the resolution (GateResolved)":            resolvedBytes,
+	}
+	// Every secret the action URL carries, plus the URL itself and the path that
+	// only the action URL has.
+	secrets := map[string]string{
+		"the full action URL": urlElicitAction(),
+		"the state token":     urlElicitState,
+		"the PKCE challenge":  urlElicitChallenge,
+		"the URL's path":      urlElicitPath,
+	}
+	for name, record := range records {
+		for what, secret := range secrets {
+			if strings.Contains(string(record), secret) {
+				t.Errorf("%s leaks %s (%q) into a durable record:\n%s", name, what, secret, record)
+			}
+		}
+	}
+	// The other half of the property, and the reason the sweep is not satisfiable
+	// by dropping everything: the ORIGIN must survive into the records a human's
+	// prompt is rebuilt from. A gate that journaled nothing would pass the sweep
+	// above and be useless.
+	for _, name := range []string{"the private payload (GatePreparedRecord)", "the public envelope (GateOpened)"} {
+		if !strings.Contains(string(records[name]), urlElicitOrigin) {
+			t.Errorf("%s does not carry the origin %q; the human's trust decision is not durably recorded:\n%s",
+				name, urlElicitOrigin, records[name])
+		}
+	}
+}
+
+// gateEventHeader is a well-formed identity for a gate event built by hand. The
+// identifiers are real and fresh, so MarshalEvent is exercised on the path a hub
+// would take; none of them is under test here — the gate body is.
+func gateEventHeader(t *testing.T) event.Header {
+	t.Helper()
+	return event.Header{
+		Coordinates: identity.Coordinates{SessionID: newUUID(t), LoopID: newUUID(t)},
+		EventID:     newUUID(t),
+		CreatedAt:   time.Now().UTC(),
+	}
+}
+
+func newUUID(t *testing.T) uuid.UUID {
+	t.Helper()
+	id, err := uuid.New()
+	if err != nil {
+		t.Fatalf("uuid.New: %v", err)
+	}
+	return id
+}
 
 // assertRealHarnessGate checks that what the host was handed is a gate Harness
 // itself would accept: the right kind, a payload the gate codec round-trips, and
 // an envelope ValidateGate passes.
-func assertRealHarnessGate(t *testing.T, req mcpharness.GateRequest, want gate.Kind) {
+//
+// It returns the envelope it validated. That is what lets a caller sweep the
+// DURABLE projection of the very gate Harness accepted, rather than of a
+// look-alike built beside it — see TestURLElicitationKeepsTheURLOutOfDurableRecords.
+//
+// The Prompt is carried onto the envelope, not dropped. That matters: ValidateGate's
+// only real rule today (Prompt.Origin on KindOpenURL) lives in the Prompt, so a
+// helper that validated a stripped copy would pass on a gate Harness refuses.
+func assertRealHarnessGate(t *testing.T, req mcpharness.GateRequest, want gate.Kind) gate.Gate {
 	t.Helper()
 	if req.Kind != want {
 		t.Fatalf("gate kind = %q, want %q", req.Kind, want)
@@ -1639,6 +1857,7 @@ func assertRealHarnessGate(t *testing.T, req mcpharness.GateRequest, want gate.K
 	if err := gate.ValidateGate(g); err != nil {
 		t.Errorf("the envelope built from this request is not a valid Harness gate: %v", err)
 	}
+	return g
 }
 
 // --- 11. a failed refresh preserves the last valid generation ----------------
