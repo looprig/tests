@@ -1754,10 +1754,11 @@ func TestURLElicitationKeepsTheURLOutOfDurableRecords(t *testing.T) {
 	}
 	// The resolution record, as the host answered it.
 	resolvedBytes, err := event.MarshalEvent(event.GateResolved{
-		Header: gateEventHeader(t),
-		GateID: g.ID,
-		Action: gate.FormActionAccept,
-		Source: gate.ResponseSource{Kind: gate.ResponseFromUser},
+		Header:   gateEventHeader(t),
+		GateID:   g.ID,
+		Resolver: gate.ResolverSession,
+		Action:   gate.FormActionAccept,
+		Source:   gate.ResponseSource{Kind: gate.ResponseFromUser},
 	})
 	if err != nil {
 		t.Fatalf("event.MarshalEvent(GateResolved): %v", err)
