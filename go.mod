@@ -12,11 +12,11 @@ require (
 
 require github.com/looprig/storage v0.2.0
 
-replace github.com/looprig/core => ../../../../core
+replace github.com/looprig/core => ../core
 
-replace github.com/looprig/inference => ../../../../inference
+replace github.com/looprig/inference => ../inference
 
-replace github.com/looprig/storage => ../../../../storage
+replace github.com/looprig/storage => ../storage
 
 // Development-only extraction mappings. release-check consumes a separate
 // go.release.mod with tagged modules and no local replacements.
@@ -24,7 +24,7 @@ replace github.com/looprig/harness => ../harness
 
 replace github.com/looprig/foreignloop => ../foreignloop
 
-replace github.com/looprig/fsstore => ../../../../fsstore
+replace github.com/looprig/fsstore => ../fsstore
 
 require github.com/looprig/mcp v0.0.0
 
@@ -38,4 +38,4 @@ require (
 	golang.org/x/sys v0.47.0 // indirect
 )
 
-replace github.com/looprig/mcp => ../../../../mcp
+replace github.com/looprig/mcp => ../mcp

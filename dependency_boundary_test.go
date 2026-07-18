@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"errors"
 	"fmt"
+	"go/build/constraint"
 	"go/parser"
 	"go/token"
 	"io/fs"
@@ -21,27 +22,47 @@ const (
 	foreignloopModulePath = "github.com/looprig/foreignloop"
 )
 
-func TestCrossModuleOwnershipScannerRejectsNonTestsOwners(t *testing.T) {
+func TestCrossModuleOwnershipScannerRejectsOnlyDualIntegrationOwners(t *testing.T) {
 	root := t.TempDir()
 	writeModuleFixture(t, root, "tests", "module github.com/looprig/tests\n", map[string]string{
 		"integration_test.go": "package tests\nimport (\n_ \"github.com/looprig/harness/pkg/rig\"\n_ \"github.com/looprig/foreignloop/backend\"\n)\n",
 	})
-	writeModuleFixture(t, root, "bad-source", "module github.com/example/bad-source\n", map[string]string{
-		"nested/owner_plan9_test.go": "//go:build plan9\n\npackage nested\nimport (\n_ \"github.com/looprig/harness/pkg/session\"\n_ \"github.com/looprig/foreignloop/driver/claude\"\n)\n",
-	})
-	writeModuleFixture(t, root, "bad-replace", `module github.com/example/bad-replace
+	writeModuleFixture(t, root, "product", `module github.com/example/product
+
+require (
+	github.com/looprig/harness v0.0.0
+	github.com/looprig/foreignloop v0.0.0
+)
 
 replace github.com/looprig/harness => ../harness
 replace github.com/looprig/foreignloop => ../foreignloop
-`, nil)
+`, map[string]string{
+		"main.go":            "package product\nimport (\n_ \"github.com/looprig/harness/pkg/rig\"\n_ \"github.com/looprig/foreignloop/backend\"\n)\n",
+		"not_integration.go": "//go:build !integration\n\npackage product\nimport (\n_ \"github.com/looprig/harness/pkg/rig\"\n_ \"github.com/looprig/foreignloop/backend\"\n)\n",
+	})
+	writeModuleFixture(t, root, "bad-test", "module github.com/example/bad-test\n", map[string]string{
+		"nested/owner_test.go": "package nested\nimport (\n_ \"github.com/looprig/harness/pkg/session\"\n_ \"github.com/looprig/foreignloop/driver/claude\"\n)\n",
+	})
+	writeModuleFixture(t, root, "bad-integration-tag", "module github.com/example/bad-integration-tag\n", map[string]string{
+		"nested/owner.go": "//go:build plan9 && integration\n\npackage nested\nimport (\n_ \"github.com/looprig/harness/pkg/session\"\n_ \"github.com/looprig/foreignloop/driver/claude\"\n)\n",
+	})
+	writeModuleFixture(t, root, "bad-migration-tag", "module github.com/example/bad-migration-tag\n", map[string]string{
+		"owner.go": "//go:build migration\n\npackage owner\nimport (\n_ \"github.com/looprig/harness/pkg/session\"\n_ \"github.com/looprig/foreignloop/backend\"\n)\n",
+	})
+	writeModuleFixture(t, root, "bad-split-tests", "module github.com/example/bad-split-tests\n", map[string]string{
+		"harness_test.go":     "package owner\nimport _ \"github.com/looprig/harness/pkg/session\"\n",
+		"foreignloop_test.go": "package owner\nimport _ \"github.com/looprig/foreignloop/backend\"\n",
+	})
 
 	violations, err := crossModuleOwnershipViolations(root)
 	if err != nil {
 		t.Fatal(err)
 	}
 	want := []string{
-		"github.com/example/bad-replace",
-		"github.com/example/bad-source",
+		"github.com/example/bad-integration-tag",
+		"github.com/example/bad-migration-tag",
+		"github.com/example/bad-split-tests",
+		"github.com/example/bad-test",
 	}
 	if strings.Join(violations, "\n") != strings.Join(want, "\n") {
 		t.Fatalf("crossModuleOwnershipViolations() = %v, want %v", violations, want)
@@ -85,13 +106,28 @@ func TestCrossModuleOwnershipBoundary(t *testing.T) {
 
 func TestDevelopmentModuleSourcesAcceptSiblingLayouts(t *testing.T) {
 	collectionRoot := t.TempDir()
-	writeModuleFixture(t, collectionRoot, "harness", "module github.com/looprig/harness\n", nil)
-	writeModuleFixture(t, collectionRoot, "foreignloop", "module github.com/looprig/foreignloop\n", nil)
+	modules := map[string]string{
+		"core":        "github.com/looprig/core",
+		"foreignloop": "github.com/looprig/foreignloop",
+		"fsstore":     "github.com/looprig/fsstore",
+		"harness":     "github.com/looprig/harness",
+		"inference":   "github.com/looprig/inference",
+		"mcp":         "github.com/looprig/mcp",
+		"storage":     "github.com/looprig/storage",
+	}
+	for directory, modulePath := range modules {
+		writeModuleFixture(t, collectionRoot, directory, "module "+modulePath+"\n", nil)
+	}
 	writeModuleFixture(t, collectionRoot, "tests", `module github.com/looprig/tests
 
 replace (
+	github.com/looprig/core => ../core
 	github.com/looprig/harness => ../harness
 	github.com/looprig/foreignloop => ../foreignloop
+	github.com/looprig/fsstore => ../fsstore
+	github.com/looprig/inference => ../inference
+	github.com/looprig/mcp => ../mcp
+	github.com/looprig/storage => ../storage
 )
 `, nil)
 
@@ -106,10 +142,12 @@ replace (
 
 func TestDevelopmentModuleSourcesRejectWrongAndMissingLocalSources(t *testing.T) {
 	collectionRoot := t.TempDir()
-	writeModuleFixture(t, collectionRoot, "wrong", "module github.com/example/wrong\n", nil)
+	writeModuleFixture(t, collectionRoot, "harness", "module github.com/example/wrong\n", nil)
+	writeModuleFixture(t, collectionRoot, "foreignloop", "module github.com/looprig/foreignloop\n", nil)
 	writeModuleFixture(t, collectionRoot, "tests", `module github.com/looprig/tests
 
-replace github.com/looprig/harness => ../wrong
+replace github.com/looprig/harness => ../harness
+replace github.com/looprig/foreignloop => ../../deep/foreignloop
 `, nil)
 
 	violations, err := developmentModuleSourceViolations(filepath.Join(collectionRoot, "tests"))
@@ -117,8 +155,13 @@ replace github.com/looprig/harness => ../wrong
 		t.Fatal(err)
 	}
 	want := []string{
-		"github.com/looprig/foreignloop has no local development replacement",
+		"github.com/looprig/core has no local development replacement",
+		"github.com/looprig/foreignloop replacement must use ../foreignloop, got ../../deep/foreignloop",
+		"github.com/looprig/fsstore has no local development replacement",
 		"github.com/looprig/harness replacement resolves to module github.com/example/wrong",
+		"github.com/looprig/inference has no local development replacement",
+		"github.com/looprig/mcp has no local development replacement",
+		"github.com/looprig/storage has no local development replacement",
 	}
 	if strings.Join(violations, "\n") != strings.Join(want, "\n") {
 		t.Fatalf("developmentModuleSourceViolations() = %v, want %v", violations, want)
@@ -164,21 +207,13 @@ func crossModuleOwnershipViolations(collectionRoot string) ([]string, error) {
 		default:
 			return nil, fmt.Errorf("read sibling manifest %s: %w", goModPath, err)
 		}
-		modulePath, subjects, err := manifestIntegrationSubjects(goMod)
+		modulePath, _, err := manifestIntegrationSubjects(goMod)
 		if err != nil {
 			return nil, fmt.Errorf("parse sibling manifest %s: %w", goModPath, err)
 		}
-		sourceSubjects, err := sourceIntegrationSubjects(moduleRoot, modulePath)
+		subjects, err := integrationTestSubjects(moduleRoot, modulePath)
 		if err != nil {
 			return nil, fmt.Errorf("scan sibling module %s: %w", modulePath, err)
-		}
-		subjects.harness = subjects.harness || sourceSubjects.harness
-		subjects.foreignloop = subjects.foreignloop || sourceSubjects.foreignloop
-		if modulePath == harnessModulePath {
-			subjects.harness = false
-		}
-		if modulePath == foreignloopModulePath {
-			subjects.foreignloop = false
 		}
 		if modulePath != testsModulePath && subjects.harness && subjects.foreignloop {
 			violations = append(violations, modulePath)
@@ -197,26 +232,42 @@ func developmentModuleSourceViolations(moduleRoot string) ([]string, error) {
 	if err != nil {
 		return nil, fmt.Errorf("parse development replacements: %w", err)
 	}
+	developmentModules := []struct {
+		modulePath string
+		directory  string
+	}{
+		{modulePath: "github.com/looprig/core", directory: "core"},
+		{modulePath: foreignloopModulePath, directory: "foreignloop"},
+		{modulePath: "github.com/looprig/fsstore", directory: "fsstore"},
+		{modulePath: harnessModulePath, directory: "harness"},
+		{modulePath: "github.com/looprig/inference", directory: "inference"},
+		{modulePath: "github.com/looprig/mcp", directory: "mcp"},
+		{modulePath: "github.com/looprig/storage", directory: "storage"},
+	}
 	var violations []string
-	for _, subject := range []string{foreignloopModulePath, harnessModulePath} {
-		target, ok := replacements[subject]
+	for _, dependency := range developmentModules {
+		target, ok := replacements[dependency.modulePath]
 		if !ok || (!filepath.IsAbs(target) && !strings.HasPrefix(target, ".")) {
-			violations = append(violations, subject+" has no local development replacement")
+			violations = append(violations, dependency.modulePath+" has no local development replacement")
 			continue
 		}
-		if !filepath.IsAbs(target) {
-			target = filepath.Join(moduleRoot, filepath.FromSlash(target))
+		expectedTarget := "../" + dependency.directory
+		cleanTarget := filepath.ToSlash(filepath.Clean(filepath.FromSlash(target)))
+		if cleanTarget != expectedTarget {
+			violations = append(violations, fmt.Sprintf("%s replacement must use %s, got %s", dependency.modulePath, expectedTarget, target))
+			continue
 		}
+		target = filepath.Join(moduleRoot, filepath.FromSlash(target))
 		targetManifest, err := os.ReadFile(filepath.Join(filepath.Clean(target), "go.mod"))
 		if err != nil {
-			return nil, fmt.Errorf("read %s replacement manifest: %w", subject, err)
+			return nil, fmt.Errorf("read %s replacement manifest: %w", dependency.modulePath, err)
 		}
 		resolvedModule, _, err := manifestIntegrationSubjects(targetManifest)
 		if err != nil {
-			return nil, fmt.Errorf("parse %s replacement manifest: %w", subject, err)
+			return nil, fmt.Errorf("parse %s replacement manifest: %w", dependency.modulePath, err)
 		}
-		if resolvedModule != subject {
-			violations = append(violations, fmt.Sprintf("%s replacement resolves to module %s", subject, resolvedModule))
+		if resolvedModule != dependency.modulePath {
+			violations = append(violations, fmt.Sprintf("%s replacement resolves to module %s", dependency.modulePath, resolvedModule))
 		}
 	}
 	sort.Strings(violations)
@@ -320,7 +371,11 @@ func unquoteModuleToken(token string) string {
 	return token
 }
 
-func sourceIntegrationSubjects(moduleRoot, modulePath string) (integrationSubjects, error) {
+// integrationTestSubjects counts imports only in ownership-test sources:
+// every _test.go file, plus non-test Go files whose build constraints contain a
+// positive integration or migration tag. Production composition is deliberately
+// outside this guard even when it imports both modules.
+func integrationTestSubjects(moduleRoot, modulePath string) (integrationSubjects, error) {
 	var subjects integrationSubjects
 	fset := token.NewFileSet()
 	err := filepath.WalkDir(moduleRoot, func(path string, entry fs.DirEntry, walkErr error) error {
@@ -347,6 +402,13 @@ func sourceIntegrationSubjects(moduleRoot, modulePath string) (integrationSubjec
 		if filepath.Ext(path) != ".go" {
 			return nil
 		}
+		owned, err := integrationOwnershipSource(path)
+		if err != nil {
+			return err
+		}
+		if !owned {
+			return nil
+		}
 		parsed, err := parser.ParseFile(fset, path, nil, parser.ImportsOnly)
 		if err != nil {
 			return err
@@ -364,6 +426,49 @@ func sourceIntegrationSubjects(moduleRoot, modulePath string) (integrationSubjec
 		return nil
 	})
 	return subjects, err
+}
+
+func integrationOwnershipSource(path string) (bool, error) {
+	if strings.HasSuffix(path, "_test.go") {
+		return true, nil
+	}
+	contents, err := os.ReadFile(path)
+	if err != nil {
+		return false, err
+	}
+	scanner := bufio.NewScanner(strings.NewReader(string(contents)))
+	for scanner.Scan() {
+		line := strings.TrimSpace(scanner.Text())
+		if strings.HasPrefix(line, "package ") {
+			break
+		}
+		if !strings.HasPrefix(line, "//go:build ") && !strings.HasPrefix(line, "// +build ") {
+			continue
+		}
+		expression, err := constraint.Parse(line)
+		if err != nil {
+			return false, fmt.Errorf("parse build constraint in %s: %w", path, err)
+		}
+		if hasPositiveOwnershipTag(expression, false) {
+			return true, nil
+		}
+	}
+	return false, scanner.Err()
+}
+
+func hasPositiveOwnershipTag(expression constraint.Expr, negated bool) bool {
+	switch typed := expression.(type) {
+	case *constraint.TagExpr:
+		return !negated && (typed.Tag == "integration" || typed.Tag == "migration")
+	case *constraint.NotExpr:
+		return hasPositiveOwnershipTag(typed.X, !negated)
+	case *constraint.AndExpr:
+		return hasPositiveOwnershipTag(typed.X, negated) || hasPositiveOwnershipTag(typed.Y, negated)
+	case *constraint.OrExpr:
+		return hasPositiveOwnershipTag(typed.X, negated) || hasPositiveOwnershipTag(typed.Y, negated)
+	default:
+		return false
+	}
 }
 
 func (subjects *integrationSubjects) addImportPath(importPath string) {
