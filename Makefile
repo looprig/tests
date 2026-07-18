@@ -1,4 +1,4 @@
-.PHONY: test fmt-check vet check release-check
+.PHONY: test fmt-check vet dependency-boundary local-source-check check release-check
 
 test:
 	GOWORK=off go test -tags integration -race ./...
@@ -9,7 +9,13 @@ fmt-check:
 vet:
 	GOWORK=off go vet -tags integration ./...
 
-check: fmt-check vet test
+dependency-boundary:
+	GOWORK=off go test -race -run '^TestCrossModuleOwnership' ./...
+
+local-source-check:
+	GOWORK=off go test -race -run '^TestDevelopmentModuleSources' ./...
+
+check: fmt-check vet dependency-boundary local-source-check test
 
 release-check:
 	@test -f go.release.mod || (echo "go.release.mod is not prepared" >&2; exit 1)
