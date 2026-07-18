@@ -7,7 +7,7 @@ require (
 	github.com/looprig/foreignloop v0.0.0
 	github.com/looprig/fsstore v0.2.0
 	github.com/looprig/harness v0.10.0
-	github.com/looprig/inference v0.3.0
+	github.com/looprig/inference v0.3.1-0.20260718005749-13e4d7f173b3
 )
 
 require github.com/looprig/storage v0.2.0
