@@ -168,30 +168,109 @@ func TestCrossModuleOwnershipScannerRejectsBrokenImmediateSiblingSymlink(t *test
 	}
 }
 
-func TestCrossModuleOwnershipScannerDoesNotFollowSourceSymlinks(t *testing.T) {
+func TestCrossModuleOwnershipScannerRejectsOwnedGoSourceSymlinks(t *testing.T) {
 	collectionRoot := t.TempDir()
-	writeModuleFixture(t, collectionRoot, "module", "module github.com/example/module\n", nil)
-	external := filepath.Join(t.TempDir(), "external_test.go")
-	if err := os.WriteFile(external, []byte("package external\nimport (\n_ \"github.com/looprig/harness/pkg/rig\"\n_ \"github.com/looprig/foreignloop/backend\"\n)\n"), 0o600); err != nil {
+	writeModuleFixture(t, collectionRoot, "test-link", "module github.com/example/test-link\n", nil)
+	writeModuleFixture(t, collectionRoot, "integration-link", "module github.com/example/integration-link\n", nil)
+	writeModuleFixture(t, collectionRoot, "migration-link", "module github.com/example/migration-link\n", nil)
+	externalRoot := t.TempDir()
+	testSource := filepath.Join(externalRoot, "external-test-source")
+	if err := os.WriteFile(testSource, []byte("package external\nimport (\n_ \"github.com/looprig/harness/pkg/rig\"\n_ \"github.com/looprig/foreignloop/backend\"\n)\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	moduleRoot := filepath.Join(collectionRoot, "module")
-	if err := os.Symlink(external, filepath.Join(moduleRoot, "linked_test.go")); err != nil {
+	integrationSource := filepath.Join(externalRoot, "external-integration-source")
+	if err := os.WriteFile(integrationSource, []byte("//go:build plan9 && integration\n\npackage external\nimport (\n_ \"github.com/looprig/harness/pkg/rig\"\n_ \"github.com/looprig/foreignloop/backend\"\n)\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.Symlink(filepath.Join(moduleRoot, "second_test.go"), filepath.Join(moduleRoot, "first_test.go")); err != nil {
+	migrationSource := filepath.Join(externalRoot, "external-migration-source")
+	if err := os.WriteFile(migrationSource, []byte("//go:build migration\n\npackage external\nimport (\n_ \"github.com/looprig/harness/pkg/rig\"\n_ \"github.com/looprig/foreignloop/backend\"\n)\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.Symlink(filepath.Join(moduleRoot, "first_test.go"), filepath.Join(moduleRoot, "second_test.go")); err != nil {
+	if err := os.Symlink(testSource, filepath.Join(collectionRoot, "test-link", "linked_test.go")); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(integrationSource, filepath.Join(collectionRoot, "integration-link", "linked.go")); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(migrationSource, filepath.Join(collectionRoot, "migration-link", "linked.go")); err != nil {
 		t.Fatal(err)
 	}
 
 	violations, err := crossModuleOwnershipViolations(collectionRoot)
 	if err != nil {
-		t.Fatalf("crossModuleOwnershipViolations() followed a source symlink: %v", err)
+		t.Fatal(err)
+	}
+	want := []string{
+		"github.com/example/integration-link",
+		"github.com/example/migration-link",
+		"github.com/example/test-link",
+	}
+	if strings.Join(violations, "\n") != strings.Join(want, "\n") {
+		t.Fatalf("crossModuleOwnershipViolations() = %v, want %v", violations, want)
+	}
+}
+
+func TestCrossModuleOwnershipScannerRejectsBrokenGoSourceSymlinks(t *testing.T) {
+	tests := []struct {
+		name  string
+		setup func(*testing.T, string)
+	}{
+		{
+			name: "dangling",
+			setup: func(t *testing.T, root string) {
+				t.Helper()
+				if err := os.Symlink(filepath.Join(root, "missing"), filepath.Join(root, "linked_test.go")); err != nil {
+					t.Fatal(err)
+				}
+			},
+		},
+		{
+			name: "cycle",
+			setup: func(t *testing.T, root string) {
+				t.Helper()
+				if err := os.Symlink(filepath.Join(root, "second.go"), filepath.Join(root, "first.go")); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.Symlink(filepath.Join(root, "first.go"), filepath.Join(root, "second.go")); err != nil {
+					t.Fatal(err)
+				}
+			},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			collectionRoot := t.TempDir()
+			writeModuleFixture(t, collectionRoot, "module", "module github.com/example/module\n", nil)
+			tt.setup(t, filepath.Join(collectionRoot, "module"))
+			_, err := crossModuleOwnershipViolations(collectionRoot)
+			if err == nil || !strings.Contains(err.Error(), "resolve Go source symlink") {
+				t.Fatalf("crossModuleOwnershipViolations() error = %v, want clear Go source symlink resolution failure", err)
+			}
+		})
+	}
+}
+
+func TestCrossModuleOwnershipScannerDoesNotTraverseSymlinkedDirectories(t *testing.T) {
+	collectionRoot := t.TempDir()
+	writeModuleFixture(t, collectionRoot, "module", "module github.com/example/module\n", nil)
+	externalRoot := t.TempDir()
+	if err := os.WriteFile(filepath.Join(externalRoot, "ownership_test.go"), []byte("package external\nimport (\n_ \"github.com/looprig/harness/pkg/rig\"\n_ \"github.com/looprig/foreignloop/backend\"\n)\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	moduleRoot := filepath.Join(collectionRoot, "module")
+	if err := os.Symlink(externalRoot, filepath.Join(moduleRoot, "linked")); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(filepath.Join(externalRoot, "ownership_test.go"), filepath.Join(moduleRoot, "ignored.txt")); err != nil {
+		t.Fatal(err)
+	}
+
+	violations, err := crossModuleOwnershipViolations(collectionRoot)
+	if err != nil {
+		t.Fatal(err)
 	}
 	if len(violations) != 0 {
-		t.Fatalf("crossModuleOwnershipViolations() = %v, want source symlinks ignored", violations)
+		t.Fatalf("crossModuleOwnershipViolations() = %v, want directory and non-Go symlinks ignored", violations)
 	}
 }
 
@@ -542,8 +621,23 @@ func integrationTestSubjects(moduleRoot, modulePath string) (integrationSubjects
 		if walkErr != nil {
 			return walkErr
 		}
+		sourcePath := path
 		if path != moduleRoot && entry.Type()&os.ModeSymlink != 0 {
-			return nil
+			if filepath.Ext(path) != ".go" {
+				return nil
+			}
+			resolved, err := filepath.EvalSymlinks(path)
+			if err != nil {
+				return fmt.Errorf("resolve Go source symlink %s: %w", path, err)
+			}
+			info, err := os.Stat(resolved)
+			if err != nil {
+				return fmt.Errorf("inspect Go source symlink %s: %w", path, err)
+			}
+			if !info.Mode().IsRegular() {
+				return fmt.Errorf("inspect Go source symlink %s: target is not a regular file", path)
+			}
+			sourcePath = resolved
 		}
 		if entry.IsDir() {
 			if path == moduleRoot {
@@ -565,14 +659,14 @@ func integrationTestSubjects(moduleRoot, modulePath string) (integrationSubjects
 		if filepath.Ext(path) != ".go" {
 			return nil
 		}
-		owned, err := integrationOwnershipSource(path)
+		owned, err := integrationOwnershipSource(path, sourcePath)
 		if err != nil {
 			return err
 		}
 		if !owned {
 			return nil
 		}
-		parsed, err := parser.ParseFile(fset, path, nil, parser.ImportsOnly)
+		parsed, err := parser.ParseFile(fset, sourcePath, nil, parser.ImportsOnly)
 		if err != nil {
 			return err
 		}
@@ -591,11 +685,11 @@ func integrationTestSubjects(moduleRoot, modulePath string) (integrationSubjects
 	return subjects, err
 }
 
-func integrationOwnershipSource(path string) (bool, error) {
-	if strings.HasSuffix(path, "_test.go") {
+func integrationOwnershipSource(logicalPath, sourcePath string) (bool, error) {
+	if strings.HasSuffix(logicalPath, "_test.go") {
 		return true, nil
 	}
-	contents, err := os.ReadFile(path)
+	contents, err := os.ReadFile(sourcePath)
 	if err != nil {
 		return false, err
 	}
@@ -610,7 +704,7 @@ func integrationOwnershipSource(path string) (bool, error) {
 		}
 		expression, err := constraint.Parse(line)
 		if err != nil {
-			return false, fmt.Errorf("parse build constraint in %s: %w", path, err)
+			return false, fmt.Errorf("parse build constraint in %s: %w", logicalPath, err)
 		}
 		if hasPositiveOwnershipTag(expression, false) {
 			return true, nil
