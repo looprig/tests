@@ -44,19 +44,44 @@ type foreignloopProcess struct {
 	provider     foreignloopProvider
 	agent        driver.Agent
 	argsPath     string
+	callsPath    string
+	startedPath  string
+	releasePath  string
 	cwd          string
 	lateBoundSID string
 }
 
+type foreignloopProcessControl uint8
+
+const (
+	foreignloopProcessImmediate foreignloopProcessControl = iota
+	foreignloopProcessBlock
+	foreignloopProcessFailAfterRelease
+)
+
 func newForeignloopProcess(t *testing.T, provider foreignloopProvider, text, boundSID string) foreignloopProcess {
+	t.Helper()
+	return newControlledForeignloopProcess(t, provider, text, boundSID, foreignloopProcessImmediate)
+}
+
+func newControlledForeignloopProcess(t *testing.T, provider foreignloopProvider, text, boundSID string, control foreignloopProcessControl) foreignloopProcess {
 	t.Helper()
 	root := t.TempDir()
 	argsPath := filepath.Join(root, "argv")
+	callsPath := filepath.Join(root, "calls")
+	startedPath := filepath.Join(root, "started")
+	releasePath := filepath.Join(root, "release")
 	execPath := filepath.Join(root, "fake-provider")
-	if err := os.WriteFile(execPath, []byte(foreignloopExecutable(provider, text, boundSID)), 0o700); err != nil {
+	if err := os.WriteFile(execPath, []byte(foreignloopExecutable(provider, text, boundSID, control)), 0o700); err != nil {
 		t.Fatalf("write fake provider: %v", err)
 	}
-	parentEnv := []string{"LOOPRIG_FAKE_ARGS=" + argsPath}
+	parentEnv := []string{
+		"LOOPRIG_FAKE_ARGS=" + argsPath,
+		"LOOPRIG_FAKE_CALLS=" + callsPath,
+		"LOOPRIG_FAKE_STARTED=" + startedPath,
+		"LOOPRIG_FAKE_RELEASE=" + releasePath,
+	}
+	envAllow := []string{"LOOPRIG_FAKE_ARGS", "LOOPRIG_FAKE_CALLS", "LOOPRIG_FAKE_STARTED", "LOOPRIG_FAKE_RELEASE"}
 	var (
 		agent driver.Agent
 		err   error
@@ -67,7 +92,7 @@ func newForeignloopProcess(t *testing.T, provider foreignloopProvider, text, bou
 			ExecPath: execPath,
 			Home:     filepath.Join(root, "home"),
 			Model:    "fixture-model",
-			EnvAllow: []string{"LOOPRIG_FAKE_ARGS"},
+			EnvAllow: envAllow,
 		})
 	case foreignloopCodex:
 		agent, err = codex.NewAgent(parentEnv, codex.Config{
@@ -75,7 +100,7 @@ func newForeignloopProcess(t *testing.T, provider foreignloopProvider, text, bou
 			Model:            "fixture-model",
 			Sandbox:          codex.SandboxReadOnly,
 			Approval:         codex.ApprovalNever,
-			EnvAllow:         []string{"LOOPRIG_FAKE_ARGS"},
+			EnvAllow:         envAllow,
 			IgnoreUserConfig: true,
 			IgnoreRules:      true,
 			SkipGitRepoCheck: true,
@@ -86,11 +111,18 @@ func newForeignloopProcess(t *testing.T, provider foreignloopProvider, text, bou
 	if err != nil {
 		t.Fatalf("construct fake provider agent: %v", err)
 	}
-	return foreignloopProcess{provider: provider, agent: agent, argsPath: argsPath, cwd: t.TempDir(), lateBoundSID: boundSID}
+	return foreignloopProcess{
+		provider: provider, agent: agent, argsPath: argsPath, callsPath: callsPath,
+		startedPath: startedPath, releasePath: releasePath, cwd: t.TempDir(), lateBoundSID: boundSID,
+	}
 }
 
-func foreignloopExecutable(provider foreignloopProvider, text, boundSID string) string {
-	lines := []string{"#!/bin/sh", "set -eu", `: > "$LOOPRIG_FAKE_ARGS"`, `for arg in "$@"; do printf '%s\n' "$arg" >> "$LOOPRIG_FAKE_ARGS"; done`}
+func foreignloopExecutable(provider foreignloopProvider, text, boundSID string, control foreignloopProcessControl) string {
+	lines := []string{
+		"#!/bin/sh", "set -eu", `: > "$LOOPRIG_FAKE_ARGS"`,
+		`for arg in "$@"; do printf '%s\n' "$arg" >> "$LOOPRIG_FAKE_ARGS"; done`,
+		`printf '1\n' >> "$LOOPRIG_FAKE_CALLS"`,
+	}
 	var output []any
 	switch provider {
 	case foreignloopClaude:
@@ -108,12 +140,30 @@ func foreignloopExecutable(provider foreignloopProvider, text, boundSID string) 
 			map[string]any{"type": "turn.completed"},
 		}
 	}
-	for _, value := range output {
+	outputLimit := len(output)
+	if control != foreignloopProcessImmediate {
+		outputLimit = 1
+	}
+	for _, value := range output[:outputLimit] {
 		encoded, err := json.Marshal(value)
 		if err != nil {
 			panic(err)
 		}
 		lines = append(lines, "printf '%s\\n' "+shellSingleQuote(string(encoded)))
+	}
+	if control != foreignloopProcessImmediate {
+		lines = append(lines, `: > "$LOOPRIG_FAKE_STARTED"`, `while [ ! -e "$LOOPRIG_FAKE_RELEASE" ]; do sleep 0.01; done`)
+		if control == foreignloopProcessFailAfterRelease {
+			lines = append(lines, "exit 7")
+		} else {
+			for _, value := range output[outputLimit:] {
+				encoded, err := json.Marshal(value)
+				if err != nil {
+					panic(err)
+				}
+				lines = append(lines, "printf '%s\\n' "+shellSingleQuote(string(encoded)))
+			}
+		}
 	}
 	return strings.Join(lines, "\n") + "\n"
 }
@@ -170,6 +220,52 @@ func (p foreignloopProcess) assertStartNew(t *testing.T, foreignSID string) {
 	}
 }
 
+func (p foreignloopProcess) waitStarted(ctx context.Context) error {
+	ticker := time.NewTicker(10 * time.Millisecond)
+	defer ticker.Stop()
+	for {
+		if _, err := os.Stat(p.startedPath); err == nil {
+			return nil
+		} else if !errors.Is(err, os.ErrNotExist) {
+			return fmt.Errorf("stat fake provider start marker: %w", err)
+		}
+		select {
+		case <-ctx.Done():
+			return fmt.Errorf("wait for fake provider start: %w", ctx.Err())
+		case <-ticker.C:
+		}
+	}
+}
+
+func (p foreignloopProcess) release() error {
+	if err := os.WriteFile(p.releasePath, []byte("release\n"), 0o600); err != nil {
+		return fmt.Errorf("release fake provider: %w", err)
+	}
+	return nil
+}
+
+func (p foreignloopProcess) callCount() (int, error) {
+	data, err := os.ReadFile(p.callsPath)
+	if errors.Is(err, os.ErrNotExist) {
+		return 0, nil
+	}
+	if err != nil {
+		return 0, fmt.Errorf("read fake provider calls: %w", err)
+	}
+	return len(strings.Fields(string(data))), nil
+}
+
+func (p foreignloopProcess) assertCallCount(t *testing.T, want int) {
+	t.Helper()
+	got, err := p.callCount()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != want {
+		t.Fatalf("fake provider calls = %d, want %d", got, want)
+	}
+}
+
 func indexForeignloopArg(args []string, want string) int {
 	for index, arg := range args {
 		if arg == want {
@@ -180,6 +276,16 @@ func indexForeignloopArg(args []string, want string) int {
 }
 
 func foreignloopDefinition(t *testing.T, name string, engine loop.Engine, llm inference.Client, delegates ...string) loop.Definition {
+	t.Helper()
+	return foreignloopDefinitionWithStyle(t, name, engine, llm, loop.DelegationSyncOnly, delegates...)
+}
+
+func foreignloopManagedDefinition(t *testing.T, name string, engine loop.Engine, llm inference.Client, delegates ...string) loop.Definition {
+	t.Helper()
+	return foreignloopDefinitionWithStyle(t, name, engine, llm, loop.DelegationManaged, delegates...)
+}
+
+func foreignloopDefinitionWithStyle(t *testing.T, name string, engine loop.Engine, llm inference.Client, style loop.DelegationStyle, delegates ...string) loop.Definition {
 	t.Helper()
 	opts := []loop.Option{
 		loop.WithName(identity.AgentName(name)),
@@ -199,6 +305,7 @@ func foreignloopDefinition(t *testing.T, name string, engine loop.Engine, llm in
 				return foreignloopAllowAll{}, nil
 			}),
 			loop.WithPolicyRevision("foreignloop-integration-v1"),
+			loop.WithDelegation(loop.Delegation{Style: style}),
 		)
 	}
 	definition, err := loop.Define(opts...)
@@ -220,18 +327,25 @@ func (foreignloopAllowAll) Grant(context.Context, string, string, tool.ApprovalS
 
 func newForeignloopSession(t *testing.T, ctx context.Context, process foreignloopProcess, primary string, definitions ...loop.Definition) (session.SessionController, *sessionstore.Store) {
 	t.Helper()
+	return newForeignloopSessionWithOptions(t, ctx, process, primary, definitions, nil)
+}
+
+func newForeignloopSessionWithOptions(t *testing.T, ctx context.Context, process foreignloopProcess, primary string, definitions []loop.Definition, extra []rig.Option) (session.SessionController, *sessionstore.Store) {
+	t.Helper()
 	store, err := sessionstore.Open(memstore.New())
 	if err != nil {
 		t.Fatalf("sessionstore.Open: %v", err)
 	}
 	cfg := process.config()
-	r, err := rig.Define(
+	options := []rig.Option{
 		rig.WithLoops(definitions...),
 		rig.WithPrimers(primary),
 		rig.WithActivePrimer(primary),
 		rig.WithSessionStore(store),
 		rig.WithForeignBuilders(backend.BuildWith(cfg), backend.BuildRestoredWith(cfg)),
-	)
+	}
+	options = append(options, extra...)
+	r, err := rig.Define(options...)
 	if err != nil {
 		t.Fatalf("rig.Define: %v", err)
 	}
@@ -366,6 +480,109 @@ type foreignloopScriptLLM struct {
 	requests []inference.Request
 }
 
+type foreignloopScenarioStep func(context.Context, inference.Request) ([]content.Chunk, error)
+
+type foreignloopScenarioLLM struct {
+	mu    sync.Mutex
+	steps []foreignloopScenarioStep
+	next  int
+}
+
+func newForeignloopScenarioLLM(steps ...foreignloopScenarioStep) *foreignloopScenarioLLM {
+	return &foreignloopScenarioLLM{steps: steps}
+}
+
+func (*foreignloopScenarioLLM) Invoke(context.Context, inference.Request) (*inference.Response, error) {
+	return nil, errors.New("foreignloopScenarioLLM: Invoke is not used")
+}
+
+func (s *foreignloopScenarioLLM) Stream(ctx context.Context, request inference.Request) (*stream.StreamReader[content.Chunk], error) {
+	s.mu.Lock()
+	index := s.next
+	s.next++
+	s.mu.Unlock()
+	if index >= len(s.steps) {
+		return nil, fmt.Errorf("foreignloop scenario requested unexpected model step %d", index)
+	}
+	chunks, err := s.steps[index](ctx, request)
+	if err != nil {
+		return nil, fmt.Errorf("foreignloop scenario step %d: %w", index, err)
+	}
+	chunkIndex := 0
+	return stream.NewStreamReader(func() (content.Chunk, error) {
+		if chunkIndex == len(chunks) {
+			return nil, io.EOF
+		}
+		chunk := chunks[chunkIndex]
+		chunkIndex++
+		return chunk, nil
+	}, nil), nil
+}
+
+func (s *foreignloopScenarioLLM) callCount() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.next
+}
+
+func foreignloopToolCall(id, input string) []content.Chunk {
+	return []content.Chunk{foreignloopToolUse(id, "Subagent", input)}
+}
+
+func foreignloopFinal(text string) []content.Chunk {
+	return []content.Chunk{&content.TextChunk{Text: text}}
+}
+
+func foreignloopLastToolResult(request inference.Request) (string, error) {
+	for index := len(request.Messages) - 1; index >= 0; index-- {
+		message, ok := request.Messages[index].(*content.ToolResultMessage)
+		if !ok {
+			continue
+		}
+		var result strings.Builder
+		for _, block := range message.Blocks {
+			text, ok := block.(*content.TextBlock)
+			if ok {
+				result.WriteString(text.Text)
+			}
+		}
+		return result.String(), nil
+	}
+	return "", errors.New("model request has no tool result")
+}
+
+type foreignloopQueuedResult struct {
+	DelegateID string `json:"delegate_id"`
+	RequestID  string `json:"request_id"`
+	Status     string `json:"status"`
+}
+
+func foreignloopLastQueuedResult(request inference.Request) (foreignloopQueuedResult, error) {
+	text, err := foreignloopLastToolResult(request)
+	if err != nil {
+		return foreignloopQueuedResult{}, err
+	}
+	var result foreignloopQueuedResult
+	if err := json.Unmarshal([]byte(text), &result); err != nil {
+		return foreignloopQueuedResult{}, fmt.Errorf("decode queued tool result %q: %w", text, err)
+	}
+	if result.DelegateID == "" || result.RequestID == "" || result.Status != "queued" {
+		return foreignloopQueuedResult{}, fmt.Errorf("queued tool result = %+v, want non-empty ids and queued status", result)
+	}
+	return result, nil
+}
+
+func foreignloopExpectLastToolResult(request inference.Request, want string) error {
+	got, err := foreignloopLastToolResult(request)
+	if err != nil {
+		return err
+	}
+	if got != want {
+		return fmt.Errorf("tool result = %q, want %q", got, want)
+	}
+	return nil
+}
+
 func newForeignloopScriptLLM(replies ...[]content.Chunk) *foreignloopScriptLLM {
 	return &foreignloopScriptLLM{replies: replies}
 }
@@ -423,4 +640,5 @@ func foreignloopToolUse(id, name, input string) content.Chunk {
 }
 
 var _ inference.Client = (*foreignloopScriptLLM)(nil)
+var _ inference.Client = (*foreignloopScenarioLLM)(nil)
 var _ loop.PermissionGate = foreignloopAllowAll{}
