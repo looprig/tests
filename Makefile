@@ -1,5 +1,8 @@
 .PHONY: test fmt-check vet dependency-boundary local-source-check check release-check
 
+RELEASE_MODFILE ?= go.release.mod
+RELEASE_GO ?= go
+
 test:
 	GOWORK=off go test -tags integration -race ./...
 
@@ -18,6 +21,6 @@ local-source-check:
 check: fmt-check vet dependency-boundary local-source-check test
 
 release-check:
-	@test -f go.release.mod || (echo "go.release.mod is not prepared" >&2; exit 1)
-	@! grep -Eq '^[[:space:]]*replace([[:space:]]|$$)' go.release.mod || (echo "go.release.mod contains local replace directives" >&2; exit 1)
-	GOWORK=off go test -modfile=go.release.mod -tags integration -race ./...
+	@test -f "$(RELEASE_MODFILE)" || (echo "$(RELEASE_MODFILE) is not prepared" >&2; exit 1)
+	@sh scripts/check-release-modfile.sh "$(RELEASE_MODFILE)"
+	GOWORK=off $(RELEASE_GO) test -modfile="$(RELEASE_MODFILE)" -tags integration -race ./...
