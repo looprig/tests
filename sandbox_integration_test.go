@@ -80,11 +80,17 @@ func TestSandboxFilesystemPathAndTreeGrantsAreDistinct(t *testing.T) {
 	executor := sandboxIntegrationExecutor(t, set, "grants")
 
 	exact := filepath.Join(workspace, "exact.txt")
+	if err := os.WriteFile(exact, []byte("original"), 0o600); err != nil {
+		t.Fatalf("pre-create exact Path target: %v", err)
+	}
 	exactCommand := "printf path > " + shellQuote(exact)
 	exactGrant := issueSandboxGrant(t, executor, "path-create", exactCommand, workspace,
 		"filesystem.write", exact, "filesystem.path.write.v1", exact)
 	if out, code, err := executor.RunCommandWithGrants(context.Background(), "path-create", workspace, exactCommand, []string{exactGrant}); err != nil || code != 0 {
 		t.Fatalf("exact Path grant run = code %d err %v out %q", code, err, out)
+	}
+	if got, err := os.ReadFile(exact); err != nil || string(got) != "path" {
+		t.Fatalf("exact Path target after grant = %q, %v", got, err)
 	}
 
 	sibling := filepath.Join(workspace, "sibling.txt")
