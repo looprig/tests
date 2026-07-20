@@ -1,10 +1,13 @@
-.PHONY: test fmt-check vet dependency-boundary local-source-check check release-check
+.PHONY: test live-network fmt-check vet dependency-boundary local-source-check check release-check
 
 RELEASE_MODFILE ?= go.release.mod
 RELEASE_GO ?= go
 
 test:
-	GOWORK=off go test -tags integration -race ./...
+	LOOPRIG_LIVE_NETWORK=0 GOWORK=off go test -tags integration -race ./...
+
+live-network:
+	LOOPRIG_LIVE_NETWORK=1 GOWORK=off go test -tags integration -race -count=1 -run '^TestSandboxBroadNetworkGrantCarriesDNS$$' .
 
 fmt-check:
 	@test -z "$$(gofmt -l .)" || (gofmt -l . && exit 1)

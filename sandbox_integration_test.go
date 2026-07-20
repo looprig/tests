@@ -217,6 +217,9 @@ func TestSandboxGrantRejectsPostApprovalSymlinkSwap(t *testing.T) {
 }
 
 func TestSandboxBroadNetworkGrantCarriesDNS(t *testing.T) {
+	if os.Getenv("LOOPRIG_LIVE_NETWORK") != "1" {
+		t.Skip("set LOOPRIG_LIVE_NETWORK=1 to run the external DNS/HTTPS integration")
+	}
 	curl := requireExternalHTTPS(t)
 	workspace := t.TempDir()
 	profile := newSandboxIntegrationProfile(t, workspace, sandbox.Allow, sandbox.Gated)
@@ -323,13 +326,13 @@ func requireExternalHTTPS(t *testing.T) string {
 	t.Helper()
 	curl, err := exec.LookPath("curl")
 	if err != nil {
-		t.Skip("broad DNS integration requires curl")
+		t.Fatalf("LOOPRIG_LIVE_NETWORK=1 requires curl: %v", err)
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
 	command := exec.CommandContext(ctx, curl, "--noproxy", "*", "--fail", "--silent", "--show-error", "--connect-timeout", "8", "--max-time", "15", "https://example.com/")
 	if output, err := command.CombinedOutput(); err != nil {
-		t.Skipf("live external DNS/HTTPS prerequisite unavailable before sandboxing: %v (%s)", err, output)
+		t.Fatalf("LOOPRIG_LIVE_NETWORK=1 external DNS/HTTPS control failed before sandboxing: %v (%s)", err, output)
 	}
 	return curl
 }
