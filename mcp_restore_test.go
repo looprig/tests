@@ -30,7 +30,6 @@ package tests
 
 import (
 	"context"
-	"errors"
 	"strings"
 	"testing"
 
@@ -380,20 +379,19 @@ func TestRemovedToolOnARestoredSessionReturnsToolUnavailable(t *testing.T) {
 	}
 }
 
-// TestMCPConfigDriftIsReportedThroughConfigMismatch is the fingerprint half of
-// the story: when an application DOES contribute its MCP identity to the config
-// fingerprint, a changed MCP configuration surfaces as the ordinary restore
-// decision — a typed *ConfigMismatchError — and WithAllowConfigMismatch resumes
-// through it.
+// TestMCPConfigDriftIsAutoAdoptedAndRecorded is the fingerprint half of the
+// story: when an application contributes its MCP identity to the configuration
+// manifest, a changed MCP configuration is classified as informational drift,
+// accepted by the default policy, and recorded as a durable configuration epoch.
 //
 // There are no MCP servers in this test, and that is deliberate. What is under
 // test is the seam, not the digest: that ExternalCapabilityRev reaches the
-// journal, that restore compares it, and that a difference is reported as config
-// drift rather than as a broken session. The digest's own properties — that it
+// journal, that restore compares it, and that a difference is durably reported
+// rather than silently ignored. The digest's own properties — that it
 // moves when a catalog moves, and that it never carries a secret — are
 // mcp/pkg/harness's tests, where they can be asserted exhaustively instead of
 // through a subprocess.
-func TestMCPConfigDriftIsReportedThroughConfigMismatch(t *testing.T) {
+func TestMCPConfigDriftIsAutoAdoptedAndRecorded(t *testing.T) {
 	t.Parallel()
 	ctx := itCtx(t)
 	store, err := sessionstore.Open(memstore.New())
@@ -423,42 +421,22 @@ func TestMCPConfigDriftIsReportedThroughConfigMismatch(t *testing.T) {
 		t.Fatalf("SessionStarted.Config.ExternalCapabilityRev = %q, want %q: the composition root's MCP identity never reached the journal", stamped, revOne)
 	}
 
-	// Same everything, different MCP configuration: restore must refuse.
-	_, err = newRestorableRig(t, store, "planner", newScriptLLM(say("two")), revTwo).rig.RestoreSession(ctx, id)
-	if err == nil {
-		t.Fatal("restore accepted a changed MCP configuration without a word")
-	}
-	var mismatch *session.ConfigMismatchError
-	if !errors.As(err, &mismatch) {
-		t.Fatalf("restore under a changed MCP configuration returned %T (%v), want a *session.ConfigMismatchError", err, err)
-	}
-
-	// The same MCP configuration restores without an override, so the mismatch
-	// above is about the change and not about the field's mere presence.
+	// The same MCP configuration restores without creating a new epoch, so the
+	// later adoption is about the change and not the field's mere presence.
 	same, err := newRestorableRig(t, store, "planner", newScriptLLM(say("same")), revOne).rig.RestoreSession(ctx, id)
 	if err != nil {
 		t.Fatalf("restore under an UNCHANGED MCP configuration was refused: %v", err)
 	}
 	shutdown(t, same)
 
-	// And the existing override is the decision: an application that means to
-	// resume across an MCP change says so, and does.
-	r, err := rig.Define(
-		rig.WithLoops(newLoop(t, "planner", newScriptLLM(say("three")), approveAll())),
-		rig.WithPrimers("planner"),
-		rig.WithActivePrimer("planner"),
-		rig.WithSessionStore(store),
-		rig.WithFingerprintFields(rig.ConfigFingerprintFields{ExternalCapabilityRev: revTwo}),
-		rig.WithAllowConfigMismatch(),
-	)
+	// External catalog drift is Info, so the default policy resumes and records
+	// exactly what changed as configuration epoch 2.
+	resumed, err := newRestorableRig(t, store, "planner", newScriptLLM(say("two")), revTwo).rig.RestoreSession(ctx, id)
 	if err != nil {
-		t.Fatalf("rig.Define: %v", err)
-	}
-	resumed, err := r.RestoreSession(ctx, id)
-	if err != nil {
-		t.Fatalf("WithAllowConfigMismatch did not resume across an MCP configuration change: %v", err)
+		t.Fatalf("default policy refused informational MCP configuration drift: %v", err)
 	}
 	shutdown(t, resumed)
+	assertExternalCapabilityAdoption(t, ctx, store, id, revOne, revTwo)
 }
 
 // TestOldJournalWithoutExternalCapabilityRestores is the additive property where
@@ -626,9 +604,9 @@ func TestMCPIdentityStampedAtCreationRestoresWithoutDrift(t *testing.T) {
 	shutdown(t, restored)
 }
 
-// TestChangedMCPServersDriftAtRestore is the other half: the digest must move
-// when the servers really do, and that movement must arrive as the ordinary
-// restore decision rather than as a broken Session.
+// TestChangedMCPServersAdoptDriftAtRestore is the other half: the digest must
+// move when the servers really do, and that movement must be durably adopted as
+// informational drift rather than breaking the Session.
 //
 // Both legs run the same command with the same number of arguments, so the
 // binding's declared configuration — its transport, its origin, its filter, its
@@ -636,7 +614,7 @@ func TestMCPIdentityStampedAtCreationRestoresWithoutDrift(t *testing.T) {
 // catalog the server turned out to serve. That is deliberate: it proves the digest
 // covers what was NEGOTIATED, which is the half no application could compute for
 // itself and the half that needs a live connection before the Session exists.
-func TestChangedMCPServersDriftAtRestore(t *testing.T) {
+func TestChangedMCPServersAdoptDriftAtRestore(t *testing.T) {
 	t.Parallel()
 	ctx := itCtx(t)
 	store, err := sessionstore.Open(memstore.New())
@@ -662,30 +640,37 @@ func TestChangedMCPServersDriftAtRestore(t *testing.T) {
 		t.Fatalf("a server offering a different toolset digested to the same %q: the identity does not cover the negotiated catalog, and this test proves nothing", revOne)
 	}
 
-	_, err = newRestorableRig(t, store, "planner", newScriptLLM(say("two")), revTwo).rig.RestoreSession(ctx, id)
-	if err == nil {
-		t.Fatal("restore accepted a changed MCP catalog without a word")
-	}
-	var mismatch *session.ConfigMismatchError
-	if !errors.As(err, &mismatch) {
-		t.Fatalf("restore under changed MCP servers returned %T (%v), want a *session.ConfigMismatchError", err, err)
-	}
-
-	// And an application that means to resume across the change says so, and does.
-	r, err := rig.Define(
-		rig.WithLoops(newLoop(t, "planner", newScriptLLM(say("three")), approveAll())),
-		rig.WithPrimers("planner"),
-		rig.WithActivePrimer("planner"),
-		rig.WithSessionStore(store),
-		rig.WithFingerprintFields(rig.ConfigFingerprintFields{ExternalCapabilityRev: revTwo}),
-		rig.WithAllowConfigMismatch(),
-	)
+	resumed, err := newRestorableRig(t, store, "planner", newScriptLLM(say("two")), revTwo).rig.RestoreSession(ctx, id)
 	if err != nil {
-		t.Fatalf("rig.Define: %v", err)
-	}
-	resumed, err := r.RestoreSession(ctx, id)
-	if err != nil {
-		t.Fatalf("WithAllowConfigMismatch did not resume across a real MCP catalog change: %v", err)
+		t.Fatalf("default policy refused informational drift from changed MCP servers: %v", err)
 	}
 	shutdown(t, resumed)
+	assertExternalCapabilityAdoption(t, ctx, store, id, revOne, revTwo)
+}
+
+func assertExternalCapabilityAdoption(t *testing.T, ctx context.Context, store *sessionstore.Store, id uuid.UUID, oldRev, newRev string) {
+	t.Helper()
+	var adoptions []event.ConfigurationAdopted
+	for _, ev := range eventsFor(t, ctx, store, id) {
+		if adopted, ok := ev.(event.ConfigurationAdopted); ok {
+			adoptions = append(adoptions, adopted)
+		}
+	}
+	if len(adoptions) != 1 {
+		t.Fatalf("ConfigurationAdopted count = %d, want 1", len(adoptions))
+	}
+	adopted := adoptions[0]
+	if adopted.Epoch != 2 || adopted.Source != event.DecisionSourcePolicy {
+		t.Fatalf("ConfigurationAdopted epoch/source = %d/%q, want 2/%q", adopted.Epoch, adopted.Source, event.DecisionSourcePolicy)
+	}
+	if adopted.Manifest.ExternalCapabilityRev != newRev {
+		t.Fatalf("adopted external capability rev = %q, want %q", adopted.Manifest.ExternalCapabilityRev, newRev)
+	}
+	if len(adopted.Drift) != 1 {
+		t.Fatalf("ConfigurationAdopted drift = %+v, want one external change", adopted.Drift)
+	}
+	change := adopted.Drift[0]
+	if change.Category != event.DriftExternal || change.Severity != event.DriftInfo || change.Old != oldRev || change.New != newRev {
+		t.Fatalf("external drift = %+v, want category=%q severity=%q old=%q new=%q", change, event.DriftExternal, event.DriftInfo, oldRev, newRev)
+	}
 }
