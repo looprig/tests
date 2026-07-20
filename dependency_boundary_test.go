@@ -17,41 +17,48 @@ import (
 )
 
 const (
-	testsModulePath       = "github.com/looprig/tests"
-	harnessModulePath     = "github.com/looprig/harness"
-	foreignloopModulePath = "github.com/looprig/foreignloop"
+	testsModulePath        = "github.com/looprig/tests"
+	harnessModulePath      = "github.com/looprig/harness"
+	foreignloopsModulePath = "github.com/looprig/foreignloops"
 )
+
+func TestForeignloopsModulePathMatchesUpstream(t *testing.T) {
+	const want = "github.com/looprig/foreignloops"
+	if foreignloopsModulePath != want {
+		t.Fatalf("foreignloopsModulePath = %q, want %q", foreignloopsModulePath, want)
+	}
+}
 
 func TestCrossModuleOwnershipScannerRejectsOnlyDualIntegrationOwners(t *testing.T) {
 	root := t.TempDir()
 	writeModuleFixture(t, root, "tests", "module github.com/looprig/tests\n", map[string]string{
-		"integration_test.go": "package tests\nimport (\n_ \"github.com/looprig/harness/pkg/rig\"\n_ \"github.com/looprig/foreignloop/backend\"\n)\n",
+		"integration_test.go": "package tests\nimport (\n_ \"github.com/looprig/harness/pkg/rig\"\n_ \"github.com/looprig/foreignloops/backend\"\n)\n",
 	})
 	writeModuleFixture(t, root, "product", `module github.com/example/product
 
 require (
 	github.com/looprig/harness v0.0.0
-	github.com/looprig/foreignloop v0.0.0
+	github.com/looprig/foreignloops v0.0.0
 )
 
 replace github.com/looprig/harness => ../harness
-replace github.com/looprig/foreignloop => ../foreignloop
+replace github.com/looprig/foreignloops => ../foreignloop
 `, map[string]string{
-		"main.go":            "package product\nimport (\n_ \"github.com/looprig/harness/pkg/rig\"\n_ \"github.com/looprig/foreignloop/backend\"\n)\n",
-		"not_integration.go": "//go:build !integration\n\npackage product\nimport (\n_ \"github.com/looprig/harness/pkg/rig\"\n_ \"github.com/looprig/foreignloop/backend\"\n)\n",
+		"main.go":            "package product\nimport (\n_ \"github.com/looprig/harness/pkg/rig\"\n_ \"github.com/looprig/foreignloops/backend\"\n)\n",
+		"not_integration.go": "//go:build !integration\n\npackage product\nimport (\n_ \"github.com/looprig/harness/pkg/rig\"\n_ \"github.com/looprig/foreignloops/backend\"\n)\n",
 	})
 	writeModuleFixture(t, root, "bad-test", "module github.com/example/bad-test\n", map[string]string{
-		"nested/owner_test.go": "package nested\nimport (\n_ \"github.com/looprig/harness/pkg/session\"\n_ \"github.com/looprig/foreignloop/driver/claude\"\n)\n",
+		"nested/owner_test.go": "package nested\nimport (\n_ \"github.com/looprig/harness/pkg/session\"\n_ \"github.com/looprig/foreignloops/driver/claude\"\n)\n",
 	})
 	writeModuleFixture(t, root, "bad-integration-tag", "module github.com/example/bad-integration-tag\n", map[string]string{
-		"nested/owner.go": "//go:build plan9 && integration\n\npackage nested\nimport (\n_ \"github.com/looprig/harness/pkg/session\"\n_ \"github.com/looprig/foreignloop/driver/claude\"\n)\n",
+		"nested/owner.go": "//go:build plan9 && integration\n\npackage nested\nimport (\n_ \"github.com/looprig/harness/pkg/session\"\n_ \"github.com/looprig/foreignloops/driver/claude\"\n)\n",
 	})
 	writeModuleFixture(t, root, "bad-migration-tag", "module github.com/example/bad-migration-tag\n", map[string]string{
-		"owner.go": "//go:build migration\n\npackage owner\nimport (\n_ \"github.com/looprig/harness/pkg/session\"\n_ \"github.com/looprig/foreignloop/backend\"\n)\n",
+		"owner.go": "//go:build migration\n\npackage owner\nimport (\n_ \"github.com/looprig/harness/pkg/session\"\n_ \"github.com/looprig/foreignloops/backend\"\n)\n",
 	})
 	writeModuleFixture(t, root, "bad-split-tests", "module github.com/example/bad-split-tests\n", map[string]string{
 		"harness_test.go":     "package owner\nimport _ \"github.com/looprig/harness/pkg/session\"\n",
-		"foreignloop_test.go": "package owner\nimport _ \"github.com/looprig/foreignloop/backend\"\n",
+		"foreignloop_test.go": "package owner\nimport _ \"github.com/looprig/foreignloops/backend\"\n",
 	})
 
 	violations, err := crossModuleOwnershipViolations(root)
@@ -75,10 +82,10 @@ func TestCrossModuleOwnershipScannerSkipsNestedModulesAndSimilarNames(t *testing
 
 require github.com/looprig/harnessed v0.0.0
 `, map[string]string{
-		"consumer.go":   "package consumer\nimport _ \"github.com/looprig/foreignloopish/backend\"\n",
+		"consumer.go":   "package consumer\nimport _ \"github.com/looprig/foreignloopsish/backend\"\n",
 		"nested/go.mod": "module github.com/example/nested\n",
-		"nested/bad.go": "package nested\nimport (\n_ \"github.com/looprig/harness/pkg/rig\"\n_ \"github.com/looprig/foreignloop/backend\"\n)\n",
-		"vendor/bad.go": "package vendor\nimport (\n_ \"github.com/looprig/harness/pkg/rig\"\n_ \"github.com/looprig/foreignloop/backend\"\n)\n",
+		"nested/bad.go": "package nested\nimport (\n_ \"github.com/looprig/harness/pkg/rig\"\n_ \"github.com/looprig/foreignloops/backend\"\n)\n",
+		"vendor/bad.go": "package vendor\nimport (\n_ \"github.com/looprig/harness/pkg/rig\"\n_ \"github.com/looprig/foreignloops/backend\"\n)\n",
 	})
 
 	violations, err := crossModuleOwnershipViolations(root)
@@ -94,7 +101,7 @@ func TestCrossModuleOwnershipScannerFollowsImmediateSiblingModuleSymlink(t *test
 	collectionRoot := t.TempDir()
 	targetRoot := t.TempDir()
 	writeModuleFixture(t, targetRoot, "linked-module", "module github.com/example/linked\n", map[string]string{
-		"ownership_test.go": "package linked\nimport (\n_ \"github.com/looprig/harness/pkg/rig\"\n_ \"github.com/looprig/foreignloop/backend\"\n)\n",
+		"ownership_test.go": "package linked\nimport (\n_ \"github.com/looprig/harness/pkg/rig\"\n_ \"github.com/looprig/foreignloops/backend\"\n)\n",
 	})
 	if err := os.Symlink(filepath.Join(targetRoot, "linked-module"), filepath.Join(collectionRoot, "linked")); err != nil {
 		t.Fatal(err)
@@ -113,7 +120,7 @@ func TestCrossModuleOwnershipScannerFollowsImmediateSiblingModuleSymlink(t *test
 func TestCrossModuleOwnershipScannerDeduplicatesRealAndSymlinkRoots(t *testing.T) {
 	collectionRoot := t.TempDir()
 	writeModuleFixture(t, collectionRoot, "real", "module github.com/example/real\n", map[string]string{
-		"ownership_test.go": "package real\nimport (\n_ \"github.com/looprig/harness/pkg/rig\"\n_ \"github.com/looprig/foreignloop/backend\"\n)\n",
+		"ownership_test.go": "package real\nimport (\n_ \"github.com/looprig/harness/pkg/rig\"\n_ \"github.com/looprig/foreignloops/backend\"\n)\n",
 	})
 	if err := os.Symlink(filepath.Join(collectionRoot, "real"), filepath.Join(collectionRoot, "alias")); err != nil {
 		t.Fatal(err)
@@ -175,15 +182,15 @@ func TestCrossModuleOwnershipScannerRejectsOwnedGoSourceSymlinks(t *testing.T) {
 	writeModuleFixture(t, collectionRoot, "migration-link", "module github.com/example/migration-link\n", nil)
 	externalRoot := t.TempDir()
 	testSource := filepath.Join(externalRoot, "external-test-source")
-	if err := os.WriteFile(testSource, []byte("package external\nimport (\n_ \"github.com/looprig/harness/pkg/rig\"\n_ \"github.com/looprig/foreignloop/backend\"\n)\n"), 0o600); err != nil {
+	if err := os.WriteFile(testSource, []byte("package external\nimport (\n_ \"github.com/looprig/harness/pkg/rig\"\n_ \"github.com/looprig/foreignloops/backend\"\n)\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	integrationSource := filepath.Join(externalRoot, "external-integration-source")
-	if err := os.WriteFile(integrationSource, []byte("//go:build plan9 && integration\n\npackage external\nimport (\n_ \"github.com/looprig/harness/pkg/rig\"\n_ \"github.com/looprig/foreignloop/backend\"\n)\n"), 0o600); err != nil {
+	if err := os.WriteFile(integrationSource, []byte("//go:build plan9 && integration\n\npackage external\nimport (\n_ \"github.com/looprig/harness/pkg/rig\"\n_ \"github.com/looprig/foreignloops/backend\"\n)\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	migrationSource := filepath.Join(externalRoot, "external-migration-source")
-	if err := os.WriteFile(migrationSource, []byte("//go:build migration\n\npackage external\nimport (\n_ \"github.com/looprig/harness/pkg/rig\"\n_ \"github.com/looprig/foreignloop/backend\"\n)\n"), 0o600); err != nil {
+	if err := os.WriteFile(migrationSource, []byte("//go:build migration\n\npackage external\nimport (\n_ \"github.com/looprig/harness/pkg/rig\"\n_ \"github.com/looprig/foreignloops/backend\"\n)\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	if err := os.Symlink(testSource, filepath.Join(collectionRoot, "test-link", "linked_test.go")); err != nil {
@@ -254,7 +261,7 @@ func TestCrossModuleOwnershipScannerDoesNotTraverseSymlinkedDirectories(t *testi
 	collectionRoot := t.TempDir()
 	writeModuleFixture(t, collectionRoot, "module", "module github.com/example/module\n", nil)
 	externalRoot := t.TempDir()
-	if err := os.WriteFile(filepath.Join(externalRoot, "ownership_test.go"), []byte("package external\nimport (\n_ \"github.com/looprig/harness/pkg/rig\"\n_ \"github.com/looprig/foreignloop/backend\"\n)\n"), 0o600); err != nil {
+	if err := os.WriteFile(filepath.Join(externalRoot, "ownership_test.go"), []byte("package external\nimport (\n_ \"github.com/looprig/harness/pkg/rig\"\n_ \"github.com/looprig/foreignloops/backend\"\n)\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	moduleRoot := filepath.Join(collectionRoot, "module")
@@ -284,7 +291,7 @@ func TestCrossModuleOwnershipBoundary(t *testing.T) {
 		t.Fatal(err)
 	}
 	for _, violation := range violations {
-		t.Errorf("module %s imports both Harness and foreignloop; cross-module integration belongs only to %s", violation, testsModulePath)
+		t.Errorf("module %s imports both Harness and foreignloops; cross-module integration belongs only to %s", violation, testsModulePath)
 	}
 }
 
@@ -292,7 +299,7 @@ func TestDevelopmentModuleSourcesAcceptSiblingLayouts(t *testing.T) {
 	collectionRoot := t.TempDir()
 	modules := map[string]string{
 		"core":        "github.com/looprig/core",
-		"foreignloop": "github.com/looprig/foreignloop",
+		"foreignloop": "github.com/looprig/foreignloops",
 		"fsstore":     "github.com/looprig/fsstore",
 		"harness":     "github.com/looprig/harness",
 		"inference":   "github.com/looprig/inference",
@@ -307,7 +314,7 @@ func TestDevelopmentModuleSourcesAcceptSiblingLayouts(t *testing.T) {
 replace (
 	github.com/looprig/core => ../core
 	github.com/looprig/harness => ../harness
-	github.com/looprig/foreignloop => ../foreignloop
+	github.com/looprig/foreignloops => ../foreignloop
 	github.com/looprig/fsstore => ../fsstore
 	github.com/looprig/inference => ../inference
 	github.com/looprig/mcp => ../mcp
@@ -327,11 +334,11 @@ replace (
 func TestDevelopmentModuleSourcesRejectWrongAndMissingLocalSources(t *testing.T) {
 	collectionRoot := t.TempDir()
 	writeModuleFixture(t, collectionRoot, "harness", "module github.com/example/wrong\n", nil)
-	writeModuleFixture(t, collectionRoot, "foreignloop", "module github.com/looprig/foreignloop\n", nil)
+	writeModuleFixture(t, collectionRoot, "foreignloop", "module github.com/looprig/foreignloops\n", nil)
 	writeModuleFixture(t, collectionRoot, "tests", `module github.com/looprig/tests
 
 replace github.com/looprig/harness => ../harness
-replace github.com/looprig/foreignloop => ../../deep/foreignloop
+replace github.com/looprig/foreignloops => ../../deep/foreignloop
 `, nil)
 
 	violations, err := developmentModuleSourceViolations(filepath.Join(collectionRoot, "tests"))
@@ -340,7 +347,7 @@ replace github.com/looprig/foreignloop => ../../deep/foreignloop
 	}
 	want := []string{
 		"github.com/looprig/core has no local development replacement",
-		"github.com/looprig/foreignloop replacement must use ../foreignloop, got ../../deep/foreignloop",
+		"github.com/looprig/foreignloops replacement must use ../foreignloop, got ../../deep/foreignloop",
 		"github.com/looprig/fsstore has no local development replacement",
 		"github.com/looprig/harness replacement resolves to module github.com/example/wrong",
 		"github.com/looprig/inference has no local development replacement",
@@ -367,8 +374,8 @@ func TestDevelopmentModuleSources(t *testing.T) {
 }
 
 type integrationSubjects struct {
-	harness     bool
-	foreignloop bool
+	harness      bool
+	foreignloops bool
 }
 
 func crossModuleOwnershipViolations(collectionRoot string) ([]string, error) {
@@ -391,7 +398,7 @@ func crossModuleOwnershipViolations(collectionRoot string) ([]string, error) {
 		if err != nil {
 			return nil, fmt.Errorf("scan sibling module %s: %w", modulePath, err)
 		}
-		if modulePath != testsModulePath && subjects.harness && subjects.foreignloop {
+		if modulePath != testsModulePath && subjects.harness && subjects.foreignloops {
 			violations = append(violations, modulePath)
 		}
 	}
@@ -476,7 +483,7 @@ func developmentModuleSourceViolations(moduleRoot string) ([]string, error) {
 		directory  string
 	}{
 		{modulePath: "github.com/looprig/core", directory: "core"},
-		{modulePath: foreignloopModulePath, directory: "foreignloop"},
+		{modulePath: foreignloopsModulePath, directory: "foreignloop"},
 		{modulePath: "github.com/looprig/fsstore", directory: "fsstore"},
 		{modulePath: harnessModulePath, directory: "harness"},
 		{modulePath: "github.com/looprig/inference", directory: "inference"},
@@ -730,7 +737,7 @@ func hasPositiveOwnershipTag(expression constraint.Expr, negated bool) bool {
 
 func (subjects *integrationSubjects) addImportPath(importPath string) {
 	subjects.harness = subjects.harness || hasModulePathPrefix(importPath, harnessModulePath)
-	subjects.foreignloop = subjects.foreignloop || hasModulePathPrefix(importPath, foreignloopModulePath)
+	subjects.foreignloops = subjects.foreignloops || hasModulePathPrefix(importPath, foreignloopsModulePath)
 }
 
 func hasModulePathPrefix(importPath, modulePath string) bool {

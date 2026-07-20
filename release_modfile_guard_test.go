@@ -25,7 +25,7 @@ go 1.26.4
 
 require (
 	github.com/looprig/harness v0.13.0
-	github.com/looprig/foreignloop v0.1.0
+	github.com/looprig/foreignloops v0.1.0
 )
 `,
 		},
@@ -55,7 +55,7 @@ replace github.com/looprig/harness => ../harness
 go 1.26.4
 
 replace (
-	github.com/looprig/foreignloop => /private/tmp/foreignloop
+	github.com/looprig/foreignloops => /private/tmp/foreignloop
 )
 `,
 			wantErr:    "local filesystem replacement",
@@ -77,7 +77,7 @@ replace github.com/looprig/harness => file:///private/tmp/harness
 
 go 1.26.4
 
-replace github.com/looprig/foreignloop => local-foreignloop
+replace github.com/looprig/foreignloops => local-foreignloop
 `,
 			wantErr: "local filesystem replacement",
 		},

@@ -4,7 +4,7 @@ go 1.26.4
 
 require (
 	github.com/looprig/core v0.2.0
-	github.com/looprig/foreignloop v0.0.0
+	github.com/looprig/foreignloops v0.0.0
 	github.com/looprig/fsstore v0.2.0
 	github.com/looprig/harness v0.10.0
 	github.com/looprig/inference v0.3.1-0.20260718005749-13e4d7f173b3
@@ -22,7 +22,7 @@ replace github.com/looprig/storage => ../storage
 // go.release.mod with tagged modules and no local replacements.
 replace github.com/looprig/harness => ../harness
 
-replace github.com/looprig/foreignloop => ../foreignloop
+replace github.com/looprig/foreignloops => ../foreignloop
 
 replace github.com/looprig/fsstore => ../fsstore
 
