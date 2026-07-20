@@ -304,6 +304,7 @@ func TestDevelopmentModuleSourcesAcceptSiblingLayouts(t *testing.T) {
 		"harness":     "github.com/looprig/harness",
 		"inference":   "github.com/looprig/inference",
 		"mcp":         "github.com/looprig/mcp",
+		"sandbox":     "github.com/looprig/sandbox",
 		"storage":     "github.com/looprig/storage",
 	}
 	for directory, modulePath := range modules {
@@ -318,6 +319,7 @@ replace (
 	github.com/looprig/fsstore => ../fsstore
 	github.com/looprig/inference => ../inference
 	github.com/looprig/mcp => ../mcp
+	github.com/looprig/sandbox => ../sandbox
 	github.com/looprig/storage => ../storage
 )
 `, nil)
@@ -352,6 +354,7 @@ replace github.com/looprig/foreignloops => ../../deep/foreignloop
 		"github.com/looprig/harness replacement resolves to module github.com/example/wrong",
 		"github.com/looprig/inference has no local development replacement",
 		"github.com/looprig/mcp has no local development replacement",
+		"github.com/looprig/sandbox has no local development replacement",
 		"github.com/looprig/storage has no local development replacement",
 	}
 	if strings.Join(violations, "\n") != strings.Join(want, "\n") {
@@ -488,6 +491,7 @@ func developmentModuleSourceViolations(moduleRoot string) ([]string, error) {
 		{modulePath: harnessModulePath, directory: "harness"},
 		{modulePath: "github.com/looprig/inference", directory: "inference"},
 		{modulePath: "github.com/looprig/mcp", directory: "mcp"},
+		{modulePath: "github.com/looprig/sandbox", directory: "sandbox"},
 		{modulePath: "github.com/looprig/storage", directory: "storage"},
 	}
 	var violations []string
