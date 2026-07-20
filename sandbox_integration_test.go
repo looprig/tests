@@ -9,7 +9,9 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"strconv"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 
@@ -66,6 +68,70 @@ func TestSandboxExecutorSetOwnsHomeAndTempLifecycle(t *testing.T) {
 	}
 	if _, err := set.For("closed"); !errors.Is(err, sandbox.ErrExecutorSetClosed) {
 		t.Fatalf("For after Close error = %v, want ErrExecutorSetClosed", err)
+	}
+}
+
+func TestSandboxExecutorSetCloseRevokesBackgroundDescendants(t *testing.T) {
+	for _, commandAccess := range []sandbox.Access{sandbox.Allow, sandbox.Gated} {
+		commandAccess := commandAccess
+		name := map[sandbox.Access]string{sandbox.Allow: "allowed", sandbox.Gated: "granted"}[commandAccess]
+		t.Run(name, func(t *testing.T) {
+			workspace := t.TempDir()
+			profile := newSandboxIntegrationProfileWithCommand(t, workspace, sandbox.Allow, sandbox.Deny, commandAccess)
+			set, err := sandbox.NewExecutorSet(profile, sandbox.WithScratchRoot(t.TempDir()), sandbox.WithMaxExecutors(1))
+			if err != nil {
+				t.Fatalf("NewExecutorSet: %v", err)
+			}
+			executor := sandboxIntegrationExecutor(t, set, "tree-revoke")
+			pidPath := filepath.Join(workspace, "descendant.pid")
+			markerPath := filepath.Join(workspace, "descendant.marker")
+			command := "(trap '' HUP; sleep 2; printf survived > " + shellQuote(markerPath) + ") & printf %s $! > " + shellQuote(pidPath) + "; wait"
+			var grant string
+			if commandAccess == sandbox.Gated {
+				grant = issueSandboxGrant(t, executor, "tree-revoke", command, workspace,
+					"command.execute", "", "command.start.v1", command)
+			}
+			runDone := make(chan error, 1)
+			go func() {
+				var runErr error
+				if commandAccess == sandbox.Allow {
+					_, _, runErr = executor.RunCommand(context.Background(), workspace, command)
+				} else {
+					_, _, runErr = executor.RunCommandWithGrants(context.Background(), "tree-revoke", workspace, command, []string{grant})
+				}
+				runDone <- runErr
+			}()
+			waitForIntegrationPath(t, pidPath)
+			pidBytes, err := os.ReadFile(pidPath)
+			if err != nil {
+				t.Fatal(err)
+			}
+			pid, err := strconv.Atoi(strings.TrimSpace(string(pidBytes)))
+			if err != nil || pid <= 0 {
+				t.Fatalf("descendant pid = %q: %v", pidBytes, err)
+			}
+
+			closeDone := make(chan error, 1)
+			go func() { closeDone <- set.Close() }()
+			select {
+			case err := <-closeDone:
+				if err != nil {
+					t.Fatalf("Close: %v", err)
+				}
+			case <-time.After(5 * time.Second):
+				t.Fatal("Close hung waiting for the background descendant")
+			}
+			if err := <-runDone; !errors.Is(err, sandbox.ErrExecutorClosed) && !errors.Is(err, context.Canceled) {
+				t.Fatalf("run error = %v, want executor closed or context canceled", err)
+			}
+			if err := syscall.Kill(pid, 0); !errors.Is(err, syscall.ESRCH) {
+				t.Fatalf("Close returned while descendant pid %d remained live: %v", pid, err)
+			}
+			time.Sleep(2200 * time.Millisecond)
+			if _, err := os.Stat(markerPath); !errors.Is(err, os.ErrNotExist) {
+				t.Fatalf("descendant retained delayed authority after Close: marker stat = %v", err)
+			}
+		})
 	}
 }
 
@@ -174,6 +240,10 @@ func TestSandboxBroadNetworkGrantCarriesDNS(t *testing.T) {
 }
 
 func newSandboxIntegrationProfile(t *testing.T, workspace string, workspaceWrite, network sandbox.Access) *sandbox.Profile {
+	return newSandboxIntegrationProfileWithCommand(t, workspace, workspaceWrite, network, sandbox.Allow)
+}
+
+func newSandboxIntegrationProfileWithCommand(t *testing.T, workspace string, workspaceWrite, network, command sandbox.Access) *sandbox.Profile {
 	t.Helper()
 	profile, err := sandbox.NewProfile(sandbox.ProfileConfig{
 		WorkspaceRoot:  workspace,
@@ -182,7 +252,7 @@ func newSandboxIntegrationProfile(t *testing.T, workspace string, workspaceWrite
 		HostRead:       sandbox.Allow,
 		HostWrite:      sandbox.Deny,
 		Network:        network,
-		Command:        sandbox.Allow,
+		Command:        command,
 		Home:           sandbox.IsolatedHome,
 		Isolation:      sandbox.Sandboxed,
 	})
@@ -190,6 +260,18 @@ func newSandboxIntegrationProfile(t *testing.T, workspace string, workspaceWrite
 		t.Fatalf("NewProfile: %v", err)
 	}
 	return profile
+}
+
+func waitForIntegrationPath(t *testing.T, path string) {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		if _, err := os.Stat(path); err == nil {
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatalf("timed out waiting for %q", path)
 }
 
 func sandboxIntegrationExecutor(t *testing.T, set *sandbox.ExecutorSet, key string) *sandbox.Executor {
