@@ -65,7 +65,7 @@ type restorableRig struct {
 func newRestorableRig(t *testing.T, store *sessionstore.Store, name string, llm *scriptLLM, externalRev string) *restorableRig {
 	t.Helper()
 	r, err := rig.Define(
-		rig.WithLoops(newLoop(t, name, llm, approveAll())),
+		rig.WithLoops(newLoop(t, name, llm, approveAll(t))),
 		rig.WithPrimers(name),
 		rig.WithActivePrimer(name),
 		rig.WithSessionStore(store),

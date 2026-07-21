@@ -320,46 +320,75 @@ func call(id, name, argsJSON string) []content.Chunk {
 	return []content.Chunk{toolUse(id, name, argsJSON)}
 }
 
-// --- the permission gate ----------------------------------------------------
+// --- the access gate --------------------------------------------------------
+//
+// The loop's permission model is now a loop.AccessGate (satisfied by
+// *gate.Evaluator) installed with loop.WithAccessGate. A prepared tool call is
+// evaluated as a typed tool.Request whose requirements each name a capability
+// kind and scope; the gate resolves each kind Deny/Gated/Allow through its
+// bound gate.AccessSource. These fixtures reproduce the old auto-approve and
+// ask-for-MCP gates in that model.
 
-// testPermission is a real loop.PermissionGate. Effect decides per model-facing
-// tool name; the zero effect (EffectAsk) opens a real Harness permission gate.
-type testPermission struct {
-	effect func(name string) loop.Effect
+// allowAllAccessSource reports Allow for every capability kind and scope. A
+// headless evaluator built over it never gates, so nothing prompts and every
+// prepared call is authorized — the new-model equivalent of the old
+// auto-approve permission gate. Empty prepared requests (e.g. delegation)
+// approve trivially, with or without a binding.
+type allowAllAccessSource struct{}
 
-	mu      sync.Mutex
-	checked []string
-	granted []string
+func (allowAllAccessSource) AccessVersion() uint16                   { return gate.CurrentAccessVersion }
+func (allowAllAccessSource) AccessFor(string, string) (uint8, error) { return gate.AccessAllow, nil }
+
+// gatedAccessSource reports Gated for every kind it is bound to. Wired to
+// tool.invoke it makes each MCP tool call an unmet gated requirement, which an
+// interactive evaluator resolves by opening one real Harness permission gate.
+type gatedAccessSource struct{}
+
+func (gatedAccessSource) AccessVersion() uint16                   { return gate.CurrentAccessVersion }
+func (gatedAccessSource) AccessFor(string, string) (uint8, error) { return gate.AccessGated, nil }
+
+// noRules matches nothing (no stored deny or allow) and persists nothing.
+// Interactive evaluator construction requires a rule writer even though MCP
+// tool.invoke requirements carry no reusable candidates, so WriteRules is never
+// actually reached; a nil matcher would also leave gated requirements unmet, but
+// spelling it out keeps the fixture's intent explicit.
+type noRules struct{}
+
+func (noRules) MatchesDeny(context.Context, tool.Requirement) (bool, error)  { return false, nil }
+func (noRules) MatchesAllow(context.Context, tool.Requirement) (bool, error) { return false, nil }
+func (noRules) WriteRules(context.Context, []tool.RuleCandidate) error       { return nil }
+
+// accessKinds is every capability kind these fixtures can route. tool.invoke is
+// the only kind MCP tools raise; the sandbox and context kinds are bound too so
+// an added tool can never fall through to a fail-closed missing-source denial.
+var accessKinds = []string{
+	mcpharness.CapabilityToolInvoke,
+	tool.CapabilityCommandExecute,
+	"filesystem.read",
+	"filesystem.write",
+	"network",
+	"context.load",
 }
 
-func (p *testPermission) Check(_ context.Context, _ tool.InvokableTool, name, _ string) loop.Effect {
-	p.mu.Lock()
-	p.checked = append(p.checked, name)
-	p.mu.Unlock()
-	if p.effect == nil {
-		return loop.EffectAutoApprove
+// allowAllBindings routes every kind to the allow-all source.
+func allowAllBindings() []gate.AccessBinding {
+	bindings := make([]gate.AccessBinding, 0, len(accessKinds))
+	for _, kind := range accessKinds {
+		bindings = append(bindings, gate.AccessBinding{Kind: kind, Source: allowAllAccessSource{}})
 	}
-	return p.effect(name)
+	return bindings
 }
 
-func (p *testPermission) Grant(_ context.Context, name, _ string, scope tool.ApprovalScope) error {
-	p.mu.Lock()
-	p.granted = append(p.granted, fmt.Sprintf("%s@%d", name, scope))
-	p.mu.Unlock()
-	return nil
-}
-
-func (p *testPermission) grants() []string {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	return append([]string(nil), p.granted...)
-}
-
-// approveAll is the permission gate every test that is not ABOUT permissions
-// uses: without one wired, the loop runner denies every call fail-secure and
-// nothing downstream would ever run.
-func approveAll() *testPermission {
-	return &testPermission{effect: func(string) loop.Effect { return loop.EffectAutoApprove }}
+// approveAll is the access gate every test that is not ABOUT permissions uses: a
+// headless allow-all evaluator. Without an access gate wired, the loop runner
+// denies every call fail-secure and nothing downstream would ever run.
+func approveAll(t *testing.T) loop.AccessGate {
+	t.Helper()
+	evaluator, err := gate.NewHeadlessEvaluator(allowAllBindings(), noRules{}, nil)
+	if err != nil {
+		t.Fatalf("gate.NewHeadlessEvaluator: %v", err)
+	}
+	return evaluator
 }
 
 // --- the host doubles -------------------------------------------------------
@@ -622,19 +651,17 @@ type rigFixture struct {
 	notices *recordingReporter
 }
 
-// newLoop defines one real Loop with a scripted model and a permission gate.
+// newLoop defines one real Loop with a scripted model and an access gate.
 // It is the MCP suite's counterpart to fixtures_test.go's `definition`, which
-// takes neither a permission gate nor delegates — both of which the tests below
+// takes neither an access gate nor delegates — both of which the tests below
 // are largely about — and so cannot serve here. The model descriptor is the
 // shared testModel: secret-free, never dialed (the client is always scripted).
-func newLoop(t *testing.T, name string, llm inference.Client, perm loop.PermissionGate, delegates ...identity.AgentName) loop.Definition {
+func newLoop(t *testing.T, name string, llm inference.Client, access loop.AccessGate, delegates ...identity.AgentName) loop.Definition {
 	t.Helper()
 	d, err := loop.Define(
 		loop.WithName(identity.AgentName(name)),
 		loop.WithInference(llm, testModel(name)),
-		loop.WithPermissionFactory(func(context.Context, tool.Bindings) (loop.PermissionGate, error) {
-			return perm, nil
-		}),
+		loop.WithAccessGate(access),
 		loop.WithPolicyRevision("test-v1"),
 		loop.WithDelegates(delegates...),
 		loop.WithDrainTimeout(500*time.Millisecond),
@@ -773,7 +800,7 @@ func TestRealSessionServesMCPTools(t *testing.T) {
 	ctx := itCtx(t)
 
 	llm := newScriptLLM(call("c1", mcpName("alpha", fixtureToolEcho), `{"text":"through-real-mcp"}`), say("ok"))
-	planner := newLoop(t, "planner", llm, approveAll())
+	planner := newLoop(t, "planner", llm, approveAll(t))
 	sess := newSession(t, newStore(t), "planner", planner)
 
 	f := attach(t, sess, nil, fixtureBinding(t, "alpha", mcpharness.ScopeSession, nil, nil))
@@ -817,7 +844,7 @@ func TestMultipleBindingsOnOneSession(t *testing.T) {
 		call("c2", mcpName("beta", fixtureToolEcho), `{"text":"from-beta"}`),
 		say("ok"),
 	)
-	sess := newSession(t, newStore(t), "planner", newLoop(t, "planner", llm, approveAll()))
+	sess := newSession(t, newStore(t), "planner", newLoop(t, "planner", llm, approveAll(t)))
 
 	f := attach(t, sess, nil,
 		fixtureBinding(t, "alpha", mcpharness.ScopeSession, []string{"-extra-tools", "1"}, nil),
@@ -885,7 +912,7 @@ func TestMixedSessionAndLoopScope(t *testing.T) {
 		call("c1", mcpName("private", fixtureToolEcho), `{"text":"private-server"}`),
 		say("ok"),
 	)
-	sess := newSession(t, newStore(t), "planner", newLoop(t, "planner", llm, approveAll()))
+	sess := newSession(t, newStore(t), "planner", newLoop(t, "planner", llm, approveAll(t)))
 	loopID := sess.ActiveLoop().ID()
 
 	f := attach(t, sess, nil,
@@ -944,8 +971,8 @@ func TestDelegateSeesSharedButNotPrivateBindings(t *testing.T) {
 		say("parent done"),
 	)
 	sess := newSession(t, newStore(t), "planner",
-		newLoop(t, "planner", parentLLM, approveAll(), "builder"),
-		newLoop(t, "builder", newScriptLLM(say("child done")), approveAll()),
+		newLoop(t, "planner", parentLLM, approveAll(t), "builder"),
+		newLoop(t, "builder", newScriptLLM(say("child done")), approveAll(t)),
 	)
 	parentID := sess.ActiveLoop().ID()
 
@@ -1051,7 +1078,7 @@ func deadBinding(t *testing.T, name string, required bool) mcpharness.Binding {
 func TestRequiredBindingFailureFailsStart(t *testing.T) {
 	t.Parallel()
 
-	sess := newSession(t, newStore(t), "planner", newLoop(t, "planner", newScriptLLM(say("x")), approveAll()))
+	sess := newSession(t, newStore(t), "planner", newLoop(t, "planner", newScriptLLM(say("x")), approveAll(t)))
 	f := attach(t, sess, nil,
 		fixtureBinding(t, "good", mcpharness.ScopeSession, nil, nil),
 		deadBinding(t, "must-work", true),
@@ -1078,7 +1105,7 @@ func TestOptionalBindingFailureDegradesOnlyItself(t *testing.T) {
 	ctx := itCtx(t)
 
 	llm := newScriptLLM(call("c1", mcpName("good", fixtureToolEcho), `{"text":"still-working"}`), say("ok"))
-	sess := newSession(t, newStore(t), "planner", newLoop(t, "planner", llm, approveAll()))
+	sess := newSession(t, newStore(t), "planner", newLoop(t, "planner", llm, approveAll(t)))
 	f := attach(t, sess, nil,
 		fixtureBinding(t, "good", mcpharness.ScopeSession, nil, nil),
 		deadBinding(t, "nice-to-have", false),
@@ -1242,7 +1269,7 @@ func TestActiveTurnKeepsItsToolSnapshotAndAdoptsAtIdle(t *testing.T) {
 		call("c2", mcpName("srv", fixtureToolEcho), `{"text":"same-turn"}`),
 		say("turn one done"),
 	)
-	sess := newSession(t, newStore(t), "planner", newLoop(t, "planner", llm, approveAll()))
+	sess := newSession(t, newStore(t), "planner", newLoop(t, "planner", llm, approveAll(t)))
 	loopID := sess.ActiveLoop().ID()
 
 	f := attach(t, sess, nil, fixtureBinding(t, "srv", mcpharness.ScopeSession, []string{"-mutate"}, nil))
@@ -1332,7 +1359,7 @@ func assertToolDrift(t *testing.T, driftArgs, wantMarker string) {
 		call("c3", mcpName("srv", fixtureToolMutated), `{"text":"stale-args"}`),
 		say("turn four done"),
 	)
-	sess := newSession(t, newStore(t), "planner", newLoop(t, "planner", llm, approveAll()))
+	sess := newSession(t, newStore(t), "planner", newLoop(t, "planner", llm, approveAll(t)))
 	loopID := sess.ActiveLoop().ID()
 
 	f := attach(t, sess, nil, fixtureBinding(t, "srv", mcpharness.ScopeSession, []string{"-mutate"}, nil))
@@ -1388,22 +1415,37 @@ func assertToolDrift(t *testing.T, driftArgs, wantMarker string) {
 
 // --- 6. permission gates for MCP tools --------------------------------------
 
-// askForMCP is a permission gate that auto-approves the Loop's own tools and
-// asks about every MCP tool, which is the posture the design's §Permissions
-// describes for a third-party server.
-func askForMCP() *testPermission {
-	return &testPermission{effect: func(name string) loop.Effect {
-		if strings.HasPrefix(name, "mcp__") {
-			return loop.EffectAsk
+// askForMCP is an interactive access gate that auto-approves the Loop's own
+// capabilities and GATES every MCP tool.invoke, which is the posture the
+// design's §Permissions describes for a third-party server. Because tool.invoke
+// resolves Gated with no saved rule (noRules matches nothing), the interactive
+// evaluator opens one real combined permission gate through the loop's approval
+// capability (loop.GateApprover) — which the real Session publishes and
+// RespondGate answers. It is the ask-for-MCP counterpart to approveAll.
+func askForMCP(t *testing.T) loop.AccessGate {
+	t.Helper()
+	bindings := make([]gate.AccessBinding, 0, len(accessKinds))
+	for _, kind := range accessKinds {
+		source := gate.AccessSource(allowAllAccessSource{})
+		if kind == mcpharness.CapabilityToolInvoke {
+			source = gatedAccessSource{}
 		}
-		return loop.EffectAutoApprove
-	}}
+		bindings = append(bindings, gate.AccessBinding{Kind: kind, Source: source})
+	}
+	// tool.invoke carries no grant class, so no grant is minted and the issuer is
+	// never consulted (nil). Interactive construction requires an approver and a
+	// rule writer; noRules is a writer that persists nothing.
+	evaluator, err := gate.NewInteractiveEvaluator(bindings, noRules{}, loop.GateApprover(), noRules{}, nil)
+	if err != nil {
+		t.Fatalf("gate.NewInteractiveEvaluator: %v", err)
+	}
+	return evaluator
 }
 
 // waitPermissionGate blocks until the loop runner has opened a real permission
 // gate and returns both halves of it: the durable envelope (whose ID a response
-// is routed by) and the request the adapter built.
-func waitPermissionGate(t *testing.T, obs *observer) (gate.Gate, tool.PermissionRequest) {
+// is routed by) and the typed prepared request the adapter built.
+func waitPermissionGate(t *testing.T, obs *observer) (gate.Gate, tool.Request) {
 	t.Helper()
 	opened := obs.wait(t, "a permission GateOpened", func(ev event.Event) bool {
 		g, ok := ev.(event.GateOpened)
@@ -1420,17 +1462,17 @@ func waitPermissionGate(t *testing.T, obs *observer) (gate.Gate, tool.Permission
 // an MCP tool: the real loop runner opens it, the real Session publishes it, and
 // the real SessionController.RespondGate answers it.
 //
-// The load-bearing assertion is the identity. An approval is persisted against
-// tool.PermissionRequest.ToolName, and design §Permissions requires that to be
-// the binding-qualified "mcp:<binding>:<raw-tool>" — an approval for the srv
-// binding's echo must never satisfy some other server's tool of the same name.
+// The load-bearing assertion is the identity. The gated tool.invoke requirement
+// the gate carries is keyed on its Scope, and design §Permissions requires that
+// to be the binding-qualified "mcp:<binding>:<raw-tool>" — an approval for the
+// srv binding's echo must never satisfy some other server's tool of the same
+// name.
 func TestPermissionGateApprovesAnMCPCall(t *testing.T) {
 	t.Parallel()
 	ctx := itCtx(t)
 
-	perm := askForMCP()
 	llm := newScriptLLM(call("c1", mcpName("srv", fixtureToolEcho), `{"text":"approved"}`), say("ok"))
-	sess := newSession(t, newStore(t), "planner", newLoop(t, "planner", llm, perm))
+	sess := newSession(t, newStore(t), "planner", newLoop(t, "planner", llm, askForMCP(t)))
 
 	f := attach(t, sess, nil, fixtureBinding(t, "srv", mcpharness.ScopeSession, nil, nil))
 	if err := f.start(t); err != nil {
@@ -1444,17 +1486,23 @@ func TestPermissionGateApprovesAnMCPCall(t *testing.T) {
 	}
 
 	g, req := waitPermissionGate(t, f.obs)
-	if got := req.ToolName(); got != permissionIdentity("srv", fixtureToolEcho) {
+	// The gate carries exactly the one unmet gated requirement — the MCP call's
+	// tool.invoke — and its Scope is the identity an approval is keyed on.
+	if len(req.Requirements) != 1 {
+		t.Fatalf("the gate carries %d requirements, want exactly the one gated tool.invoke", len(req.Requirements))
+	}
+	gated := req.Requirements[0]
+	if got := gated.Scope; got != permissionIdentity("srv", fixtureToolEcho) {
 		t.Errorf("the gate names the capability %q, want %q: an approval must be qualified by its binding",
 			got, permissionIdentity("srv", fixtureToolEcho))
 	}
-	// The summary is what a human reads; it must name the server and the tool,
-	// and must not be the raw arguments (design §Permissions).
-	if !strings.Contains(req.Description(), fixtureToolEcho) || !strings.Contains(req.Description(), "srv") {
-		t.Errorf("the prompt %q names neither the tool nor the server", req.Description())
+	// The requirement description is what a human reads; it must name the server
+	// and the tool, and must not be the raw arguments (design §Permissions).
+	if !strings.Contains(gated.Description, fixtureToolEcho) || !strings.Contains(gated.Description, "srv") {
+		t.Errorf("the prompt %q names neither the tool nor the server", gated.Description)
 	}
-	if strings.Contains(req.Description(), "approved") {
-		t.Errorf("the prompt %q leaked the call's arguments", req.Description())
+	if strings.Contains(gated.Description, "approved") {
+		t.Errorf("the prompt %q leaked the call's arguments", gated.Description)
 	}
 	if g.Blocks != gate.BlocksToolCall {
 		t.Errorf("the gate blocks %q, want a tool call", g.Blocks)
@@ -1462,8 +1510,7 @@ func TestPermissionGateApprovesAnMCPCall(t *testing.T) {
 
 	if err := sess.RespondGate(ctx, gate.GateResponse{
 		GateID: g.ID,
-		Action: "approve",
-		Values: map[string]json.RawMessage{"scope": json.RawMessage(`"session"`)},
+		Action: string(gate.ApprovalApprove),
 		Source: gate.ResponseSource{Kind: gate.ResponseFromUser},
 	}); err != nil {
 		t.Fatalf("RespondGate: %v", err)
@@ -1473,10 +1520,14 @@ func TestPermissionGateApprovesAnMCPCall(t *testing.T) {
 	if got := toolResults(reqs[1]); len(got) != 1 || got[0] != "approved" {
 		t.Fatalf("after approval the call returned %q, want the fixture's echo", got)
 	}
-	// A session-scoped approval is persisted through the gate the host wired.
-	if grants := perm.grants(); len(grants) == 0 {
-		t.Error("a session-scoped approval persisted nothing")
-	}
+	// NOTE: the old fixture also asserted a session-scoped approval PERSISTED a
+	// grant through the gate. That assertion tested a removed concept — the old
+	// tool.ApprovalScope (once/session/workspace) and the gate's Grant hook are
+	// gone. The new model persists only on "Approve always for this workspace"
+	// via a RuleWriter, and an MCP tool.invoke requirement deliberately carries no
+	// reusable rule candidate to persist, so a plain Approve persists nothing by
+	// design. The persistence sub-assertion is therefore dropped; the identity
+	// and the approve-then-call-succeeds assertions above carry this test's intent.
 }
 
 // TestPermissionGateDeniesAnMCPCall proves the gate is a gate: a denial stops the
@@ -1487,7 +1538,7 @@ func TestPermissionGateDeniesAnMCPCall(t *testing.T) {
 	ctx := itCtx(t)
 
 	llm := newScriptLLM(call("c1", mcpName("srv", fixtureToolEcho), `{"text":"never-sent"}`), say("ok"))
-	sess := newSession(t, newStore(t), "planner", newLoop(t, "planner", llm, askForMCP()))
+	sess := newSession(t, newStore(t), "planner", newLoop(t, "planner", llm, askForMCP(t)))
 
 	f := attach(t, sess, nil, fixtureBinding(t, "srv", mcpharness.ScopeSession, nil, nil))
 	if err := f.start(t); err != nil {
@@ -1503,7 +1554,7 @@ func TestPermissionGateDeniesAnMCPCall(t *testing.T) {
 	g, _ := waitPermissionGate(t, f.obs)
 	if err := sess.RespondGate(ctx, gate.GateResponse{
 		GateID: g.ID,
-		Action: "deny",
+		Action: string(gate.ApprovalDeny),
 		Source: gate.ResponseSource{Kind: gate.ResponseFromUser},
 	}); err != nil {
 		t.Fatalf("RespondGate: %v", err)
@@ -1543,7 +1594,7 @@ func TestFormElicitationReachesTheHostAndAnswersTheServer(t *testing.T) {
 		call("c1", mcpName("srv", fixtureToolElicit), `{"schema":true}`),
 		say("ok"),
 	)
-	sess := newSession(t, newStore(t), "planner", newLoop(t, "planner", llm, approveAll()))
+	sess := newSession(t, newStore(t), "planner", newLoop(t, "planner", llm, approveAll(t)))
 
 	f := attach(t, sess, gates, fixtureBinding(t, "srv", mcpharness.ScopeSession, []string{"-elicit"}, func(b *mcpharness.Binding) {
 		b.Server.Capabilities = client.ClientCapabilities{Elicitation: true}
@@ -1635,7 +1686,7 @@ func driveURLElicitation(t *testing.T) mcpharness.GateRequest {
 		t.Fatalf("marshalling the elicit call's arguments: %v", err)
 	}
 	llm := newScriptLLM(call("c1", mcpName("srv", fixtureToolElicit), string(args)), say("ok"))
-	sess := newSession(t, newStore(t), "planner", newLoop(t, "planner", llm, approveAll()))
+	sess := newSession(t, newStore(t), "planner", newLoop(t, "planner", llm, approveAll(t)))
 
 	f := attach(t, sess, gates, fixtureBinding(t, "srv", mcpharness.ScopeSession, []string{"-elicit"}, func(b *mcpharness.Binding) {
 		b.Server.Capabilities = client.ClientCapabilities{Elicitation: true}
@@ -1882,7 +1933,7 @@ func TestRejectedRefreshPreservesTheAdoptedGeneration(t *testing.T) {
 		call("c2", mcpName("srv", fixtureToolEcho), `{"text":"still-serving"}`),
 		say("ok"),
 	)
-	sess := newSession(t, newStore(t), "planner", newLoop(t, "planner", llm, approveAll()))
+	sess := newSession(t, newStore(t), "planner", newLoop(t, "planner", llm, approveAll(t)))
 	loopID := sess.ActiveLoop().ID()
 
 	// The fixture with -mutate serves exactly these seven: echo, slow, fail, big,
@@ -1955,7 +2006,7 @@ func TestOneBindingFailsAndReconnectsIndependently(t *testing.T) {
 		call("c2", mcpName("steady", fixtureToolEcho), `{"text":"unaffected"}`),
 		say("ok"),
 	)
-	sess := newSession(t, newStore(t), "planner", newLoop(t, "planner", llm, approveAll()))
+	sess := newSession(t, newStore(t), "planner", newLoop(t, "planner", llm, approveAll(t)))
 
 	f := attach(t, sess, nil,
 		fixtureBinding(t, "fragile", mcpharness.ScopeSession, []string{"-crash"}, nil),
@@ -2008,7 +2059,7 @@ func TestLoopAndSessionShutdownClosesOwnedBindings(t *testing.T) {
 	ctx := itCtx(t)
 
 	llm := newScriptLLM(call("c1", mcpName("private", fixtureToolEcho), `{"text":"alive"}`), say("ok"))
-	sess := newSession(t, newStore(t), "planner", newLoop(t, "planner", llm, approveAll()))
+	sess := newSession(t, newStore(t), "planner", newLoop(t, "planner", llm, approveAll(t)))
 	loopID := sess.ActiveLoop().ID()
 
 	f := attach(t, sess, nil,

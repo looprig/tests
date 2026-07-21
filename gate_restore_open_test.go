@@ -211,7 +211,26 @@ func TestRestoreSurvivesDanglingPermissionGate(t *testing.T) {
 			Effect:   gate.EffectResume,
 			Subject:  gate.Subject{TurnID: turnID, StepID: stepID},
 		}
-		payload := gate.PermissionPayload{Request: tool.BashRequest{Command: "echo ok"}}
+		// A prepared command.execute request for a Bash command — the new-model
+		// replacement for the removed tool.BashRequest. It is only journaled and
+		// restored here, never executed, so the execution-binding fields carry
+		// representative-but-inert values (a fixed future expiry).
+		const bashCommand = "echo ok"
+		payload := gate.PermissionPayload{Request: tool.Request{
+			ToolName:           "Bash",
+			Summary:            "run echo ok",
+			ExecutionID:        "gate-restore-exec",
+			Command:            bashCommand,
+			WorkingDirectory:   "/workspace",
+			ExpiresAtUnixMilli: 4102444800000,
+			Requirements: []tool.Requirement{{
+				Kind:        tool.CapabilityCommandExecute,
+				Match:       bashCommand,
+				Description: "run the command echo ok",
+				GrantClass:  tool.GrantClassCommandStart,
+				GrantTarget: bashCommand,
+			}},
+		}}
 		gateID, err := preparer.PrepareGateOpen(ctx, loopID, envelope, payload)
 		if err != nil {
 			t.Fatalf("PrepareGateOpen(permission): %v", err)

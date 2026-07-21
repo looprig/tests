@@ -27,7 +27,6 @@ import (
 	"github.com/looprig/harness/pkg/rig"
 	"github.com/looprig/harness/pkg/session"
 	"github.com/looprig/harness/pkg/sessionstore"
-	"github.com/looprig/harness/pkg/tool"
 	"github.com/looprig/inference"
 	"github.com/looprig/inference/stream"
 	"github.com/looprig/storage/memstore"
@@ -301,9 +300,11 @@ func foreignloopDefinitionWithStyle(t *testing.T, name string, engine loop.Engin
 		}
 		opts = append(opts,
 			loop.WithDelegates(names...),
-			loop.WithPermissionFactory(func(context.Context, tool.Bindings) (loop.PermissionGate, error) {
-				return foreignloopAllowAll{}, nil
-			}),
+			// A permissive headless allow-all access gate, the new-model equivalent
+			// of the old auto-approve permission gate (shared with the MCP suite via
+			// approveAll). Delegating loops need it wired so subagent tool calls are
+			// authorized rather than fail-secure denied.
+			loop.WithAccessGate(approveAll(t)),
 			loop.WithPolicyRevision("foreignloop-integration-v1"),
 			loop.WithDelegation(loop.Delegation{Style: style}),
 		)
@@ -313,16 +314,6 @@ func foreignloopDefinitionWithStyle(t *testing.T, name string, engine loop.Engin
 		t.Fatalf("loop.Define(%q): %v", name, err)
 	}
 	return definition
-}
-
-type foreignloopAllowAll struct{}
-
-func (foreignloopAllowAll) Check(context.Context, tool.InvokableTool, string, string) loop.Effect {
-	return loop.EffectAutoApprove
-}
-
-func (foreignloopAllowAll) Grant(context.Context, string, string, tool.ApprovalScope) error {
-	return nil
 }
 
 func newForeignloopSession(t *testing.T, ctx context.Context, process foreignloopProcess, primary string, definitions ...loop.Definition) (session.SessionController, *sessionstore.Store) {
@@ -641,4 +632,3 @@ func foreignloopToolUse(id, name, input string) content.Chunk {
 
 var _ inference.Client = (*foreignloopScriptLLM)(nil)
 var _ inference.Client = (*foreignloopScenarioLLM)(nil)
-var _ loop.PermissionGate = foreignloopAllowAll{}
