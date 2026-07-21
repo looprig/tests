@@ -42,7 +42,7 @@ require (
 )
 
 replace github.com/looprig/harness => ../harness
-replace github.com/looprig/foreignloops => ../foreignloop
+replace github.com/looprig/foreignloops => ../foreignloops
 `, map[string]string{
 		"main.go":            "package product\nimport (\n_ \"github.com/looprig/harness/pkg/rig\"\n_ \"github.com/looprig/foreignloops/backend\"\n)\n",
 		"not_integration.go": "//go:build !integration\n\npackage product\nimport (\n_ \"github.com/looprig/harness/pkg/rig\"\n_ \"github.com/looprig/foreignloops/backend\"\n)\n",
@@ -298,14 +298,14 @@ func TestCrossModuleOwnershipBoundary(t *testing.T) {
 func TestDevelopmentModuleSourcesAcceptSiblingLayouts(t *testing.T) {
 	collectionRoot := t.TempDir()
 	modules := map[string]string{
-		"core":        "github.com/looprig/core",
-		"foreignloop": "github.com/looprig/foreignloops",
-		"fsstore":     "github.com/looprig/fsstore",
-		"harness":     "github.com/looprig/harness",
-		"inference":   "github.com/looprig/inference",
-		"mcp":         "github.com/looprig/mcp",
-		"sandbox":     "github.com/looprig/sandbox",
-		"storage":     "github.com/looprig/storage",
+		"core":         "github.com/looprig/core",
+		"foreignloops": "github.com/looprig/foreignloops",
+		"fsstore":      "github.com/looprig/fsstore",
+		"harness":      "github.com/looprig/harness",
+		"inference":    "github.com/looprig/inference",
+		"mcp":          "github.com/looprig/mcp",
+		"sandbox":      "github.com/looprig/sandbox",
+		"storage":      "github.com/looprig/storage",
 	}
 	for directory, modulePath := range modules {
 		writeModuleFixture(t, collectionRoot, directory, "module "+modulePath+"\n", nil)
@@ -315,7 +315,7 @@ func TestDevelopmentModuleSourcesAcceptSiblingLayouts(t *testing.T) {
 replace (
 	github.com/looprig/core => ../core
 	github.com/looprig/harness => ../harness
-	github.com/looprig/foreignloops => ../foreignloop
+	github.com/looprig/foreignloops => ../foreignloops
 	github.com/looprig/fsstore => ../fsstore
 	github.com/looprig/inference => ../inference
 	github.com/looprig/mcp => ../mcp
@@ -336,11 +336,11 @@ replace (
 func TestDevelopmentModuleSourcesRejectWrongAndMissingLocalSources(t *testing.T) {
 	collectionRoot := t.TempDir()
 	writeModuleFixture(t, collectionRoot, "harness", "module github.com/example/wrong\n", nil)
-	writeModuleFixture(t, collectionRoot, "foreignloop", "module github.com/looprig/foreignloops\n", nil)
+	writeModuleFixture(t, collectionRoot, "foreignloops", "module github.com/looprig/foreignloops\n", nil)
 	writeModuleFixture(t, collectionRoot, "tests", `module github.com/looprig/tests
 
 replace github.com/looprig/harness => ../harness
-replace github.com/looprig/foreignloops => ../../deep/foreignloop
+replace github.com/looprig/foreignloops => ../../deep/foreignloops
 `, nil)
 
 	violations, err := developmentModuleSourceViolations(filepath.Join(collectionRoot, "tests"))
@@ -349,7 +349,7 @@ replace github.com/looprig/foreignloops => ../../deep/foreignloop
 	}
 	want := []string{
 		"github.com/looprig/core has no local development replacement",
-		"github.com/looprig/foreignloops replacement must use ../foreignloop, got ../../deep/foreignloop",
+		"github.com/looprig/foreignloops replacement must use ../foreignloops, got ../../deep/foreignloops",
 		"github.com/looprig/fsstore has no local development replacement",
 		"github.com/looprig/harness replacement resolves to module github.com/example/wrong",
 		"github.com/looprig/inference has no local development replacement",
@@ -486,7 +486,7 @@ func developmentModuleSourceViolations(moduleRoot string) ([]string, error) {
 		directory  string
 	}{
 		{modulePath: "github.com/looprig/core", directory: "core"},
-		{modulePath: foreignloopsModulePath, directory: "foreignloop"},
+		{modulePath: foreignloopsModulePath, directory: "foreignloops"},
 		{modulePath: "github.com/looprig/fsstore", directory: "fsstore"},
 		{modulePath: harnessModulePath, directory: "harness"},
 		{modulePath: "github.com/looprig/inference", directory: "inference"},

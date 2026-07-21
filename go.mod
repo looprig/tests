@@ -23,7 +23,7 @@ replace github.com/looprig/storage => ../storage
 // go.release.mod with tagged modules and no local replacements.
 replace github.com/looprig/harness => ../harness
 
-replace github.com/looprig/foreignloops => ../foreignloop
+replace github.com/looprig/foreignloops => ../foreignloops
 
 replace github.com/looprig/fsstore => ../fsstore
 
