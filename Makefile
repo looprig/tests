@@ -1,7 +1,13 @@
-.PHONY: test live-network fmt-check vet dependency-boundary local-source-check check release-check
+.PHONY: test live-network fmt fmt-check vet staticcheck lint vuln secure dependency-boundary local-source-check check release-check
 
 RELEASE_MODFILE ?= go.release.mod
 RELEASE_GO ?= go
+
+# Module's own package dirs. This module is a single package at its root, but
+# go list is used (rather than hardcoding ".") to match the go-list idiom the
+# rest of this Makefile relies on. -tags integration matches vet/test below so
+# the dirs list picks up integration-tagged files too.
+GO_DIRS := $(shell GOWORK=off go list -f '{{.Dir}}' -tags integration ./...)
 
 test:
 	LOOPRIG_LIVE_NETWORK=0 GOWORK=off go test -tags integration -race ./...
@@ -9,11 +15,31 @@ test:
 live-network:
 	LOOPRIG_LIVE_NETWORK=1 GOWORK=off go test -tags integration -race -count=1 -run '^TestSandboxBroadNetworkGrantCarriesDNS$$' .
 
+# Format the whole module in place.
+fmt:
+	gofmt -w $(GO_DIRS)
+
 fmt-check:
 	@test -z "$$(gofmt -l .)" || (gofmt -l . && exit 1)
 
 vet:
 	GOWORK=off go vet -tags integration ./...
+
+staticcheck:
+	GOWORK=off go tool staticcheck -tags integration ./...
+
+lint: fmt-check vet staticcheck
+	# gosec is NOT module-aware: its ./... is a filesystem walk that would descend
+	# into sibling checkouts alongside this module rather than stopping at module
+	# boundaries the way go vet and staticcheck do. Scope it to THIS module's
+	# package dirs via GO_DIRS (the same go-list idiom fmt/fmt-check use).
+	GOWORK=off go tool gosec $(GO_DIRS)
+
+vuln:
+	GOWORK=off go mod verify
+	GOWORK=off go tool govulncheck ./...
+
+secure: lint vuln
 
 dependency-boundary:
 	GOWORK=off go test -race -run '^TestCrossModuleOwnership' ./...

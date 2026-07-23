@@ -478,24 +478,6 @@ func (p *recordingPublisher) waitStatusAfterLoss(t *testing.T, binding string) {
 	}
 }
 
-// waitNotice blocks until the reporter (tools_test.go's recordingReporter) has
-// seen a notice of this kind.
-func waitNotice(t *testing.T, r *recordingReporter, kind mcpharness.NoticeKind) mcpharness.Notice {
-	t.Helper()
-	deadline := time.Now().Add(settle)
-	for {
-		for _, n := range r.snapshot() {
-			if n.Kind == kind {
-				return n
-			}
-		}
-		if time.Now().After(deadline) {
-			t.Fatalf("no %v notice was ever reported; saw %+v", kind, r.snapshot())
-		}
-		time.Sleep(10 * time.Millisecond)
-	}
-}
-
 // --- the observer -----------------------------------------------------------
 
 // observer drains a real Session's enduring event stream. Every wait below is
@@ -540,17 +522,6 @@ func (o *observer) find(pred func(event.Event) bool) (event.Event, bool) {
 	return nil, false
 }
 
-// count returns how many events match pred.
-func (o *observer) count(pred func(event.Event) bool) int {
-	n := 0
-	for _, ev := range o.all() {
-		if pred(ev) {
-			n++
-		}
-	}
-	return n
-}
-
 // wait blocks until an event matching pred has been drained.
 func (o *observer) wait(t *testing.T, what string, pred func(event.Event) bool) event.Event {
 	t.Helper()
@@ -566,45 +537,11 @@ func (o *observer) wait(t *testing.T, what string, pred func(event.Event) bool) 
 	}
 }
 
-// waitCount blocks until at least n events match pred.
-func (o *observer) waitCount(t *testing.T, what string, n int, pred func(event.Event) bool) {
-	t.Helper()
-	deadline := time.Now().Add(settle)
-	for {
-		if got := o.count(pred); got >= n {
-			return
-		}
-		if time.Now().After(deadline) {
-			t.Fatalf("saw %d %s, want at least %d", o.count(pred), what, n)
-		}
-		time.Sleep(5 * time.Millisecond)
-	}
-}
-
 // loopIdle matches a Loop parking.
 func loopIdle(loopID uuid.UUID) func(event.Event) bool {
 	return func(ev event.Event) bool {
 		idle, ok := ev.(event.LoopIdle)
 		return ok && idle.EventHeader().LoopID == loopID
-	}
-}
-
-// waitLoopID resolves an agent name to the Loop ID the Session minted for it,
-// by watching the loop-scoped events that carry both.
-func (o *observer) waitLoopID(t *testing.T, name string) uuid.UUID {
-	t.Helper()
-	deadline := time.Now().Add(settle)
-	for {
-		for _, ev := range o.all() {
-			h := ev.EventHeader()
-			if string(h.AgentName) == name && !h.LoopID.IsZero() {
-				return h.LoopID
-			}
-		}
-		if time.Now().After(deadline) {
-			t.Fatalf("no loop named %q was ever seen on the event stream", name)
-		}
-		time.Sleep(5 * time.Millisecond)
 	}
 }
 
