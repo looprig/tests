@@ -1,4 +1,4 @@
-.PHONY: test live-network fmt fmt-check vet staticcheck lint vuln secure dependency-boundary local-source-check check release-check
+.PHONY: test live-network fmt fmt-check vet staticcheck lint vuln secure dependency-boundary local-source-check root-layout check release-check
 
 RELEASE_MODFILE ?= go.release.mod
 RELEASE_GO ?= go
@@ -47,7 +47,13 @@ dependency-boundary:
 local-source-check:
 	GOWORK=off go test -race -run '^TestDevelopmentModuleSources' ./...
 
-check: fmt-check vet dependency-boundary local-source-check test
+# Every sibling repository in this ecosystem (harness, classifiers, coderig,
+# and this tests module) carries the same minimal top-level marker set
+# (go.mod, Makefile, LICENSE, CONTRIBUTING.md). See root_layout_test.go.
+root-layout:
+	GOWORK=off go test -race -run '^(TestSiblingRootLayout|TestRepositoryRootLayoutMatchesEcosystemConvention)' ./...
+
+check: fmt-check vet dependency-boundary local-source-check root-layout test
 
 release-check:
 	@test -f "$(RELEASE_MODFILE)" || (echo "$(RELEASE_MODFILE) is not prepared" >&2; exit 1)
