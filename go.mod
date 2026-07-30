@@ -21,7 +21,9 @@ replace github.com/looprig/storage => ../storage
 
 // Development-only extraction mappings. release-check consumes a separate
 // go.release.mod with tagged modules and no local replacements.
-replace github.com/looprig/harness => ../harness
+replace github.com/looprig/harness => ../harness-permission-classifier
+
+replace github.com/looprig/classifiers => ../classifiers
 
 replace github.com/looprig/foreignloops => ../foreignloops
 

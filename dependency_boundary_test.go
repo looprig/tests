@@ -298,6 +298,7 @@ func TestCrossModuleOwnershipBoundary(t *testing.T) {
 func TestDevelopmentModuleSourcesAcceptSiblingLayouts(t *testing.T) {
 	collectionRoot := t.TempDir()
 	modules := map[string]string{
+		"classifiers":  "github.com/looprig/classifiers",
 		"core":         "github.com/looprig/core",
 		"foreignloops": "github.com/looprig/foreignloops",
 		"fsstore":      "github.com/looprig/fsstore",
@@ -313,6 +314,7 @@ func TestDevelopmentModuleSourcesAcceptSiblingLayouts(t *testing.T) {
 	writeModuleFixture(t, collectionRoot, "tests", `module github.com/looprig/tests
 
 replace (
+	github.com/looprig/classifiers => ../classifiers
 	github.com/looprig/core => ../core
 	github.com/looprig/harness => ../harness
 	github.com/looprig/foreignloops => ../foreignloops
@@ -348,6 +350,7 @@ replace github.com/looprig/foreignloops => ../../deep/foreignloops
 		t.Fatal(err)
 	}
 	want := []string{
+		"github.com/looprig/classifiers has no local development replacement",
 		"github.com/looprig/core has no local development replacement",
 		"github.com/looprig/foreignloops replacement must use ../foreignloops, got ../../deep/foreignloops",
 		"github.com/looprig/fsstore has no local development replacement",
@@ -359,6 +362,53 @@ replace github.com/looprig/foreignloops => ../../deep/foreignloops
 	}
 	if strings.Join(violations, "\n") != strings.Join(want, "\n") {
 		t.Fatalf("developmentModuleSourceViolations() = %v, want %v", violations, want)
+	}
+}
+
+// TestDevelopmentModuleSourcesAcceptsPermissionClassifierFeatureSiblings locks
+// in the permission-classifier feature branch's intentional sibling layout:
+// harness checked out as ../harness-permission-classifier (the canonical
+// ../harness checkout lacks this feature) and a new ../classifiers sibling
+// supplying the real command-safety policy. This must not loosen the guard
+// into accepting arbitrary paths — TestDevelopmentModuleSourcesRejectWrongAndMissingLocalSources
+// still asserts a typo'd path like ../../deep/foreignloops is rejected.
+func TestDevelopmentModuleSourcesAcceptsPermissionClassifierFeatureSiblings(t *testing.T) {
+	collectionRoot := t.TempDir()
+	modules := map[string]string{
+		"classifiers":                   "github.com/looprig/classifiers",
+		"core":                          "github.com/looprig/core",
+		"foreignloops":                  "github.com/looprig/foreignloops",
+		"fsstore":                       "github.com/looprig/fsstore",
+		"harness-permission-classifier": "github.com/looprig/harness",
+		"inference":                     "github.com/looprig/inference",
+		"mcp":                           "github.com/looprig/mcp",
+		"sandbox":                       "github.com/looprig/sandbox",
+		"storage":                       "github.com/looprig/storage",
+	}
+	for directory, modulePath := range modules {
+		writeModuleFixture(t, collectionRoot, directory, "module "+modulePath+"\n", nil)
+	}
+	writeModuleFixture(t, collectionRoot, "tests", `module github.com/looprig/tests
+
+replace (
+	github.com/looprig/classifiers => ../classifiers
+	github.com/looprig/core => ../core
+	github.com/looprig/harness => ../harness-permission-classifier
+	github.com/looprig/foreignloops => ../foreignloops
+	github.com/looprig/fsstore => ../fsstore
+	github.com/looprig/inference => ../inference
+	github.com/looprig/mcp => ../mcp
+	github.com/looprig/sandbox => ../sandbox
+	github.com/looprig/storage => ../storage
+)
+`, nil)
+
+	violations, err := developmentModuleSourceViolations(filepath.Join(collectionRoot, "tests"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(violations) != 0 {
+		t.Fatalf("developmentModuleSourceViolations() = %v, want none", violations)
 	}
 }
 
@@ -482,17 +532,22 @@ func developmentModuleSourceViolations(moduleRoot string) ([]string, error) {
 		return nil, fmt.Errorf("parse development replacements: %w", err)
 	}
 	developmentModules := []struct {
-		modulePath string
-		directory  string
+		modulePath  string
+		directories []string
 	}{
-		{modulePath: "github.com/looprig/core", directory: "core"},
-		{modulePath: foreignloopsModulePath, directory: "foreignloops"},
-		{modulePath: "github.com/looprig/fsstore", directory: "fsstore"},
-		{modulePath: harnessModulePath, directory: "harness"},
-		{modulePath: "github.com/looprig/inference", directory: "inference"},
-		{modulePath: "github.com/looprig/mcp", directory: "mcp"},
-		{modulePath: "github.com/looprig/sandbox", directory: "sandbox"},
-		{modulePath: "github.com/looprig/storage", directory: "storage"},
+		{modulePath: "github.com/looprig/classifiers", directories: []string{"classifiers"}},
+		{modulePath: "github.com/looprig/core", directories: []string{"core"}},
+		{modulePath: foreignloopsModulePath, directories: []string{"foreignloops"}},
+		{modulePath: "github.com/looprig/fsstore", directories: []string{"fsstore"}},
+		// Permission-classifier feature branch intentionally checks harness out
+		// as ../harness-permission-classifier (the canonical ../harness checkout
+		// lacks this feature); both sibling names are accepted so the guard
+		// still fails a genuine drift like ../../deep/harness.
+		{modulePath: harnessModulePath, directories: []string{"harness", "harness-permission-classifier"}},
+		{modulePath: "github.com/looprig/inference", directories: []string{"inference"}},
+		{modulePath: "github.com/looprig/mcp", directories: []string{"mcp"}},
+		{modulePath: "github.com/looprig/sandbox", directories: []string{"sandbox"}},
+		{modulePath: "github.com/looprig/storage", directories: []string{"storage"}},
 	}
 	var violations []string
 	for _, dependency := range developmentModules {
@@ -501,10 +556,24 @@ func developmentModuleSourceViolations(moduleRoot string) ([]string, error) {
 			violations = append(violations, dependency.modulePath+" has no local development replacement")
 			continue
 		}
-		expectedTarget := "../" + dependency.directory
 		cleanTarget := filepath.ToSlash(filepath.Clean(filepath.FromSlash(target)))
-		if cleanTarget != expectedTarget {
-			violations = append(violations, fmt.Sprintf("%s replacement must use %s, got %s", dependency.modulePath, expectedTarget, target))
+		matched := false
+		for _, directory := range dependency.directories {
+			if cleanTarget == "../"+directory {
+				matched = true
+				break
+			}
+		}
+		if !matched {
+			expected := "../" + dependency.directories[0]
+			if len(dependency.directories) > 1 {
+				expectedList := make([]string, len(dependency.directories))
+				for index, directory := range dependency.directories {
+					expectedList[index] = "../" + directory
+				}
+				expected = strings.Join(expectedList, " or ")
+			}
+			violations = append(violations, fmt.Sprintf("%s replacement must use %s, got %s", dependency.modulePath, expected, target))
 			continue
 		}
 		target = filepath.Join(moduleRoot, filepath.FromSlash(target))
