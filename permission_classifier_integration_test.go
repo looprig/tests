@@ -400,6 +400,187 @@ func definePermissionClassifierRig(
 	return r
 }
 
+// definePermissionClassifierRigWithPolicy mirrors definePermissionClassifierRig
+// with review classifiers ALWAYS enabled, but takes the review policy directly
+// instead of hardcoding one revision — so a caller can hold the classifier set
+// and every other configuration input byte-identical across two legs while
+// varying ONLY the review policy's own identity (its Revision). This isolates
+// the review-policy-identity-drift-while-enabled fix (Harness pkg/event/drift.go's
+// new review_policy_rev check, pkg/rig/fingerprint.go's
+// ConfigManifest.PermissionReviewPolicyRev) as the sole configuration delta a
+// restore comparison sees, the same way definePermissionClassifierRig's
+// enabled/disabled toggle isolates PermissionReviewConfigured.
+func definePermissionClassifierRigWithPolicy(
+	t *testing.T,
+	stores fsStores,
+	base string,
+	operatorLLM inference.Client,
+	classifierLLM inference.Client,
+	shared *runCommandTool,
+	policy gate.PermissionReviewPolicy,
+	allowMismatch bool,
+) *rig.Rig {
+	t.Helper()
+	operator, err := loop.Define(
+		loop.WithName(identity.AgentName("operator")),
+		loop.WithInference(operatorLLM, testModel("operator")),
+		loop.WithAccessGate(gatedCommandRunAccessGate(t)),
+		loop.WithPolicyRevision("permission-classifier-test-v1"),
+		loop.WithTools(runCommandDefinition(shared)),
+	)
+	if err != nil {
+		t.Fatalf("loop.Define: %v", err)
+	}
+	classifier, err := commandsafety.New(commandsafety.Options{
+		Inference: classifierLLM,
+		Model:     permissionClassifierTestModel(),
+		Policy:    commandsafety.DefaultPolicy(),
+		Evidence:  commandsafety.StandardEvidence(commandsafety.ReadEvidencePolicy{}),
+	})
+	if err != nil {
+		t.Fatalf("commandsafety.New: %v", err)
+	}
+	classifiers, err := gate.NewPermissionClassifierSet(classifier)
+	if err != nil {
+		t.Fatalf("gate.NewPermissionClassifierSet: %v", err)
+	}
+	opts := []rig.Option{
+		rig.WithLoops(operator),
+		rig.WithPrimers("operator"),
+		rig.WithActivePrimer("operator"),
+		rig.WithSessionStore(stores.sessions),
+		rig.WithSessionWorkspaces(stores.workspace, base),
+		rig.WithSnapshots(rig.SnapshotPolicy{Trigger: rig.SnapshotManual}),
+		rig.WithPermissionClassifiers(classifiers),
+		rig.WithPermissionReviewPolicy(policy),
+		rig.WithPermissionReviewEvidence(stubEvidenceAccess{}, stubEvidenceContainment{}, commandsafety.RequiredEvidenceKinds()),
+		rig.WithPermissionReviewSecurityCeiling("permission-classifier-test-ceiling/v1"),
+		rig.WithHustleLimits(permissionClassifierHustleLimits()),
+	}
+	if allowMismatch {
+		opts = append(opts, rig.WithAllowConfigMismatch())
+	}
+	r, err := rig.Define(opts...)
+	if err != nil {
+		t.Fatalf("rig.Define: %v", err)
+	}
+	return r
+}
+
+// TestPermissionClassifierRestoreRejectsStrictToDefaultPolicyChange is the
+// cross-module proof for the Addendum-3-style fix in Harness's
+// pkg/event/drift.go (AssessDrift's new review_policy_rev check) and
+// pkg/rig/fingerprint.go (ConfigManifest.PermissionReviewPolicyRev): a
+// session opened with permission review classifiers ENABLED under a strict
+// custom review policy (MaximumAutoRisk: low) and later restored with
+// classifiers STILL enabled but under Harness's own default, looser policy
+// (MaximumAutoRisk: high) must NOT restore silently. Before the Harness fix,
+// this exact scenario fell through the opaque TopologyRev-only comparison
+// (classified Info, like any other topology change) and DefaultPolicyDecider
+// silently accepted it -- a strict security posture downgrading to a looser
+// one, invisibly, across a restore. This test proves the real restore path
+// (a real rig.Session, a real fsstore-backed journal, RestoreSession) now
+// rejects that transition unless the consumer explicitly opts in via
+// rig.WithAllowConfigMismatch(), mirroring
+// TestPermissionClassifierRestoreRejectsDisabledToEnabledConfigChange's own
+// shape for the disabled->enabled transition.
+func TestPermissionClassifierRestoreRejectsStrictToDefaultPolicyChange(t *testing.T) {
+	t.Parallel()
+	ctx := itCtx(t)
+	persistence := filepath.Join(t.TempDir(), "persistence")
+	// One shared workspace base and classifier set across every leg: the
+	// restore comparison below must isolate the review POLICY identity as the
+	// ONLY configuration delta.
+	wsBase := filepath.Join(t.TempDir(), "ws")
+	shared := &runCommandTool{}
+
+	strictPolicy, err := gate.NewPermissionReviewPolicy(
+		"strict-policy-v1",
+		gate.ReviewRiskLow,
+		map[gate.ReviewRisk]gate.ReviewAuthorization{
+			gate.ReviewRiskLow:    gate.ReviewAuthorizationUnknown,
+			gate.ReviewRiskMedium: gate.ReviewAuthorizationUnknown,
+			gate.ReviewRiskHigh:   gate.ReviewAuthorizationMedium,
+		},
+		nil, 0,
+	)
+	if err != nil {
+		t.Fatalf("gate.NewPermissionReviewPolicy (strict): %v", err)
+	}
+	defaultPolicy, err := gate.DefaultPermissionReviewPolicy("default-policy-v1")
+	if err != nil {
+		t.Fatalf("gate.DefaultPermissionReviewPolicy: %v", err)
+	}
+	if strictPolicy.MaximumAutoRisk == defaultPolicy.MaximumAutoRisk {
+		t.Fatal("fixture bug: strict and default policies must differ in posture, not just label")
+	}
+
+	var id uuid.UUID
+	func() {
+		stores := openFSStores(t, persistence)
+		defer func() { _ = stores.fs.Close() }()
+		strict := definePermissionClassifierRigWithPolicy(
+			t, stores, wsBase, newScriptLLM(say("idle")),
+			&scriptedReviewClient{respond: reviewAllowLow("n/a")}, shared, strictPolicy, false,
+		)
+		sess, err := strict.NewSession(ctx)
+		if err != nil {
+			t.Fatalf("NewSession (strict policy): %v", err)
+		}
+		id = sess.SessionID()
+		shutdown(t, sess)
+	}()
+
+	func() {
+		stores := openFSStores(t, persistence)
+		defer func() { _ = stores.fs.Close() }()
+		defaultNoAllow := definePermissionClassifierRigWithPolicy(
+			t, stores, wsBase, newScriptLLM(say("idle")),
+			&scriptedReviewClient{respond: reviewAllowLow("n/a")}, shared, defaultPolicy, false,
+		)
+		restored, err := defaultNoAllow.RestoreSession(ctx, id)
+		if err == nil {
+			shutdown(t, restored)
+			t.Fatal("restore from strict to default review policy succeeded without WithAllowConfigMismatch, want rejection")
+		}
+		var rejected *session.RestoreRejectedError
+		var mismatched *session.ConfigMismatchError
+		if !errors.As(err, &rejected) && !errors.As(err, &mismatched) {
+			t.Fatalf("restore error = %T %v, want *session.RestoreRejectedError or *session.ConfigMismatchError", err, err)
+		}
+	}()
+
+	func() {
+		stores := openFSStores(t, persistence)
+		defer func() { _ = stores.fs.Close() }()
+		defaultAllow := definePermissionClassifierRigWithPolicy(
+			t, stores, wsBase, newScriptLLM(say("idle")),
+			&scriptedReviewClient{respond: reviewAllowLow("n/a")}, shared, defaultPolicy, true,
+		)
+		restoredDefault, err := defaultAllow.RestoreSession(ctx, id)
+		if err != nil {
+			t.Fatalf("restore with WithAllowConfigMismatch: %v", err)
+		}
+		shutdown(t, restoredDefault)
+	}()
+
+	// The persisted session now carries the DEFAULT policy; restoring again
+	// under the SAME (default) policy must succeed without any override.
+	func() {
+		stores := openFSStores(t, persistence)
+		defer func() { _ = stores.fs.Close() }()
+		sameConfigAgain := definePermissionClassifierRigWithPolicy(
+			t, stores, wsBase, newScriptLLM(say("idle")),
+			&scriptedReviewClient{respond: reviewAllowLow("n/a")}, shared, defaultPolicy, false,
+		)
+		restoredAgain, err := sameConfigAgain.RestoreSession(ctx, id)
+		if err != nil {
+			t.Fatalf("same-config restore (no override) failed: %v", err)
+		}
+		shutdown(t, restoredAgain)
+	}()
+}
+
 // ---- fixtures: event-stream gate helpers -----------------------------------
 
 // internalEventsFor replays the FULL privileged event stream for id,
