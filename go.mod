@@ -7,7 +7,7 @@ require (
 	github.com/looprig/core v0.2.0
 	github.com/looprig/foreignloops v0.0.0
 	github.com/looprig/fsstore v0.2.0
-	github.com/looprig/harness v0.10.0
+	github.com/looprig/harness v0.19.0
 	github.com/looprig/inference v0.3.1-0.20260718005749-13e4d7f173b3
 	github.com/looprig/sandbox v0.0.0
 )
@@ -22,7 +22,7 @@ replace github.com/looprig/storage => ../storage
 
 // Development-only extraction mappings. release-check consumes a separate
 // go.release.mod with tagged modules and no local replacements.
-replace github.com/looprig/harness => ../harness-permission-classifier
+replace github.com/looprig/harness => ../harness
 
 replace github.com/looprig/classifiers => ../classifiers
 
