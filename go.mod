@@ -4,7 +4,7 @@ go 1.26.4
 
 require (
 	github.com/looprig/classifiers v0.0.0
-	github.com/looprig/core v0.2.0
+	github.com/looprig/core v0.5.0
 	github.com/looprig/foreignloops v0.0.0
 	github.com/looprig/fsstore v0.2.0
 	github.com/looprig/harness v0.19.0
