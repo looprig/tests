@@ -8,7 +8,7 @@ require (
 	github.com/looprig/foreignloops v0.1.1
 	github.com/looprig/fsstore v0.3.0
 	github.com/looprig/harness v0.20.0
-	github.com/looprig/inference v0.7.0
+	github.com/looprig/inference v0.8.0
 	github.com/looprig/sandbox v0.5.0
 )
 
