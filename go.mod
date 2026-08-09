@@ -5,14 +5,14 @@ go 1.26.4
 require (
 	github.com/looprig/classifiers v0.1.1
 	github.com/looprig/core v0.5.0
+	github.com/looprig/credentials v0.0.0
 	github.com/looprig/foreignloops v0.1.1
 	github.com/looprig/fsstore v0.3.0
 	github.com/looprig/harness v0.20.0
 	github.com/looprig/inference v0.8.0
 	github.com/looprig/llm v0.12.0
-	github.com/looprig/credentials v0.0.0
-	github.com/looprig/secrets v0.0.0
 	github.com/looprig/sandbox v0.5.0
+	github.com/looprig/secrets v0.0.0
 )
 
 require github.com/looprig/storage v0.3.0
@@ -57,7 +57,9 @@ require (
 	github.com/go-logr/logr v1.4.4 // indirect
 	github.com/go-logr/stdr v1.2.2 // indirect
 	github.com/google/go-cmp v0.7.0 // indirect
+	github.com/google/go-tdx-guest v0.3.1 // indirect
 	github.com/google/jsonschema-go v0.4.3 // indirect
+	github.com/google/logger v1.1.2 // indirect
 	github.com/google/nftables v0.3.0 // indirect
 	github.com/google/s2a-go v0.1.9 // indirect
 	github.com/google/uuid v1.6.0 // indirect
@@ -87,6 +89,7 @@ require (
 	go.opentelemetry.io/otel v1.45.0 // indirect
 	go.opentelemetry.io/otel/metric v1.45.0 // indirect
 	go.opentelemetry.io/otel/trace v1.45.0 // indirect
+	go.uber.org/multierr v1.11.0 // indirect
 	go.yaml.in/yaml/v3 v3.0.5 // indirect
 	go.yaml.in/yaml/v4 v4.0.0-rc.6 // indirect
 	golang.org/x/crypto v0.54.0 // indirect
