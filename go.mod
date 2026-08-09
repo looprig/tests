@@ -9,6 +9,9 @@ require (
 	github.com/looprig/fsstore v0.3.0
 	github.com/looprig/harness v0.20.0
 	github.com/looprig/inference v0.8.0
+	github.com/looprig/llm v0.12.0
+	github.com/looprig/credentials v0.0.0
+	github.com/looprig/secrets v0.0.0
 	github.com/looprig/sandbox v0.5.0
 )
 
@@ -17,6 +20,12 @@ require github.com/looprig/storage v0.3.0
 replace github.com/looprig/core => ../core
 
 replace github.com/looprig/inference => ../inference
+
+replace github.com/looprig/llm => ../llm
+
+replace github.com/looprig/credentials => ../credentials
+
+replace github.com/looprig/secrets => ../secrets
 
 replace github.com/looprig/storage => ../storage
 

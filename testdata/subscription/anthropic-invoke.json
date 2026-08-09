@@ -1,0 +1,32 @@
+{
+  "model": "fixture-alias",
+  "system": "Be concise and explain the tool result.",
+  "max_tokens": 128,
+  "thinking": {"type": "adaptive"},
+  "output_config": {"effort": "high"},
+  "tools": [
+    {
+      "name": "get_weather",
+      "description": "Return fixture weather data.",
+      "input_schema": {
+        "type": "object",
+        "properties": {"city": {"type": "string"}},
+        "required": ["city"],
+        "additionalProperties": false
+      }
+    }
+  ],
+  "tool_choice": {"type": "any"},
+  "messages": [
+    {
+      "role": "user",
+      "content": [
+        {"type": "text", "text": "What is the weather?"},
+        {
+          "type": "image",
+          "source": {"type": "base64", "media_type": "image/png", "data": "aGVsbG8="}
+        }
+      ]
+    }
+  ]
+}
