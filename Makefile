@@ -47,7 +47,7 @@ dependency-boundary:
 local-source-check:
 	GOWORK=off go test -race -run '^TestDevelopmentModuleSources' ./...
 
-# Every sibling repository in this ecosystem (harness, classifiers, coderig,
+# Every sibling repository in this ecosystem (harness, classifiers, carbon,
 # and this tests module) carries the same minimal top-level marker set
 # (go.mod, Makefile, LICENSE, CONTRIBUTING.md). See root_layout_test.go.
 root-layout:
