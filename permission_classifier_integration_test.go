@@ -7,9 +7,9 @@
 // composed the way a real consumer composes it: a real rig.Session, a real
 // gated tool call, and a real *commandsafety.Classifier — assembled directly
 // against Harness's public pkg/rig/pkg/gate/pkg/loop/pkg/tool surface, using
-// the same composition seams CodeRig's internal/app/permission_review.go
+// the same composition seams Carbon's internal/app/permission_review.go
 // uses (classifiers/pkg/commandsafety + harness/pkg/gate + harness/pkg/rig),
-// but never importing CodeRig itself (CodeRig's RuntimeAgent/sessionadapter
+// but never importing Carbon itself (Carbon's RuntimeAgent/sessionadapter
 // wrapper is a private, product-specific convenience, not a required seam).
 //
 // No production policy lives here: every fixture below is either a scripted
@@ -177,7 +177,7 @@ func (fakeGrantIssuer) IssueGrant(_ context.Context, executionID, _, _, _, _, _,
 
 // permissionClassifierTestModel is a minimal model.Model satisfying
 // commandsafety.New's capability requirements (Tools, StructuredOutput, and
-// StructuredOutputWithTools) — mirrors CodeRig's own
+// StructuredOutputWithTools) — mirrors Carbon's own
 // permissionReviewTestModel (internal/app/permission_review_test.go), since
 // this module's own testModel() deliberately omits these for ordinary loops.
 func permissionClassifierTestModel() model.Model {
@@ -285,7 +285,7 @@ func reviewNeedsHuman(inputJSON string) (string, error) {
 // needs. None of this file's scenarios drive the classifier's evidence-tool
 // loop (every scripted verdict above answers on the classifier's first
 // inference call), so these never need to enforce anything real — that real
-// enforcement is CodeRig's own permission_review_evidence.go, already proven
+// enforcement is Carbon's own permission_review_evidence.go, already proven
 // there.
 type stubEvidenceAccess struct{}
 
@@ -321,12 +321,12 @@ func permissionClassifierHustleLimits() rig.HustleLimits {
 
 // definePermissionClassifierRig assembles a real rig with one operator loop
 // bound to the gated run_command tool, optionally registering a real
-// command-safety classifier (enabled) built exactly the way CodeRig's own
+// command-safety classifier (enabled) built exactly the way Carbon's own
 // newPermissionReviewRegistration builds one (commandsafety.New +
 // gate.NewPermissionClassifierSet + rig.WithPermissionClassifiers/
 // WithPermissionReviewPolicy/WithPermissionReviewEvidence/
 // WithPermissionReviewSecurityCeiling), but assembled directly against
-// Harness's public pkg/rig surface rather than through CodeRig's private
+// Harness's public pkg/rig surface rather than through Carbon's private
 // internal/app composition. The loop/tool/access-gate topology is identical
 // whether enabled or not, so a disabled/enabled restore comparison isolates
 // the permission-review registration as the only configuration delta.

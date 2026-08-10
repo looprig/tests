@@ -272,8 +272,8 @@ func TestCredentialGatewayCancellationClosesStream(t *testing.T) {
 
 // TestCredentialGatewayChildExecEnvMechanics checks only that an explicitly
 // constructed exec.Cmd environment contains gateway metadata and no provider
-// variables. CodeRig's ACP composition/e2e tests are the authority for the
-// production child launch path; this test does not claim to invoke CodeRig.
+// variables. Carbon's ACP composition/e2e tests are the authority for the
+// production child launch path; this test does not claim to invoke Carbon.
 func TestCredentialGatewayChildExecEnvMechanics(t *testing.T) {
 	if os.Getenv("LOOPRIG_CREDENTIAL_GATEWAY_CHILD") == "1" {
 		if got := os.Getenv("LOOPRIG_GATEWAY_BASE_URL"); got != "http://127.0.0.1:43123" {
