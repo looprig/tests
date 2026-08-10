@@ -8,12 +8,12 @@ package tests
 // CI").
 //
 // Scope, deliberately minimal: this checks only that each of the four
-// sibling repositories (harness, classifiers, coderig, and this tests
+// sibling repositories (harness, classifiers, carbon, and this tests
 // module itself) has the small set of top-level marker files every one of
 // them ALREADY carries today (go.mod, Makefile, LICENSE, CONTRIBUTING.md) —
 // the survey in Task 26 confirmed this exact set is the true common
-// baseline (harness and coderig additionally carry CLAUDE.md/AGENTS.md,
-// classifiers and coderig lack a top-level README.md, so those are NOT
+// baseline (harness and carbon additionally carry CLAUDE.md/AGENTS.md,
+// classifiers and carbon lack a top-level README.md, so those are NOT
 // included). This does not duplicate classifiers' own
 // internal/buildtest/layout_test.go (which checks that ONE repo's own
 // internal source-tree shape, e.g. "no root .go files"/"module path is
@@ -22,15 +22,15 @@ package tests
 // It exists so a future consumer or CI runner that walks this repository
 // collection can rely on every sibling exposing the same minimal
 // discoverable structure, independent of whether that sibling happens to be
-// a Go module dependency of this one (coderig is not: it consumes these
+// a Go module dependency of this one (carbon is not: it consumes these
 // modules as a downstream product and never appears in go.mod).
 //
-// coderig is checked by convention, not by go.mod REPLACE discovery (unlike
-// harness/classifiers, this module has no dependency edge to coderig to
+// carbon is checked by convention, not by go.mod REPLACE discovery (unlike
+// harness/classifiers, this module has no dependency edge to carbon to
 // walk): its accepted sibling directory names mirror the existing
 // harness/harness-permission-classifier duality developmentModuleSources
 // already tolerates, for the same reason (a permission-classifier feature
-// branch checks out ../coderig-permission-classifier, not ../coderig).
+// branch checks out ../carbon-permission-classifier, not ../carbon).
 
 import (
 	"os"
@@ -58,7 +58,7 @@ var rootLayoutRepositories = []struct {
 }{
 	{label: "harness", directories: []string{"harness", "harness-permission-classifier"}},
 	{label: "classifiers", directories: []string{"classifiers"}},
-	{label: "coderig", directories: []string{"coderig", "coderig-permission-classifier"}},
+	{label: "carbon", directories: []string{"carbon", "carbon-permission-classifier"}},
 	{label: "tests", directories: []string{"tests", "tests-permission-classifier"}},
 }
 
@@ -132,7 +132,7 @@ func writeFullRootLayoutFixtureSet(t *testing.T, collectionRoot string) {
 	t.Helper()
 	writeRootLayoutFixture(t, collectionRoot, "harness-permission-classifier", rootLayoutMarkerFiles)
 	writeRootLayoutFixture(t, collectionRoot, "classifiers", rootLayoutMarkerFiles)
-	writeRootLayoutFixture(t, collectionRoot, "coderig-permission-classifier", rootLayoutMarkerFiles)
+	writeRootLayoutFixture(t, collectionRoot, "carbon-permission-classifier", rootLayoutMarkerFiles)
 	writeRootLayoutFixture(t, collectionRoot, "tests-permission-classifier", rootLayoutMarkerFiles)
 }
 
@@ -153,7 +153,7 @@ func TestSiblingRootLayoutAcceptsCanonicalDirectoryNames(t *testing.T) {
 	collectionRoot := t.TempDir()
 	writeRootLayoutFixture(t, collectionRoot, "harness", rootLayoutMarkerFiles)
 	writeRootLayoutFixture(t, collectionRoot, "classifiers", rootLayoutMarkerFiles)
-	writeRootLayoutFixture(t, collectionRoot, "coderig", rootLayoutMarkerFiles)
+	writeRootLayoutFixture(t, collectionRoot, "carbon", rootLayoutMarkerFiles)
 	writeRootLayoutFixture(t, collectionRoot, "tests", rootLayoutMarkerFiles)
 
 	violations, err := siblingRootLayoutViolations(collectionRoot)
@@ -219,7 +219,7 @@ func TestSiblingRootLayoutReportsMarkerFileThatIsActuallyADirectory(t *testing.T
 func TestSiblingRootLayoutReportsMissingRepositoryDirectory(t *testing.T) {
 	collectionRoot := t.TempDir()
 	writeRootLayoutFixture(t, collectionRoot, "classifiers", rootLayoutMarkerFiles)
-	writeRootLayoutFixture(t, collectionRoot, "coderig-permission-classifier", rootLayoutMarkerFiles)
+	writeRootLayoutFixture(t, collectionRoot, "carbon-permission-classifier", rootLayoutMarkerFiles)
 	writeRootLayoutFixture(t, collectionRoot, "tests-permission-classifier", rootLayoutMarkerFiles)
 	// harness deliberately absent.
 

@@ -18,21 +18,21 @@ import (
 
 const (
 	testsModulePath        = "github.com/looprig/tests"
-	coderigModulePath      = "github.com/looprig/coderig"
+	carbonModulePath       = "github.com/looprig/carbon"
 	harnessModulePath      = "github.com/looprig/harness"
 	foreignloopsModulePath = "github.com/looprig/foreignloops"
 )
 
 // crossModuleIntegrationOwners are the modules sanctioned to depend on both
 // Harness and foreignloops directly. tests is the integration-test
-// composition root; coderig is the production composition root that wires
+// composition root; carbon is the production composition root that wires
 // foreignloops' ACP driver into Harness's foreign-loop machinery to run ACP
 // agents (e.g. claude-code) as Harness children (internal/app/acpchildren.go).
 // Every other module must reach that combination through one of these two,
 // never by importing both directly itself.
 var crossModuleIntegrationOwners = map[string]bool{
-	testsModulePath:   true,
-	coderigModulePath: true,
+	testsModulePath:  true,
+	carbonModulePath: true,
 }
 
 func TestForeignloopsModulePathMatchesUpstream(t *testing.T) {
@@ -304,7 +304,7 @@ func TestCrossModuleOwnershipBoundary(t *testing.T) {
 		t.Fatal(err)
 	}
 	for _, violation := range violations {
-		t.Errorf("module %s imports both Harness and foreignloops; cross-module integration belongs only to %s or %s", violation, testsModulePath, coderigModulePath)
+		t.Errorf("module %s imports both Harness and foreignloops; cross-module integration belongs only to %s or %s", violation, testsModulePath, carbonModulePath)
 	}
 }
 
