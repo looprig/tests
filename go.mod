@@ -5,17 +5,17 @@ go 1.26.4
 require (
 	github.com/looprig/classifiers v0.1.1
 	github.com/looprig/core v0.5.0
-	github.com/looprig/credentials v0.0.0
+	github.com/looprig/credentials v0.1.0
 	github.com/looprig/foreignloops v0.1.1
 	github.com/looprig/fsstore v0.3.0
-	github.com/looprig/harness v0.20.0
-	github.com/looprig/inference v0.8.0
+	github.com/looprig/harness v0.22.0
+	github.com/looprig/inference v0.9.0
 	github.com/looprig/llm v0.12.0
 	github.com/looprig/sandbox v0.5.0
-	github.com/looprig/secrets v0.0.0
+	github.com/looprig/secrets v0.1.0
 )
 
-require github.com/looprig/storage v0.3.0
+require github.com/looprig/storage v0.3.1
 
 replace github.com/looprig/core => ../core
 
@@ -53,6 +53,7 @@ require (
 	github.com/buger/jsonparser v1.6.1 // indirect
 	github.com/ccojocar/zxcvbn-go v1.0.4 // indirect
 	github.com/cespare/xxhash/v2 v2.3.0 // indirect
+	github.com/creack/pty v1.1.24 // indirect
 	github.com/felixge/httpsnoop v1.1.0 // indirect
 	github.com/go-logr/logr v1.4.4 // indirect
 	github.com/go-logr/stdr v1.2.2 // indirect
