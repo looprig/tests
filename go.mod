@@ -3,15 +3,15 @@ module github.com/looprig/tests
 go 1.26.4
 
 require (
-	github.com/looprig/classifiers v0.1.1
+	github.com/looprig/classifiers v0.1.2
 	github.com/looprig/core v0.5.0
 	github.com/looprig/credentials v0.1.0
-	github.com/looprig/foreignloops v0.1.1
-	github.com/looprig/fsstore v0.3.0
+	github.com/looprig/foreignloops v0.2.1
+	github.com/looprig/fsstore v0.3.2
 	github.com/looprig/harness v0.22.0
 	github.com/looprig/inference v0.9.0
-	github.com/looprig/llm v0.12.0
-	github.com/looprig/sandbox v0.5.0
+	github.com/looprig/llm v0.13.1
+	github.com/looprig/sandbox v0.7.0
 	github.com/looprig/secrets v0.1.0
 )
 
@@ -41,7 +41,7 @@ replace github.com/looprig/fsstore => ../fsstore
 
 replace github.com/looprig/sandbox => ../sandbox
 
-require github.com/looprig/mcp v0.3.1
+require github.com/looprig/mcp v0.6.0
 
 require (
 	cloud.google.com/go v0.123.0 // indirect
