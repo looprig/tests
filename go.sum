@@ -71,8 +71,8 @@ github.com/invopop/jsonschema v0.14.0 h1:MHQqLhvpNUZfw+hM3AZDYK7jxO8FZoQeQM77g8i
 github.com/invopop/jsonschema v0.14.0/go.mod h1:ygm6C2EaVNMBDPpaPlnOA2pFAxBnxGjFlMZABxm9n2I=
 github.com/landlock-lsm/go-landlock v0.9.0 h1:2q8G8yx9Hsd5bV+R6PJfgQl0zszNxC8KO+SIqGwfxlw=
 github.com/landlock-lsm/go-landlock v0.9.0/go.mod h1:mn5GSi81Jf7yMs5WSi+SUi4sUeNLUGVdbT4Id6wXNQw=
-github.com/looprig/acp v0.2.1 h1:Jxx94Rw0W35Rk+x3wWXweb1tPp9e7IkwWCuGlFdMI9E=
-github.com/looprig/acp v0.2.1/go.mod h1:a8jnRa87Xr0ykyGLSjIMQR7Xagnp5guz2fVMT2w77Gk=
+github.com/looprig/acp v0.2.2 h1:hi8KTeLGiOXUkJAO5yDZYiS/Y52Zc0leXLE/zBh7cjI=
+github.com/looprig/acp v0.2.2/go.mod h1:OUaVFe8UAVCBeMhTomsDSAaNDRo3EoYGZGO9/iqhKmU=
 github.com/mdlayher/netlink v1.11.2 h1:HKh2jqe+omdSWcQ88nrT7INE61B0NXfiSPFdgL4YbNI=
 github.com/mdlayher/netlink v1.11.2/go.mod h1:uT2Yc/QLaZubzDpZIBi9d4GoeLwtp3x1AMeqSRrK2sA=
 github.com/mdlayher/socket v0.6.1 h1:M7uj2NtuujUY4mYr1C57NmfNiRHbkKpnBxO856lsc3A=
