@@ -512,6 +512,15 @@ func (o *observer) all() []event.Event {
 	return append([]event.Event(nil), o.events...)
 }
 
+// count returns the number of events drained so far. It is used as a cursor
+// when a test needs to distinguish the idle it already observed from a later
+// idle it just caused.
+func (o *observer) count() int {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	return len(o.events)
+}
+
 // find returns the first event matching pred.
 func (o *observer) find(pred func(event.Event) bool) (event.Event, bool) {
 	for _, ev := range o.all() {
@@ -532,6 +541,28 @@ func (o *observer) wait(t *testing.T, what string, pred func(event.Event) bool) 
 		}
 		if time.Now().After(deadline) {
 			t.Fatalf("no %s was ever published", what)
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+}
+
+// waitAfter is wait with an event cursor. A plain wait can return an earlier
+// matching LoopIdle, which is not enough when a test is proving what a newly
+// submitted boundary did.
+func (o *observer) waitAfter(t *testing.T, what string, after int, pred func(event.Event) bool) event.Event {
+	t.Helper()
+	deadline := time.Now().Add(settle)
+	for {
+		events := o.all()
+		if after < len(events) {
+			for _, ev := range events[after:] {
+				if pred(ev) {
+					return ev
+				}
+			}
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("no %s was published after event %d", what, after)
 		}
 		time.Sleep(5 * time.Millisecond)
 	}
@@ -1124,17 +1155,26 @@ func (f *rigFixture) waitCandidate(t *testing.T, binding string, after uint64) {
 	}
 }
 
-// catalogGeneration is the ordinal of the binding's currently ADOPTED catalog (0
-// before one is adopted), read through the public Manager.Status().
-func (f *rigFixture) catalogGeneration(t *testing.T, binding string) uint64 {
+// catalogState returns the public adopted/candidate ordinals for one binding.
+// The two values are deliberately read together: a refresh may be either a
+// candidate waiting for the next idle or a generation that the idle has already
+// adopted by the time the test observes it.
+func (f *rigFixture) catalogState(t *testing.T, binding string) (adopted, candidate uint64) {
 	t.Helper()
 	for _, st := range f.mgr.Status() {
 		if st.Name == binding {
-			return st.Client.CatalogGeneration
+			return st.Client.CatalogGeneration, st.Client.CandidateGeneration
 		}
 	}
 	t.Fatalf("no binding named %q", binding)
-	return 0
+	return 0, 0
+}
+
+// catalogGeneration is the ordinal of the binding's currently ADOPTED catalog (0
+// before one is adopted), read through the public Manager.Status().
+func (f *rigFixture) catalogGeneration(t *testing.T, binding string) uint64 {
+	adopted, _ := f.catalogState(t, binding)
+	return adopted
 }
 
 // adoptions counts the toolsets the adapter has installed so far.
@@ -1178,12 +1218,70 @@ func (f *rigFixture) waitAdoptions(t *testing.T, n int) {
 func (f *rigFixture) carryToNextGeneration(t *testing.T, binding string, loopID uuid.UUID) {
 	t.Helper()
 	f.waitCandidate(t, binding, 1)
-	before := f.adoptions()
+
+	// The mutating turn's idle may have been delivered before the refresh became
+	// a candidate. Observe that boundary before driving another one, then branch
+	// on the public state we actually saw. If generation 2 is already adopted,
+	// the nudge must be a no-op; if it is still a candidate, the nudge is the
+	// boundary that adopts it.
+	f.obs.wait(t, "the mutating turn's idle boundary", loopIdle(loopID))
+	adopted, candidate := f.catalogState(t, binding)
+	if adopted > 1 && candidate > 0 {
+		t.Fatalf("binding %q reports adopted generation %d and candidate generation %d; one mutation should have one outcome", binding, adopted, candidate)
+	}
+	const wantAdoptions = 2 // initial Install plus exactly one generation change
+	if adopted > 1 {
+		if adopted != 2 || candidate != 0 {
+			t.Fatalf("binding %q state = adopted %d/candidate %d, want adopted generation 2 with no candidate", binding, adopted, candidate)
+		}
+		// CatalogGeneration moves before the asynchronous Reporter notice. Wait
+		// for that notice, then require exactly one adoption before exercising
+		// the already-current nudge path.
+		f.waitAdoptions(t, wantAdoptions)
+		if got := f.adoptions(); got != wantAdoptions {
+			t.Fatalf("already-adopted generation produced %d adoption notices, want exactly %d", got, wantAdoptions)
+		}
+	} else if candidate > 1 {
+		if adopted != 1 || candidate != 2 {
+			t.Fatalf("binding %q state = adopted %d/candidate %d, want candidate generation 2 over adopted generation 1", binding, adopted, candidate)
+		}
+	} else {
+		t.Fatalf("binding %q has no generation-2 candidate or adoption: adopted %d/candidate %d", binding, adopted, candidate)
+	}
+
+	// A plain wait could find the first idle again. Use the cursor captured
+	// before submitting the nudge so the boundary below is unambiguously the
+	// nudge's own.
+	nudgeAfter := f.obs.count()
 	if _, err := f.sess.Submit(itCtx(t), []content.Block{&content.TextBlock{Text: "nudge"}}); err != nil {
 		t.Fatalf("Submit: %v", err)
 	}
-	f.obs.wait(t, "an idle boundary for the nudge turn", loopIdle(loopID))
-	f.waitAdoptions(t, before+1)
+	f.obs.waitAfter(t, "an idle boundary for the nudge turn", nudgeAfter, loopIdle(loopID))
+
+	if adopted > 1 {
+		// There was no candidate left to adopt. The nudge's idle must not churn
+		// the installed toolset or emit a redundant adoption notice.
+		time.Sleep(50 * time.Millisecond)
+		if got := f.adoptions(); got != wantAdoptions {
+			t.Fatalf("already-adopted generation produced %d adoption notices after a no-op idle, want exactly %d", got, wantAdoptions)
+		}
+		if got, pending := f.catalogState(t, binding); got != 2 || pending != 0 {
+			t.Fatalf("after no-op idle binding state = adopted %d/candidate %d, want adopted 2/candidate 0", got, pending)
+		}
+		return
+	}
+
+	// The candidate branch must result in one and only one replacement. The
+	// adapter may service the mutating idle just before or the nudge idle just
+	// after the candidate became visible; either way the safe-boundary contract
+	// is the same and the public result is exactly one generation-2 notice.
+	f.waitAdoptions(t, wantAdoptions)
+	if got := f.adoptions(); got != wantAdoptions {
+		t.Fatalf("candidate generation produced %d adoption notices, want exactly %d", got, wantAdoptions)
+	}
+	if got, pending := f.catalogState(t, binding); got != 2 || pending != 0 {
+		t.Fatalf("after candidate idle binding state = adopted %d/candidate %d, want adopted 2/candidate 0", got, pending)
+	}
 }
 
 // TestActiveTurnKeepsItsToolSnapshotAndAdoptsAtIdle is the catalog model end to

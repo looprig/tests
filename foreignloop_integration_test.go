@@ -360,7 +360,7 @@ func TestForeignloopProviderFailureWithQueuedDelegates(t *testing.T) {
 
 	events := eventsFor(t, ctx, store, sess.SessionID())
 	childStarted := childForeignloopStarted(t, events, parentID)
-	events = waitForeignloopTurnTerminal(t, ctx, store, sess.SessionID(), childStarted.LoopID)
+	waitForeignloopTurnTerminal(t, ctx, store, sess.SessionID(), childStarted.LoopID)
 	events = waitForeignloopInputCancelled(t, ctx, store, sess.SessionID(), childStarted.LoopID, event.CancelTurnFailed, 2)
 	assertForeignloopTurnKinds(t, events, childStarted.LoopID, []string{"TurnStarted", "TurnFailed"})
 	queuedIDs := foreignloopCancelledRequestIDs(t, events, childStarted.LoopID, event.CancelTurnFailed, "B", "C")
@@ -386,6 +386,12 @@ func TestForeignloopSubagentQuota(t *testing.T) {
 			return foreignloopToolCall("quota-second", `{"agent_type":"child","instructions":"second","wait_for_response":true}`), nil
 		},
 		func(_ context.Context, request inference.Request) ([]content.Chunk, error) {
+			// The typed SessionLoopQuotaExceeded is consumed by Harness's
+			// StartAgent tool at this boundary. Quota rejection publishes no
+			// LoopStarted (or quota-specific durable event), and the tool's
+			// fail-closed model-facing contract intentionally exposes only this
+			// generic result. Harness's own session-runtime tests assert the typed
+			// error before this integration boundary.
 			const want = "error: agent failed"
 			if err := foreignloopExpectLastToolResult(request, want); err != nil {
 				return nil, err
