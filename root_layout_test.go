@@ -17,8 +17,8 @@ package tests
 // included). This does not duplicate classifiers' own
 // internal/buildtest/layout_test.go (which checks that ONE repo's own
 // internal source-tree shape, e.g. "no root .go files"/"module path is
-// exact") or this module's own developmentModuleSourceViolations (which
-// checks go.mod REPLACE directives point at the right sibling directory).
+// exact") or this module's canonical go.mod guard (which checks that the
+// published module graph contains no workspace-only REPLACE directives).
 // It exists so a future consumer or CI runner that walks this repository
 // collection can rely on every sibling exposing the same minimal
 // discoverable structure, independent of whether that sibling happens to be
@@ -27,10 +27,10 @@ package tests
 //
 // carbon is checked by convention, not by go.mod REPLACE discovery (unlike
 // harness/classifiers, this module has no dependency edge to carbon to
-// walk): its accepted sibling directory names mirror the existing
-// harness/harness-permission-classifier duality developmentModuleSources
-// already tolerates, for the same reason (a permission-classifier feature
-// branch checks out ../carbon-permission-classifier, not ../carbon).
+// walk): its accepted sibling directory names mirror the workspace's
+// harness/harness-permission-classifier duality, for the same reason (a
+// permission-classifier feature branch checks out ../carbon-permission-classifier,
+// not ../carbon).
 
 import (
 	"os"
@@ -49,9 +49,8 @@ var rootLayoutMarkerFiles = []string{"go.mod", "Makefile", "LICENSE", "CONTRIBUT
 
 // rootLayoutRepositories is the closed set of sibling repositories this
 // check covers, in report order. directories lists every sibling directory
-// name accepted for that repository (canonical name first), mirroring
-// developmentModuleSourceViolations' existing harness/
-// harness-permission-classifier duality.
+// name accepted for that repository (canonical name first), mirroring the
+// workspace's harness/harness-permission-classifier duality.
 var rootLayoutRepositories = []struct {
 	label       string
 	directories []string
@@ -113,8 +112,8 @@ func findFirstExistingDirectory(collectionRoot string, directories []string) (st
 // writeRootLayoutFixture creates directory/name under collectionRoot and
 // populates it with exactly the given marker file names (empty contents —
 // this check only cares about presence, matching every real marker file's
-// role here: a real go.mod's exact content is already covered by
-// findModuleRoot/developmentModuleSourceViolations, not this check).
+// role here: the module's exact dependency content is covered by the
+// canonical go.mod guard, not this check).
 func writeRootLayoutFixture(t *testing.T, collectionRoot, directory string, markers []string) {
 	t.Helper()
 	root := filepath.Join(collectionRoot, directory)
@@ -242,8 +241,8 @@ func TestSiblingRootLayoutReportsMissingRepositoryDirectory(t *testing.T) {
 // TestRepositoryRootLayoutMatchesEcosystemConvention is the live guard: it
 // runs siblingRootLayoutViolations against the real, currently checked-out
 // sibling repository collection (this module's own parent directory), the
-// same way TestDevelopmentModuleSources runs its own violation-detection
-// function against the real go.mod. A future repository that drops one of
+// same way the canonical module guard checks this repository's go.mod. A
+// future repository that drops one of
 // these marker files, or a collection missing one of the four repositories
 // entirely, fails this test.
 func TestRepositoryRootLayoutMatchesEcosystemConvention(t *testing.T) {

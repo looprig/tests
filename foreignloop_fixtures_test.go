@@ -151,7 +151,15 @@ func foreignloopExecutable(provider foreignloopProvider, text, boundSID string, 
 		lines = append(lines, "printf '%s\\n' "+shellSingleQuote(string(encoded)))
 	}
 	if control != foreignloopProcessImmediate {
-		lines = append(lines, `: > "$LOOPRIG_FAKE_STARTED"`, `while [ ! -e "$LOOPRIG_FAKE_RELEASE" ]; do sleep 0.01; done`)
+		// The published driver interrupts the whole provider process group. Keep
+		// this fixture cooperative at that boundary so cancellation tests exercise
+		// the driver's process-group contract rather than a shell that ignores
+		// SIGINT while waiting for its polling child.
+		lines = append(lines,
+			`trap 'exit 130' INT TERM`,
+			`: > "$LOOPRIG_FAKE_STARTED"`,
+			`while [ ! -e "$LOOPRIG_FAKE_RELEASE" ]; do sleep 0.01; done`,
+		)
 		if control == foreignloopProcessFailAfterRelease {
 			lines = append(lines, "exit 7")
 		} else {
@@ -392,6 +400,51 @@ func waitForeignloopTurnDone(t *testing.T, ctx context.Context, sub event.Subscr
 	}
 }
 
+// waitForeignloopTurnTerminal replays the durable journal until a child turn's
+// terminal event is committed. Parent turns may finish before an asynchronously
+// supervised foreign child reports provider failure, so a single immediate
+// replay would race the journal rather than test the failure contract.
+func waitForeignloopTurnTerminal(t *testing.T, ctx context.Context, store *sessionstore.Store, sessionID, loopID uuid.UUID) []event.Event {
+	t.Helper()
+	ticker := time.NewTicker(10 * time.Millisecond)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			t.Fatalf("wait for loop %s terminal event: %v", loopID, ctx.Err())
+		default:
+		}
+		events := eventsFor(t, ctx, store, sessionID)
+		turnEvents := foreignloopTurnEvents(events, loopID)
+		if len(turnEvents) > 0 {
+			switch turnEvents[len(turnEvents)-1].(type) {
+			case event.TurnDone, event.TurnFailed, event.TurnInterrupted:
+				return events
+			}
+		}
+		select {
+		case <-ctx.Done():
+			t.Fatalf("wait for loop %s terminal event: %v", loopID, ctx.Err())
+		case <-ticker.C:
+		}
+	}
+}
+
+// interruptForeignloopChild uses the public loop controller because the tagged
+// StopAgent tool waits for LoopIdle, while foreignloops v0.2.4 publishes only
+// the TurnInterrupted terminal for an interrupted turn.
+func interruptForeignloopChild(ctx context.Context, sess session.SessionController, agentID string) error {
+	childID, err := uuid.Parse(agentID)
+	if err != nil {
+		return fmt.Errorf("parse foreignloop agent id %q: %w", agentID, err)
+	}
+	controller, ok := sess.LoopController(childID)
+	if !ok {
+		return fmt.Errorf("foreignloop child %s not registered", agentID)
+	}
+	return controller.Interrupt(ctx)
+}
+
 func rootForeignloopStarted(t *testing.T, events []event.Event) event.LoopStarted {
 	t.Helper()
 	for _, value := range events {
@@ -517,7 +570,56 @@ func (s *foreignloopScenarioLLM) callCount() int {
 }
 
 func foreignloopToolCall(id, input string) []content.Chunk {
-	return []content.Chunk{foreignloopToolUse(id, "Subagent", input)}
+	name, wire := foreignloopAgentToolCall(input)
+	return []content.Chunk{foreignloopToolUse(id, name, wire)}
+}
+
+func foreignloopAgentToolCall(input string) (string, string) {
+	var raw map[string]any
+	if err := json.Unmarshal([]byte(input), &raw); err != nil {
+		return "StartAgent", input
+	}
+	action, _ := raw["action"].(string)
+	if action == "" {
+		switch {
+		case raw["agent_id"] != nil && raw["message"] != nil:
+			return "MessageAgent", input
+		case raw["agent_id"] != nil:
+			return "StopAgent", input
+		default:
+			return "StartAgent", input
+		}
+	}
+	switch action {
+	case "start":
+		wire := map[string]any{
+			"agent_type":        raw["agent"],
+			"instructions":      raw["message"],
+			"wait_for_response": raw["wait"],
+		}
+		return "StartAgent", marshalForeignloopToolInput(wire)
+	case "send":
+		wire := map[string]any{
+			"agent_id":          raw["delegate_id"],
+			"message":           raw["message"],
+			"wait_for_response": raw["wait"],
+		}
+		return "MessageAgent", marshalForeignloopToolInput(wire)
+	case "interrupt":
+		return "StopAgent", marshalForeignloopToolInput(map[string]any{"agent_id": raw["delegate_id"]})
+	case "status":
+		return "ListAgents", marshalForeignloopToolInput(map[string]any{"agent_id": raw["delegate_id"]})
+	default:
+		return "StartAgent", input
+	}
+}
+
+func marshalForeignloopToolInput(input map[string]any) string {
+	encoded, err := json.Marshal(input)
+	if err != nil {
+		return "{}"
+	}
+	return string(encoded)
 }
 
 func foreignloopFinal(text string) []content.Chunk {
@@ -542,23 +644,27 @@ func foreignloopLastToolResult(request inference.Request) (string, error) {
 	return "", errors.New("model request has no tool result")
 }
 
-type foreignloopQueuedResult struct {
-	DelegateID string `json:"delegate_id"`
-	RequestID  string `json:"request_id"`
-	Status     string `json:"status"`
+type foreignloopAgentToolResult struct {
+	AgentID        string `json:"agent_id"`
+	Name           string `json:"name"`
+	State          string `json:"state"`
+	PreviousState  string `json:"previous_state"`
+	DeliveryStatus string `json:"delivery_status"`
+	ResponseStatus string `json:"response_status"`
+	Response       string `json:"response"`
 }
 
-func foreignloopLastQueuedResult(request inference.Request) (foreignloopQueuedResult, error) {
+func foreignloopLastAgentToolResult(request inference.Request) (foreignloopAgentToolResult, error) {
 	text, err := foreignloopLastToolResult(request)
 	if err != nil {
-		return foreignloopQueuedResult{}, err
+		return foreignloopAgentToolResult{}, err
 	}
-	var result foreignloopQueuedResult
+	var result foreignloopAgentToolResult
 	if err := json.Unmarshal([]byte(text), &result); err != nil {
-		return foreignloopQueuedResult{}, fmt.Errorf("decode queued tool result %q: %w", text, err)
+		return foreignloopAgentToolResult{}, fmt.Errorf("decode agent tool result %q: %w", text, err)
 	}
-	if result.DelegateID == "" || result.RequestID == "" || result.Status != "queued" {
-		return foreignloopQueuedResult{}, fmt.Errorf("queued tool result = %+v, want non-empty ids and queued status", result)
+	if result.AgentID == "" {
+		return foreignloopAgentToolResult{}, fmt.Errorf("agent tool result = %+v, want agent id", result)
 	}
 	return result, nil
 }
@@ -568,8 +674,19 @@ func foreignloopExpectLastToolResult(request inference.Request, want string) err
 	if err != nil {
 		return err
 	}
-	if got != want {
+	if got != want && foreignloopForegroundResponse(got) != want {
 		return fmt.Errorf("tool result = %q, want %q", got, want)
+	}
+	return nil
+}
+
+func foreignloopExpectRawToolResult(request inference.Request, want string) error {
+	got, err := foreignloopLastToolResult(request)
+	if err != nil {
+		return err
+	}
+	if got != want {
+		return fmt.Errorf("raw tool result = %q, want %q", got, want)
 	}
 	return nil
 }
@@ -617,13 +734,23 @@ func (s *foreignloopScriptLLM) toolResults() []string {
 			var text strings.Builder
 			for _, block := range toolResult.Blocks {
 				if typed, ok := block.(*content.TextBlock); ok {
-					text.WriteString(typed.Text)
+					text.WriteString(foreignloopForegroundResponse(typed.Text))
 				}
 			}
 			result = append(result, text.String())
 		}
 	}
 	return result
+}
+
+func foreignloopForegroundResponse(text string) string {
+	var result struct {
+		Response *string `json:"response"`
+	}
+	if err := json.Unmarshal([]byte(text), &result); err == nil && result.Response != nil {
+		return *result.Response
+	}
+	return text
 }
 
 func foreignloopToolUse(id, name, input string) content.Chunk {

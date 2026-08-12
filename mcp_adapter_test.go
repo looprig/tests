@@ -891,7 +891,7 @@ func TestMixedSessionAndLoopScope(t *testing.T) {
 // --- 3 & 4. selectors, and a delegate that inherits nothing private ---------
 
 // TestDelegateSeesSharedButNotPrivateBindings is the delegation rule end to end:
-// a REAL delegate Loop, spawned by a real Subagent call from a real parent turn,
+// a REAL delegate Loop, spawned by a real StartAgent call from a real parent turn,
 // against real servers.
 //
 // The parent has a private Loop-scoped binding and a Session-scoped binding
@@ -904,7 +904,7 @@ func TestDelegateSeesSharedButNotPrivateBindings(t *testing.T) {
 	ctx := itCtx(t)
 
 	parentLLM := newScriptLLM(
-		call("c1", "Subagent", `{"action":"start","agent":"builder","message":"go","wait":true}`),
+		call("c1", "StartAgent", `{"agent_type":"builder","instructions":"go","wait_for_response":true}`),
 		say("parent done"),
 	)
 	sess := newSession(t, newStore(t), "planner",
@@ -1533,7 +1533,7 @@ func TestFormElicitationReachesTheHostAndAnswersTheServer(t *testing.T) {
 	)
 	sess := newSession(t, newStore(t), "planner", newLoop(t, "planner", llm, approveAll(t)))
 
-	f := attach(t, sess, gates, fixtureBinding(t, "srv", mcpharness.ScopeSession, []string{"-elicit"}, func(b *mcpharness.Binding) {
+	f := attach(t, sess, gates, fixtureBinding(t, "srv", mcpharness.ScopeSession, []string{"-elicit", "-legacy-protocol"}, func(b *mcpharness.Binding) {
 		b.Server.Capabilities = client.ClientCapabilities{Elicitation: true}
 	}))
 	if err := f.start(t); err != nil {
@@ -1625,7 +1625,7 @@ func driveURLElicitation(t *testing.T) mcpharness.GateRequest {
 	llm := newScriptLLM(call("c1", mcpName("srv", fixtureToolElicit), string(args)), say("ok"))
 	sess := newSession(t, newStore(t), "planner", newLoop(t, "planner", llm, approveAll(t)))
 
-	f := attach(t, sess, gates, fixtureBinding(t, "srv", mcpharness.ScopeSession, []string{"-elicit"}, func(b *mcpharness.Binding) {
+	f := attach(t, sess, gates, fixtureBinding(t, "srv", mcpharness.ScopeSession, []string{"-elicit", "-legacy-protocol"}, func(b *mcpharness.Binding) {
 		b.Server.Capabilities = client.ClientCapabilities{Elicitation: true}
 	}))
 	if err := f.start(t); err != nil {

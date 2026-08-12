@@ -3,45 +3,19 @@ module github.com/looprig/tests
 go 1.26.4
 
 require (
-	github.com/looprig/classifiers v0.1.4
+	github.com/looprig/classifiers v0.1.5
 	github.com/looprig/core v0.5.1
 	github.com/looprig/credentials v0.1.0
-	github.com/looprig/foreignloops v0.2.3
+	github.com/looprig/foreignloops v0.2.4
 	github.com/looprig/fsstore v0.3.2
-	github.com/looprig/harness v0.24.2
-	github.com/looprig/inference v0.9.2
-	github.com/looprig/llm v0.13.2
+	github.com/looprig/harness v0.25.0
+	github.com/looprig/inference v0.10.0
+	github.com/looprig/llm v0.13.4
+	github.com/looprig/mcp v0.6.3
 	github.com/looprig/sandbox v0.8.1
 	github.com/looprig/secrets v0.1.0
+	github.com/looprig/storage v0.3.1
 )
-
-require github.com/looprig/storage v0.3.1
-
-replace github.com/looprig/core => ../core
-
-replace github.com/looprig/inference => ../inference
-
-replace github.com/looprig/llm => ../llm
-
-replace github.com/looprig/credentials => ../credentials
-
-replace github.com/looprig/secrets => ../secrets
-
-replace github.com/looprig/storage => ../storage
-
-// Development-only extraction mappings. release-check consumes a separate
-// go.release.mod with tagged modules and no local replacements.
-replace github.com/looprig/harness => ../harness
-
-replace github.com/looprig/classifiers => ../classifiers
-
-replace github.com/looprig/foreignloops => ../foreignloops
-
-replace github.com/looprig/fsstore => ../fsstore
-
-replace github.com/looprig/sandbox => ../sandbox
-
-require github.com/looprig/mcp v0.6.2
 
 require (
 	cloud.google.com/go v0.123.0 // indirect
@@ -113,8 +87,6 @@ require (
 	honnef.co/go/tools v0.7.0 // indirect
 	kernel.org/pub/linux/libs/security/libcap/psx v1.2.78 // indirect
 )
-
-replace github.com/looprig/mcp => ../mcp
 
 tool (
 	github.com/securego/gosec/v2/cmd/gosec

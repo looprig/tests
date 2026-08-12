@@ -17,24 +17,20 @@ module boundary itself:
 - it verifies that no other module in the sibling checkout tree reaches
   into both Harness and foreignloops at once (that kind of cross-module
   integration belongs here, not in a leaf module);
-- it verifies that its own `go.mod` points every looprig dependency at a
-  local sibling checkout during development (`../core`, `../harness`, ...),
-  so development always runs against source, not a stale tagged release;
-- it verifies a separate `go.release.mod` — prepared out of band with
-  tagged module versions and no local `replace` directives — before a
-  release is cut.
+- it verifies that its canonical `go.mod` contains only published module
+  versions and no workspace-only `replace` directives, so every invocation
+  exercises the same graph a real consumer resolves.
 
 ## Build, test, and secure
 
 All Go invocations in this repo are run with `GOWORK=off` so the module
-resolves entirely through its own `go.mod` `require`/`replace` graph rather
-than any enclosing Go workspace.
+resolves entirely through its own canonical `go.mod` rather than any
+enclosing Go workspace.
 
 - `make test` — runs the full integration suite (`-tags integration`) with
-  the race detector, against real sibling modules via the local `replace`
-  directives in `go.mod`. `LOOPRIG_LIVE_NETWORK=0` keeps the suite from
-  making real outbound network calls; tests that need external network
-  access skip themselves closed under this setting.
+  the race detector against the published module graph. `LOOPRIG_LIVE_NETWORK=0`
+  keeps the suite from making real outbound network calls; tests that need
+  external network access skip themselves closed under this setting.
 - `make live-network` — runs only the opted-in
   `TestSandboxBroadNetworkGrantCarriesDNS` test with
   `LOOPRIG_LIVE_NETWORK=1`, exercising a sandboxed process's real outbound
@@ -57,26 +53,17 @@ than any enclosing Go workspace.
   imports both Harness and foreignloops packages from integration-tagged
   (or otherwise real, non-test) source — that combination is reserved for
   this repo.
-- `make local-source-check` — runs `TestDevelopmentModuleSources`, which
-  parses this module's own `go.mod` and fails if any looprig dependency is
-  missing a local `replace` directive, points at the wrong sibling
-  directory, or resolves to the wrong module path. This keeps development
-  runs honest about testing local source rather than a previously tagged
-  release.
+- `make mod-check` — verifies the canonical `go.mod` has no local filesystem
+  replacements, is tidy under `GOWORK=off`, and has verified module sums.
 - `make check` — the fast-feedback composition: `fmt-check`, `vet`,
-  `dependency-boundary`, `local-source-check`, then `test`. It deliberately
+  `dependency-boundary`, `root-layout`, then `test`. It deliberately
   leaves out `secure` (staticcheck/gosec/govulncheck are slower and
   `govulncheck` needs network access to the vulnerability database) and
   leaves out `live-network`.
-- `make release-check` — verifies a prepared `go.release.mod`
-  (`RELEASE_MODFILE`, default `go.release.mod`) contains no local
-  filesystem `replace` directives — only tagged module versions or
-  versioned external replacements — via
-  `scripts/check-release-modfile.sh`, then runs the full integration suite
-  against that release modfile with `-modfile`. This is the check that
-  proves a tagged release of the looprig modules actually works together,
-  as opposed to `make test`/`make check`, which prove local development
-  source works together.
+- `make release-check` — validates the canonical `go.mod` with
+  `scripts/check-release-modfile.sh`, checks tidy/module sums, and runs the
+  full integration suite against that exact published graph. It has no
+  alternate release modfile and cannot silently fall back to workspace source.
 
 ## Pull requests
 

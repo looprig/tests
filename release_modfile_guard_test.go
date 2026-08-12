@@ -8,7 +8,38 @@ import (
 	"testing"
 )
 
-func TestReleaseModfileGuard(t *testing.T) {
+func TestCanonicalGoModHasNoLocalReplacements(t *testing.T) {
+	t.Parallel()
+
+	contents, err := os.ReadFile("go.mod")
+	if err != nil {
+		t.Fatalf("read canonical go.mod: %v", err)
+	}
+	for _, line := range strings.Split(string(contents), "\n") {
+		trimmed := strings.TrimSpace(line)
+		if strings.HasPrefix(trimmed, "replace ") || trimmed == "replace" || trimmed == "replace (" {
+			t.Fatalf("canonical go.mod still contains a replace directive: %q", trimmed)
+		}
+	}
+}
+
+func TestReleaseCheckUsesCanonicalGoMod(t *testing.T) {
+	t.Parallel()
+
+	contents, err := os.ReadFile("Makefile")
+	if err != nil {
+		t.Fatalf("read Makefile: %v", err)
+	}
+	makefile := string(contents)
+	if strings.Contains(makefile, "RELEASE_MODFILE") {
+		t.Fatal("release-check must not accept an alternate release modfile")
+	}
+	if !strings.Contains(makefile, `scripts/check-release-modfile.sh go.mod`) {
+		t.Fatal("release-check must validate the canonical go.mod")
+	}
+}
+
+func TestCanonicalModuleGuardRejectsLocalReplacements(t *testing.T) {
 	t.Parallel()
 
 	tests := []struct {
@@ -88,7 +119,7 @@ replace github.com/looprig/foreignloops => local-foreignloop
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
 
-			modfile := filepath.Join(t.TempDir(), "go.release.mod")
+			modfile := filepath.Join(t.TempDir(), "go.mod")
 			if err := os.WriteFile(modfile, []byte(tt.modfile), 0o600); err != nil {
 				t.Fatalf("write temporary modfile: %v", err)
 			}
@@ -97,7 +128,7 @@ replace github.com/looprig/foreignloops => local-foreignloop
 			output, err := cmd.CombinedOutput()
 			if tt.wantErr == "" {
 				if err != nil {
-					t.Fatalf("guard rejected release modfile: %v\n%s", err, output)
+					t.Fatalf("guard rejected canonical module file: %v\n%s", err, output)
 				}
 				return
 			}
@@ -113,74 +144,4 @@ replace github.com/looprig/foreignloops => local-foreignloop
 			}
 		})
 	}
-}
-
-func TestReleaseCheckTargetFailsClosedBeforeGo(t *testing.T) {
-	t.Parallel()
-
-	tempDir := t.TempDir()
-	marker := filepath.Join(tempDir, "go-invoked")
-	fakeGo := filepath.Join(tempDir, "fake-go")
-	fakeGoBody := "#!/bin/sh\nprintf '%s\\n' \"$*\" > \"$RELEASE_GO_MARKER\"\n"
-	if err := os.WriteFile(fakeGo, []byte(fakeGoBody), 0o700); err != nil {
-		t.Fatalf("write fake Go command: %v", err)
-	}
-
-	run := func(t *testing.T, modfile string) ([]byte, error) {
-		t.Helper()
-		cmd := exec.Command("make", "release-check", "RELEASE_MODFILE="+modfile, "RELEASE_GO="+fakeGo)
-		cmd.Env = append(os.Environ(), "RELEASE_GO_MARKER="+marker)
-		return cmd.CombinedOutput()
-	}
-
-	t.Run("absent modfile", func(t *testing.T) {
-		modfile := filepath.Join(tempDir, "absent.mod")
-		output, err := run(t, modfile)
-		if err == nil {
-			t.Fatal("release-check accepted an absent release modfile")
-		}
-		if !strings.Contains(string(output), "not prepared") {
-			t.Fatalf("release-check output %q does not explain absent modfile", output)
-		}
-		if _, err := os.Stat(marker); !os.IsNotExist(err) {
-			t.Fatalf("Go command invoked before absent-modfile check: %v", err)
-		}
-	})
-
-	t.Run("local replace", func(t *testing.T) {
-		modfile := filepath.Join(tempDir, "local.mod")
-		contents := "module github.com/looprig/tests\n\ngo 1.26.4\n\nreplace github.com/looprig/harness => ../harness\n"
-		if err := os.WriteFile(modfile, []byte(contents), 0o600); err != nil {
-			t.Fatalf("write local-replace modfile: %v", err)
-		}
-		output, err := run(t, modfile)
-		if err == nil {
-			t.Fatal("release-check accepted a local replacement")
-		}
-		if !strings.Contains(string(output), "local filesystem replacement") {
-			t.Fatalf("release-check output %q does not explain local replacement", output)
-		}
-		if _, err := os.Stat(marker); !os.IsNotExist(err) {
-			t.Fatalf("Go command invoked before local-replace check: %v", err)
-		}
-	})
-
-	t.Run("tagged release modfile", func(t *testing.T) {
-		modfile := filepath.Join(tempDir, "tagged.mod")
-		contents := "module github.com/looprig/tests\n\ngo 1.26.4\n\nrequire github.com/looprig/harness v0.13.0\n"
-		if err := os.WriteFile(modfile, []byte(contents), 0o600); err != nil {
-			t.Fatalf("write tagged modfile: %v", err)
-		}
-		output, err := run(t, modfile)
-		if err != nil {
-			t.Fatalf("release-check rejected tagged modfile: %v\n%s", err, output)
-		}
-		invocation, err := os.ReadFile(marker)
-		if err != nil {
-			t.Fatalf("read Go invocation marker: %v", err)
-		}
-		if !strings.Contains(string(invocation), "test -modfile="+modfile) {
-			t.Fatalf("Go invocation %q did not use release modfile", invocation)
-		}
-	})
 }

@@ -2,9 +2,9 @@
 
 set -eu
 
-modfile=${1:-}
-if [ -z "$modfile" ] || [ ! -f "$modfile" ]; then
-	echo "release modfile is not prepared: ${modfile:-go.release.mod}" >&2
+modfile=${1:-go.mod}
+if [ ! -f "$modfile" ]; then
+	echo "canonical module file is not prepared: $modfile" >&2
 	exit 1
 fi
 
@@ -28,7 +28,7 @@ function reject_local(replacement, target, fields) {
 	if (fields < 2 || target ~ /^\.\.?\// || target ~ /^\// ||
 	    target ~ /^file:/ || target ~ /^~/ || target ~ /^[A-Za-z]:[\\\/]/ ||
 	    target ~ /^\\\\/) {
-		printf "release modfile contains local filesystem replacement: %s\n", replacement > "/dev/stderr"
+		printf "module file contains local filesystem replacement: %s\n", replacement > "/dev/stderr"
 		failed = 1
 		exit 1
 	}
@@ -63,7 +63,7 @@ BEGIN {
 
 	separator = index(line, "=>")
 	if (separator == 0) {
-		printf "malformed replace directive in release modfile: %s\n", line > "/dev/stderr"
+		printf "malformed replace directive in module file: %s\n", line > "/dev/stderr"
 		failed = 1
 		exit 1
 	}
@@ -72,7 +72,7 @@ BEGIN {
 
 END {
 	if (!failed && in_replace_block) {
-		print "unterminated replace block in release modfile" > "/dev/stderr"
+		print "unterminated replace block in module file" > "/dev/stderr"
 		exit 1
 	}
 }

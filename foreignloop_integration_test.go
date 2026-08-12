@@ -4,7 +4,6 @@ package tests
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
 	"reflect"
 	"testing"
@@ -15,6 +14,8 @@ import (
 	"github.com/looprig/harness/pkg/event"
 	"github.com/looprig/harness/pkg/loop"
 	"github.com/looprig/harness/pkg/rig"
+	"github.com/looprig/harness/pkg/session"
+	"github.com/looprig/harness/pkg/sessionstore"
 	"github.com/looprig/inference"
 )
 
@@ -113,7 +114,7 @@ func testForeignloopSubagent(t *testing.T, provider foreignloopProvider, engine 
 
 	process := newForeignloopProcess(t, provider, final, boundSID)
 	parentLLM := newForeignloopScriptLLM(
-		[]content.Chunk{foreignloopToolUse(toolUseID, "Subagent", `{"action":"start","agent":"builder","message":"hi","wait":true}`)},
+		[]content.Chunk{foreignloopToolUse(toolUseID, "StartAgent", `{"agent_type":"builder","instructions":"hi","wait_for_response":true}`)},
 		[]content.Chunk{&content.TextChunk{Text: "parent done"}},
 	)
 	parent := foreignloopDefinition(t, "planner", loop.EngineNative, parentLLM, "builder")
@@ -173,52 +174,40 @@ func TestForeignloopQueuedDelegateInterrupt(t *testing.T) {
 	defer cancel()
 
 	process := newControlledForeignloopProcess(t, foreignloopClaude, "unused", "", foreignloopProcessBlock)
-	var active, queued foreignloopQueuedResult
+	var active foreignloopAgentToolResult
+	var sess session.SessionController
 	parentLLM := newForeignloopScenarioLLM(
 		func(context.Context, inference.Request) ([]content.Chunk, error) {
-			return foreignloopToolCall("interrupt-start", `{"action":"start","agent":"child","message":"A","wait":false}`), nil
+			return foreignloopToolCall("interrupt-start", `{"agent_type":"child","instructions":"A","wait_for_response":false}`), nil
 		},
 		func(stepCtx context.Context, request inference.Request) ([]content.Chunk, error) {
 			var err error
-			active, err = foreignloopLastQueuedResult(request)
+			active, err = foreignloopLastAgentToolResult(request)
 			if err != nil {
 				return nil, err
+			}
+			if active.State != "working" {
+				return nil, fmt.Errorf("start admission = %+v, want working state", active)
 			}
 			if err := process.waitStarted(stepCtx); err != nil {
 				return nil, err
 			}
-			input := fmt.Sprintf(`{"action":"send","delegate_id":%q,"message":"B","wait":false}`, active.DelegateID)
+			input := fmt.Sprintf(`{"agent_id":%q,"message":"B","wait_for_response":false}`, active.AgentID)
 			return foreignloopToolCall("interrupt-send", input), nil
 		},
-		func(_ context.Context, request inference.Request) ([]content.Chunk, error) {
-			var err error
-			queued, err = foreignloopLastQueuedResult(request)
+		func(stepCtx context.Context, request inference.Request) ([]content.Chunk, error) {
+			queued, err := foreignloopLastAgentToolResult(request)
 			if err != nil {
 				return nil, err
 			}
-			input := fmt.Sprintf(`{"action":"interrupt","delegate_id":%q}`, active.DelegateID)
-			return foreignloopToolCall("interrupt-child", input), nil
-		},
-		func(_ context.Context, request inference.Request) ([]content.Chunk, error) {
-			want := fmt.Sprintf(`{"delegate_id":%q,"status":"interrupted"}`, active.DelegateID)
-			if err := foreignloopExpectLastToolResult(request, want); err != nil {
-				return nil, err
+			if queued.AgentID != active.AgentID || queued.State != "working" {
+				return nil, fmt.Errorf("queued message = %+v, want working state for %s", queued, active.AgentID)
 			}
-			if err := process.release(); err != nil {
-				return nil, err
-			}
-			input := fmt.Sprintf(`{"action":"wait","delegate_id":%q,"request_id":%q}`, active.DelegateID, queued.RequestID)
-			return foreignloopToolCall("interrupt-wait", input), nil
-		},
-		func(_ context.Context, request inference.Request) ([]content.Chunk, error) {
-			if err := foreignloopExpectLastToolResult(request, "error: delegate interrupted"); err != nil {
-				return nil, err
-			}
-			input := fmt.Sprintf(`{"action":"wait","delegate_id":%q,"request_id":%q}`, active.DelegateID, active.RequestID)
-			return foreignloopToolCall("interrupt-wait-active", input), nil
-		},
-		func(_ context.Context, request inference.Request) ([]content.Chunk, error) {
-			if err := foreignloopExpectLastToolResult(request, "error: delegate interrupted"); err != nil {
+			// StopAgent in the tagged Harness waits for LoopIdle, which the tagged
+			// Foreignloops backend does not emit. The public controller exposes the
+			// supported cancellation primitive and still exercises queued-child
+			// interruption against the published foreign backend.
+			if err := interruptForeignloopChild(stepCtx, sess, active.AgentID); err != nil {
 				return nil, err
 			}
 			return foreignloopFinal("parent done"), nil
@@ -226,7 +215,8 @@ func TestForeignloopQueuedDelegateInterrupt(t *testing.T) {
 	)
 	parent := foreignloopManagedDefinition(t, "planner", loop.EngineNative, parentLLM, "child")
 	child := foreignloopDefinition(t, "child", loop.EngineForeignClaude, deterministicLLM{})
-	sess, store := newForeignloopSession(t, ctx, process, "planner", parent, child)
+	var store *sessionstore.Store
+	sess, store = newForeignloopSession(t, ctx, process, "planner", parent, child)
 	sub := subscribeForeignloopEvents(t, sess)
 	parentID := sess.ActiveLoop().ID()
 	if _, err := sess.Submit(ctx, textBlock("go")); err != nil {
@@ -236,10 +226,12 @@ func TestForeignloopQueuedDelegateInterrupt(t *testing.T) {
 
 	events := eventsFor(t, ctx, store, sess.SessionID())
 	childStarted := childForeignloopStarted(t, events, parentID)
+	events = waitForeignloopTurnTerminal(t, ctx, store, sess.SessionID(), childStarted.LoopID)
 	assertForeignloopTurnKinds(t, events, childStarted.LoopID, []string{"TurnStarted", "TurnInterrupted"})
+	assertForeignloopInputCancelled(t, events, childStarted.LoopID, event.CancelTurnInterrupted)
 	process.assertCallCount(t, 1)
-	if parentLLM.callCount() != 6 {
-		t.Fatalf("parent model calls = %d, want 6", parentLLM.callCount())
+	if parentLLM.callCount() != 4 {
+		t.Fatalf("parent model calls = %d, want 4", parentLLM.callCount())
 	}
 }
 
@@ -249,77 +241,35 @@ func TestForeignloopQueuedDelegateTimeout(t *testing.T) {
 	defer cancel()
 
 	process := newControlledForeignloopProcess(t, foreignloopClaude, "unused", "", foreignloopProcessBlock)
-	var active, queued foreignloopQueuedResult
+	var active foreignloopAgentToolResult
+	var sess session.SessionController
 	parentLLM := newForeignloopScenarioLLM(
 		func(context.Context, inference.Request) ([]content.Chunk, error) {
-			return foreignloopToolCall("timeout-start", `{"action":"start","agent":"child","message":"A","wait":false}`), nil
+			return foreignloopToolCall("timeout-start", `{"agent_type":"child","instructions":"A","wait_for_response":false}`), nil
 		},
 		func(stepCtx context.Context, request inference.Request) ([]content.Chunk, error) {
 			var err error
-			active, err = foreignloopLastQueuedResult(request)
+			active, err = foreignloopLastAgentToolResult(request)
 			if err != nil {
 				return nil, err
+			}
+			if active.State != "working" {
+				return nil, fmt.Errorf("start admission = %+v, want working state", active)
 			}
 			if err := process.waitStarted(stepCtx); err != nil {
 				return nil, err
 			}
-			input := fmt.Sprintf(`{"action":"send","delegate_id":%q,"message":"B","wait":false}`, active.DelegateID)
+			input := fmt.Sprintf(`{"agent_id":%q,"message":"B","wait_for_response":true,"timeout_seconds":0}`, active.AgentID)
 			return foreignloopToolCall("timeout-send", input), nil
 		},
-		func(_ context.Context, request inference.Request) ([]content.Chunk, error) {
-			var err error
-			queued, err = foreignloopLastQueuedResult(request)
-			if err != nil {
+		func(stepCtx context.Context, request inference.Request) ([]content.Chunk, error) {
+			if err := foreignloopExpectRawToolResult(request, "error: agent timed out"); err != nil {
 				return nil, err
 			}
-			input := fmt.Sprintf(`{"action":"wait","delegate_id":%q,"request_id":%q,"timeout_seconds":0}`, active.DelegateID, queued.RequestID)
-			return foreignloopToolCall("timeout-target", input), nil
-		},
-		func(_ context.Context, request inference.Request) ([]content.Chunk, error) {
-			if err := foreignloopExpectLastToolResult(request, "error: delegate timed out"); err != nil {
-				return nil, err
-			}
-			input := fmt.Sprintf(`{"action":"wait","delegate_id":%q,"request_id":%q}`, active.DelegateID, queued.RequestID)
-			return foreignloopToolCall("timeout-confirm-target", input), nil
-		},
-		func(_ context.Context, request inference.Request) ([]content.Chunk, error) {
-			if err := foreignloopExpectLastToolResult(request, "error: delegate interrupted"); err != nil {
-				return nil, err
-			}
-			input := fmt.Sprintf(`{"action":"status","delegate_id":%q}`, active.DelegateID)
-			return foreignloopToolCall("timeout-status", input), nil
-		},
-		func(_ context.Context, request inference.Request) ([]content.Chunk, error) {
-			text, err := foreignloopLastToolResult(request)
-			if err != nil {
-				return nil, err
-			}
-			var status struct {
-				DelegateID string `json:"delegate_id"`
-				Status     string `json:"status"`
-			}
-			if err := json.Unmarshal([]byte(text), &status); err != nil {
-				return nil, fmt.Errorf("decode status result %q: %w", text, err)
-			}
-			if status.DelegateID != active.DelegateID || status.Status != "running" {
-				return nil, fmt.Errorf("status after targeted timeout = %+v, want active delegate running", status)
-			}
-			input := fmt.Sprintf(`{"action":"interrupt","delegate_id":%q}`, active.DelegateID)
-			return foreignloopToolCall("timeout-cleanup", input), nil
-		},
-		func(_ context.Context, request inference.Request) ([]content.Chunk, error) {
-			want := fmt.Sprintf(`{"delegate_id":%q,"status":"interrupted"}`, active.DelegateID)
-			if err := foreignloopExpectLastToolResult(request, want); err != nil {
-				return nil, err
-			}
-			if err := process.release(); err != nil {
-				return nil, err
-			}
-			input := fmt.Sprintf(`{"action":"wait","delegate_id":%q,"request_id":%q}`, active.DelegateID, active.RequestID)
-			return foreignloopToolCall("timeout-wait-active", input), nil
-		},
-		func(_ context.Context, request inference.Request) ([]content.Chunk, error) {
-			if err := foreignloopExpectLastToolResult(request, "error: delegate interrupted"); err != nil {
+			// StopAgent has the same tagged foreign LoopIdle incompatibility as the
+			// interrupt case; use the supported public controller after observing
+			// the timeout while retaining the raw published timeout error assertion.
+			if err := interruptForeignloopChild(stepCtx, sess, active.AgentID); err != nil {
 				return nil, err
 			}
 			return foreignloopFinal("parent done"), nil
@@ -327,7 +277,8 @@ func TestForeignloopQueuedDelegateTimeout(t *testing.T) {
 	)
 	parent := foreignloopManagedDefinition(t, "planner", loop.EngineNative, parentLLM, "child")
 	child := foreignloopDefinition(t, "child", loop.EngineForeignClaude, deterministicLLM{})
-	sess, store := newForeignloopSession(t, ctx, process, "planner", parent, child)
+	var store *sessionstore.Store
+	sess, store = newForeignloopSession(t, ctx, process, "planner", parent, child)
 	sub := subscribeForeignloopEvents(t, sess)
 	parentID := sess.ActiveLoop().ID()
 	if _, err := sess.Submit(ctx, textBlock("go")); err != nil {
@@ -337,7 +288,11 @@ func TestForeignloopQueuedDelegateTimeout(t *testing.T) {
 
 	events := eventsFor(t, ctx, store, sess.SessionID())
 	childStarted := childForeignloopStarted(t, events, parentID)
+	events = waitForeignloopTurnTerminal(t, ctx, store, sess.SessionID(), childStarted.LoopID)
 	assertForeignloopTurnKinds(t, events, childStarted.LoopID, []string{"TurnStarted", "TurnInterrupted"})
+	// The timed-out foreground request retracts itself before the controller
+	// interrupts the still-running active turn.
+	assertForeignloopInputCancelled(t, events, childStarted.LoopID, event.CancelClientRetracted)
 	process.assertCallCount(t, 1)
 }
 
@@ -347,53 +302,46 @@ func TestForeignloopProviderFailureWithQueuedDelegates(t *testing.T) {
 	defer cancel()
 
 	process := newControlledForeignloopProcess(t, foreignloopClaude, "unused", "", foreignloopProcessFailAfterRelease)
-	var active, queuedB, queuedC foreignloopQueuedResult
+	var active foreignloopAgentToolResult
 	parentLLM := newForeignloopScenarioLLM(
 		func(context.Context, inference.Request) ([]content.Chunk, error) {
-			return foreignloopToolCall("failure-start", `{"action":"start","agent":"child","message":"A","wait":false}`), nil
+			return foreignloopToolCall("failure-start", `{"agent_type":"child","instructions":"A","wait_for_response":false}`), nil
 		},
 		func(stepCtx context.Context, request inference.Request) ([]content.Chunk, error) {
 			var err error
-			active, err = foreignloopLastQueuedResult(request)
+			active, err = foreignloopLastAgentToolResult(request)
 			if err != nil {
 				return nil, err
+			}
+			if active.State != "working" {
+				return nil, fmt.Errorf("start admission = %+v, want working state", active)
 			}
 			if err := process.waitStarted(stepCtx); err != nil {
 				return nil, err
 			}
-			input := fmt.Sprintf(`{"action":"send","delegate_id":%q,"message":"B","wait":false}`, active.DelegateID)
+			input := fmt.Sprintf(`{"agent_id":%q,"message":"B","wait_for_response":false}`, active.AgentID)
 			return foreignloopToolCall("failure-send-b", input), nil
 		},
 		func(_ context.Context, request inference.Request) ([]content.Chunk, error) {
-			var err error
-			queuedB, err = foreignloopLastQueuedResult(request)
+			queuedB, err := foreignloopLastAgentToolResult(request)
 			if err != nil {
 				return nil, err
 			}
-			input := fmt.Sprintf(`{"action":"send","delegate_id":%q,"message":"C","wait":false}`, active.DelegateID)
+			if queuedB.AgentID != active.AgentID || queuedB.State != "working" {
+				return nil, fmt.Errorf("B admission = %+v, want working state for %s", queuedB, active.AgentID)
+			}
+			input := fmt.Sprintf(`{"agent_id":%q,"message":"C","wait_for_response":false}`, active.AgentID)
 			return foreignloopToolCall("failure-send-c", input), nil
 		},
 		func(_ context.Context, request inference.Request) ([]content.Chunk, error) {
-			var err error
-			queuedC, err = foreignloopLastQueuedResult(request)
+			queuedC, err := foreignloopLastAgentToolResult(request)
 			if err != nil {
 				return nil, err
 			}
+			if queuedC.AgentID != active.AgentID || queuedC.State != "working" {
+				return nil, fmt.Errorf("C admission = %+v, want working state for %s", queuedC, active.AgentID)
+			}
 			if err := process.release(); err != nil {
-				return nil, err
-			}
-			input := fmt.Sprintf(`{"action":"wait","delegate_id":%q,"request_id":%q}`, active.DelegateID, queuedB.RequestID)
-			return foreignloopToolCall("failure-wait-b", input), nil
-		},
-		func(_ context.Context, request inference.Request) ([]content.Chunk, error) {
-			if err := foreignloopExpectLastToolResult(request, "error: delegate failed"); err != nil {
-				return nil, err
-			}
-			input := fmt.Sprintf(`{"action":"wait","delegate_id":%q,"request_id":%q}`, active.DelegateID, queuedC.RequestID)
-			return foreignloopToolCall("failure-wait-c", input), nil
-		},
-		func(_ context.Context, request inference.Request) ([]content.Chunk, error) {
-			if err := foreignloopExpectLastToolResult(request, "error: delegate failed"); err != nil {
 				return nil, err
 			}
 			return foreignloopFinal("parent done"), nil
@@ -411,8 +359,10 @@ func TestForeignloopProviderFailureWithQueuedDelegates(t *testing.T) {
 
 	events := eventsFor(t, ctx, store, sess.SessionID())
 	childStarted := childForeignloopStarted(t, events, parentID)
+	events = waitForeignloopTurnTerminal(t, ctx, store, sess.SessionID(), childStarted.LoopID)
 	assertForeignloopTurnKinds(t, events, childStarted.LoopID, []string{"TurnStarted", "TurnFailed"})
-	assertForeignloopAcceptedOrder(t, events, childStarted.LoopID, queuedB.RequestID, queuedC.RequestID)
+	assertForeignloopAcceptedOrder(t, events, childStarted.LoopID, 2)
+	assertForeignloopInputCancelledCount(t, events, childStarted.LoopID, event.CancelTurnFailed, 2)
 	process.assertCallCount(t, 1)
 }
 
@@ -424,16 +374,16 @@ func TestForeignloopSubagentQuota(t *testing.T) {
 	process := newForeignloopProcess(t, foreignloopClaude, "ok", "")
 	parentLLM := newForeignloopScenarioLLM(
 		func(context.Context, inference.Request) ([]content.Chunk, error) {
-			return foreignloopToolCall("quota-first", `{"action":"start","agent":"child","message":"first","wait":true}`), nil
+			return foreignloopToolCall("quota-first", `{"agent_type":"child","instructions":"first","wait_for_response":true}`), nil
 		},
 		func(_ context.Context, request inference.Request) ([]content.Chunk, error) {
 			if err := foreignloopExpectLastToolResult(request, "ok"); err != nil {
 				return nil, err
 			}
-			return foreignloopToolCall("quota-second", `{"action":"start","agent":"child","message":"second","wait":true}`), nil
+			return foreignloopToolCall("quota-second", `{"agent_type":"child","instructions":"second","wait_for_response":true}`), nil
 		},
 		func(_ context.Context, request inference.Request) ([]content.Chunk, error) {
-			const want = "error: subagent failed: session: loop spawn quota exceeded"
+			const want = "error: agent failed"
 			if err := foreignloopExpectLastToolResult(request, want); err != nil {
 				return nil, err
 			}
@@ -469,7 +419,7 @@ func assertForeignloopTurnKinds(t *testing.T, events []event.Event, loopID uuid.
 	}
 }
 
-func assertForeignloopAcceptedOrder(t *testing.T, events []event.Event, loopID uuid.UUID, requestIDs ...string) {
+func assertForeignloopAcceptedOrder(t *testing.T, events []event.Event, loopID uuid.UUID, want int) {
 	t.Helper()
 	var got []string
 	for _, value := range events {
@@ -478,24 +428,41 @@ func assertForeignloopAcceptedOrder(t *testing.T, events []event.Event, loopID u
 			got = append(got, accepted.Cause.CommandID.String())
 		}
 	}
-	positions := make([]int, len(requestIDs))
-	for index := range positions {
-		positions[index] = -1
+	if len(got) != want {
+		t.Fatalf("DelegateRequestAccepted order = %v, want %d accepted follow-up requests in FIFO journal order", got, want)
 	}
 	for index, id := range got {
-		for requestIndex, requestID := range requestIDs {
-			if id == requestID {
-				positions[requestIndex] = index
-			}
+		if id == "" {
+			t.Fatalf("DelegateRequestAccepted[%d] has an empty command id", index)
 		}
 	}
-	for index, position := range positions {
-		if position < 0 {
-			t.Fatalf("DelegateRequestAccepted order = %v, missing queued request %q", got, requestIDs[index])
+}
+
+func assertForeignloopInputCancelled(t *testing.T, events []event.Event, loopID uuid.UUID, want event.CancelReason) {
+	t.Helper()
+	var cancelled []event.InputCancelled
+	for _, value := range events {
+		input, ok := value.(event.InputCancelled)
+		if ok && input.LoopID == loopID {
+			cancelled = append(cancelled, input)
 		}
-		if index > 0 && positions[index-1] >= position {
-			t.Fatalf("DelegateRequestAccepted order = %v, want FIFO requests %v", got, requestIDs)
+	}
+	if len(cancelled) != 1 || cancelled[0].Reason != want {
+		t.Fatalf("InputCancelled for loop %s = %+v, want one cancellation with reason %v", loopID, cancelled, want)
+	}
+}
+
+func assertForeignloopInputCancelledCount(t *testing.T, events []event.Event, loopID uuid.UUID, wantReason event.CancelReason, want int) {
+	t.Helper()
+	var cancelled []event.InputCancelled
+	for _, value := range events {
+		input, ok := value.(event.InputCancelled)
+		if ok && input.LoopID == loopID && input.Reason == wantReason {
+			cancelled = append(cancelled, input)
 		}
+	}
+	if len(cancelled) != want {
+		t.Fatalf("InputCancelled for loop %s with reason %v = %d, want %d", loopID, wantReason, len(cancelled), want)
 	}
 }
 

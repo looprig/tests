@@ -30,6 +30,7 @@ package tests
 
 import (
 	"context"
+	"errors"
 	"strings"
 	"testing"
 
@@ -62,15 +63,17 @@ type restorableRig struct {
 // fingerprint — mcpharness.Manager.ConfigDigest in a real application. Empty
 // means "this application attached no external capability", which is both the
 // default and what every journal written before the field existed carries.
-func newRestorableRig(t *testing.T, store *sessionstore.Store, name string, llm *scriptLLM, externalRev string) *restorableRig {
+func newRestorableRig(t *testing.T, store *sessionstore.Store, name string, llm *scriptLLM, externalRev string, extra ...rig.Option) *restorableRig {
 	t.Helper()
-	r, err := rig.Define(
+	options := []rig.Option{
 		rig.WithLoops(newLoop(t, name, llm, approveAll(t))),
 		rig.WithPrimers(name),
 		rig.WithActivePrimer(name),
 		rig.WithSessionStore(store),
 		rig.WithFingerprintFields(rig.ConfigFingerprintFields{ExternalCapabilityRev: externalRev}),
-	)
+	}
+	options = append(options, extra...)
+	r, err := rig.Define(options...)
 	if err != nil {
 		t.Fatalf("rig.Define: %v", err)
 	}
@@ -379,10 +382,11 @@ func TestRemovedToolOnARestoredSessionReturnsToolUnavailable(t *testing.T) {
 	}
 }
 
-// TestMCPConfigDriftIsAutoAdoptedAndRecorded is the fingerprint half of the
+// TestMCPConfigDriftRequiresExplicitAdoption is the fingerprint half of the
 // story: when an application contributes its MCP identity to the configuration
-// manifest, a changed MCP configuration is classified as informational drift,
-// accepted by the default policy, and recorded as a durable configuration epoch.
+// manifest, a changed MCP configuration is classified as warning drift. The
+// fail-secure default rejects it; an application that explicitly accepts the
+// warning gets a durable configuration epoch.
 //
 // There are no MCP servers in this test, and that is deliberate. What is under
 // test is the seam, not the digest: that ExternalCapabilityRev reaches the
@@ -391,7 +395,7 @@ func TestRemovedToolOnARestoredSessionReturnsToolUnavailable(t *testing.T) {
 // moves when a catalog moves, and that it never carries a secret — are
 // mcp/pkg/harness's tests, where they can be asserted exhaustively instead of
 // through a subprocess.
-func TestMCPConfigDriftIsAutoAdoptedAndRecorded(t *testing.T) {
+func TestMCPConfigDriftRequiresExplicitAdoption(t *testing.T) {
 	t.Parallel()
 	ctx := itCtx(t)
 	store, err := sessionstore.Open(memstore.New())
@@ -429,11 +433,18 @@ func TestMCPConfigDriftIsAutoAdoptedAndRecorded(t *testing.T) {
 	}
 	shutdown(t, same)
 
-	// External catalog drift is Info, so the default policy resumes and records
-	// exactly what changed as configuration epoch 2.
-	resumed, err := newRestorableRig(t, store, "planner", newScriptLLM(say("two")), revTwo).rig.RestoreSession(ctx, id)
+	// External catalog drift is Warn, so the fail-secure default refuses it.
+	_, err = newRestorableRig(t, store, "planner", newScriptLLM(say("two-default")), revTwo).rig.RestoreSession(ctx, id)
+	var rejected *session.RestoreRejectedError
+	if !errors.As(err, &rejected) {
+		t.Fatalf("default policy error = %v, want *session.RestoreRejectedError", err)
+	}
+
+	// Explicit application policy accepts the warning and records exactly what
+	// changed as configuration epoch 2.
+	resumed, err := newRestorableRig(t, store, "planner", newScriptLLM(say("two")), revTwo, rig.WithRestoreDecider(session.AcceptAllDecider{})).rig.RestoreSession(ctx, id)
 	if err != nil {
-		t.Fatalf("default policy refused informational MCP configuration drift: %v", err)
+		t.Fatalf("explicit policy refused MCP configuration drift: %v", err)
 	}
 	shutdown(t, resumed)
 	assertExternalCapabilityAdoption(t, ctx, store, id, revOne, revTwo)
@@ -640,9 +651,15 @@ func TestChangedMCPServersAdoptDriftAtRestore(t *testing.T) {
 		t.Fatalf("a server offering a different toolset digested to the same %q: the identity does not cover the negotiated catalog, and this test proves nothing", revOne)
 	}
 
-	resumed, err := newRestorableRig(t, store, "planner", newScriptLLM(say("two")), revTwo).rig.RestoreSession(ctx, id)
+	_, err = newRestorableRig(t, store, "planner", newScriptLLM(say("two-default")), revTwo).rig.RestoreSession(ctx, id)
+	var rejected *session.RestoreRejectedError
+	if !errors.As(err, &rejected) {
+		t.Fatalf("default policy error = %v, want *session.RestoreRejectedError", err)
+	}
+
+	resumed, err := newRestorableRig(t, store, "planner", newScriptLLM(say("two")), revTwo, rig.WithRestoreDecider(session.AcceptAllDecider{})).rig.RestoreSession(ctx, id)
 	if err != nil {
-		t.Fatalf("default policy refused informational drift from changed MCP servers: %v", err)
+		t.Fatalf("explicit policy refused drift from changed MCP servers: %v", err)
 	}
 	shutdown(t, resumed)
 	assertExternalCapabilityAdoption(t, ctx, store, id, revOne, revTwo)
@@ -670,7 +687,7 @@ func assertExternalCapabilityAdoption(t *testing.T, ctx context.Context, store *
 		t.Fatalf("ConfigurationAdopted drift = %+v, want one external change", adopted.Drift)
 	}
 	change := adopted.Drift[0]
-	if change.Category != event.DriftExternal || change.Severity != event.DriftInfo || change.Old != oldRev || change.New != newRev {
-		t.Fatalf("external drift = %+v, want category=%q severity=%q old=%q new=%q", change, event.DriftExternal, event.DriftInfo, oldRev, newRev)
+	if change.Category != event.DriftExternal || change.Severity != event.DriftWarn || change.Old != oldRev || change.New != newRev {
+		t.Fatalf("external drift = %+v, want category=%q severity=%q old=%q new=%q", change, event.DriftExternal, event.DriftWarn, oldRev, newRev)
 	}
 }
