@@ -6,6 +6,7 @@ import (
 	"context"
 	"fmt"
 	"reflect"
+	"strings"
 	"testing"
 	"time"
 
@@ -360,8 +361,10 @@ func TestForeignloopProviderFailureWithQueuedDelegates(t *testing.T) {
 	events := eventsFor(t, ctx, store, sess.SessionID())
 	childStarted := childForeignloopStarted(t, events, parentID)
 	events = waitForeignloopTurnTerminal(t, ctx, store, sess.SessionID(), childStarted.LoopID)
+	events = waitForeignloopInputCancelled(t, ctx, store, sess.SessionID(), childStarted.LoopID, event.CancelTurnFailed, 2)
 	assertForeignloopTurnKinds(t, events, childStarted.LoopID, []string{"TurnStarted", "TurnFailed"})
-	assertForeignloopAcceptedOrder(t, events, childStarted.LoopID, 2)
+	queuedIDs := foreignloopCancelledRequestIDs(t, events, childStarted.LoopID, event.CancelTurnFailed, "B", "C")
+	assertForeignloopAcceptedOrder(t, events, childStarted.LoopID, queuedIDs...)
 	assertForeignloopInputCancelledCount(t, events, childStarted.LoopID, event.CancelTurnFailed, 2)
 	process.assertCallCount(t, 1)
 }
@@ -419,23 +422,91 @@ func assertForeignloopTurnKinds(t *testing.T, events []event.Event, loopID uuid.
 	}
 }
 
-func assertForeignloopAcceptedOrder(t *testing.T, events []event.Event, loopID uuid.UUID, want int) {
+func assertForeignloopAcceptedOrder(t *testing.T, events []event.Event, loopID uuid.UUID, requestIDs ...string) {
 	t.Helper()
+	if err := foreignloopAcceptedOrderError(events, loopID, requestIDs...); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func foreignloopAcceptedOrderError(events []event.Event, loopID uuid.UUID, requestIDs ...string) error {
 	var got []string
 	for _, value := range events {
 		accepted, ok := value.(event.DelegateRequestAccepted)
 		if ok && accepted.LoopID == loopID {
+			if accepted.Cause.CommandID.IsZero() {
+				return fmt.Errorf("DelegateRequestAccepted[%d] has a zero command id", len(got))
+			}
 			got = append(got, accepted.Cause.CommandID.String())
 		}
 	}
-	if len(got) != want {
-		t.Fatalf("DelegateRequestAccepted order = %v, want %d accepted follow-up requests in FIFO journal order", got, want)
+	if !reflect.DeepEqual(got, requestIDs) {
+		return fmt.Errorf("DelegateRequestAccepted order = %v, want exact queued request IDs in FIFO order %v", got, requestIDs)
 	}
-	for index, id := range got {
-		if id == "" {
-			t.Fatalf("DelegateRequestAccepted[%d] has an empty command id", index)
+	return nil
+}
+
+func foreignloopCancelledRequestIDs(t *testing.T, events []event.Event, loopID uuid.UUID, reason event.CancelReason, messages ...string) []string {
+	t.Helper()
+	var cancelled []event.InputCancelled
+	for _, value := range events {
+		input, ok := value.(event.InputCancelled)
+		if ok && input.LoopID == loopID && input.Reason == reason {
+			cancelled = append(cancelled, input)
 		}
 	}
+	if len(cancelled) != len(messages) {
+		t.Fatalf("InputCancelled for loop %s with reason %v = %d, want %d messages in FIFO order", loopID, reason, len(cancelled), len(messages))
+	}
+	ids := make([]string, len(cancelled))
+	for index, input := range cancelled {
+		gotMessage := foreignloopUserMessageText(input.Message)
+		if gotMessage != messages[index] {
+			t.Fatalf("InputCancelled[%d] message = %q, want queued message %q", index, gotMessage, messages[index])
+		}
+		if input.Cause.CommandID.IsZero() {
+			t.Fatalf("InputCancelled[%d] has a zero command id", index)
+		}
+		ids[index] = input.Cause.CommandID.String()
+	}
+	return ids
+}
+
+func waitForeignloopInputCancelled(t *testing.T, ctx context.Context, store *sessionstore.Store, sessionID, loopID uuid.UUID, reason event.CancelReason, want int) []event.Event {
+	t.Helper()
+	ticker := time.NewTicker(10 * time.Millisecond)
+	defer ticker.Stop()
+	for {
+		events := eventsFor(t, ctx, store, sessionID)
+		count := 0
+		for _, value := range events {
+			input, ok := value.(event.InputCancelled)
+			if ok && input.LoopID == loopID && input.Reason == reason {
+				count++
+			}
+		}
+		if count >= want {
+			return events
+		}
+		select {
+		case <-ctx.Done():
+			t.Fatalf("wait for %d InputCancelled events for loop %s: %v", want, loopID, ctx.Err())
+		case <-ticker.C:
+		}
+	}
+}
+
+func foreignloopUserMessageText(message *content.UserMessage) string {
+	if message == nil {
+		return ""
+	}
+	var result strings.Builder
+	for _, block := range message.Blocks {
+		if text, ok := block.(*content.TextBlock); ok {
+			result.WriteString(text.Text)
+		}
+	}
+	return result.String()
 }
 
 func assertForeignloopInputCancelled(t *testing.T, events []event.Event, loopID uuid.UUID, want event.CancelReason) {
