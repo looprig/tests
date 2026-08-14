@@ -162,7 +162,7 @@ func TestCredentialGatewayFixtureInvokeCrossHarness(t *testing.T) {
 	if len(decoded.Tools) != 1 || decoded.Tools[0].Name != "get_weather" {
 		t.Errorf("decoded tools = %#v, want get_weather", decoded.Tools)
 	}
-	if decoded.ToolChoice != inference.ToolChoiceRequired {
+	if decoded.ToolChoice != inference.ToolRequired() {
 		t.Errorf("decoded tool choice = %v, want required", decoded.ToolChoice)
 	}
 	if decoded.Override == nil || decoded.Override.Effort != model.EffortHigh {
@@ -205,7 +205,7 @@ func TestCredentialGatewayFixtureStreamCrossHarness(t *testing.T) {
 	if len(decoded.Tools) != 1 || decoded.Tools[0].Name != "lookup_fixture" {
 		t.Errorf("decoded tools = %#v, want lookup_fixture", decoded.Tools)
 	}
-	if decoded.ToolChoice != inference.ToolChoiceRequired {
+	if decoded.ToolChoice != inference.ToolRequired() {
 		t.Errorf("decoded tool choice = %v, want required", decoded.ToolChoice)
 	}
 	if decoded.Override == nil || decoded.Override.Effort != model.EffortHigh {
