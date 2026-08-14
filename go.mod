@@ -1,6 +1,6 @@
 module github.com/looprig/tests
 
-go 1.26.4
+go 1.26.6
 
 require (
 	github.com/looprig/classifiers v0.1.5
