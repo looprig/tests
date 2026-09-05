@@ -809,8 +809,9 @@ func listDueSessionStoreCommands(t *testing.T, ctx context.Context, store *sessi
 // Everything below wraps a storage.Composite without changing its behaviour,
 // recording the provider operation and the NAME each call carries. It is how
 // this file proves claims about work that is not visible in a return value:
-// that a page costs one provider query, that a refused Open touched nothing but
-// the layout marker, and that a tenant identity never reaches a provider name.
+// that a page costs bounded provider work, that a refused Open touched nothing
+// but the layout marker, and that a tenant identity never reaches a provider
+// name.
 
 // providerCall is one recorded provider operation.
 type providerCall struct {
@@ -874,7 +875,30 @@ func (l recordingLedger) Append(ctx context.Context, name string, expected uint6
 
 func (l recordingLedger) Read(ctx context.Context, name string, from uint64) (storage.Cursor, error) {
 	l.rec.record("Ledger", "Read", name)
-	return l.inner.Read(ctx, name, from)
+	cursor, err := l.inner.Read(ctx, name, from)
+	if err != nil || cursor == nil {
+		return cursor, err
+	}
+	return recordingCursor{inner: cursor, rec: l.rec, name: name}, nil
+}
+
+// recordingCursor makes provider record work visible without changing cursor
+// semantics. In particular, Next is recorded before delegation so an attempted
+// advance that returns EOF or another error still counts as provider work.
+type recordingCursor struct {
+	inner storage.Cursor
+	rec   *providerRecorder
+	name  string
+}
+
+func (c recordingCursor) Next(ctx context.Context) (storage.Record, error) {
+	c.rec.record("LedgerCursor", "Next", c.name)
+	return c.inner.Next(ctx)
+}
+
+func (c recordingCursor) Close() error {
+	c.rec.record("LedgerCursor", "Close", c.name)
+	return c.inner.Close()
 }
 
 func (l recordingLedger) Tip(ctx context.Context, name string) (uint64, error) {
@@ -2137,10 +2161,18 @@ func TestSessionStorePagesAreBoundedByQueryWork(t *testing.T) {
 				}
 			}()
 			for i := range 12 {
+				if i%2 == 0 {
+					appendSessionStoreRecord(t, ctx, writer, sessionstore.Envelope{
+						Kind:    sessionstore.EnvelopeKindPublicEvent,
+						EventID: sessionwire.EventID("event-" + strconv.Itoa(i)),
+						Public:  sessionstore.BodySlot{Inline: []byte(`{"step":` + strconv.Itoa(i) + `}`)},
+					})
+					continue
+				}
 				appendSessionStoreRecord(t, ctx, writer, sessionstore.Envelope{
-					Kind:    sessionstore.EnvelopeKindPublicEvent,
-					EventID: sessionwire.EventID("event-" + strconv.Itoa(i)),
-					Public:  sessionstore.BodySlot{Inline: []byte(`{"step":` + strconv.Itoa(i) + `}`)},
+					Kind:     sessionstore.EnvelopeKindRuntimeControl,
+					RecordID: "runtime-" + strconv.Itoa(i),
+					Runtime:  sessionstore.BodySlot{Inline: []byte("private")},
 				})
 			}
 			const scanBudget = 3
@@ -2165,6 +2197,12 @@ func TestSessionStorePagesAreBoundedByQueryWork(t *testing.T) {
 			}
 			if got := rec.count("Ledger", "Read"); got != 1 {
 				t.Fatalf("bounded journal page issued %d ledger reads, want exactly one", got)
+			}
+			if got := rec.count("LedgerCursor", "Next"); got != scanBudget {
+				t.Fatalf("bounded journal page attempted %d cursor advances, want exactly the %d-record scan budget", got, scanBudget)
+			}
+			if got := rec.count("LedgerCursor", "Close"); got != 1 {
+				t.Fatalf("bounded journal page closed %d ledger cursors, want exactly one", got)
 			}
 			if got := rec.count("Blobs", ""); got != 0 {
 				t.Fatalf("bounded journal page issued %d blob calls, want none for inline bodies", got)
