@@ -815,9 +815,11 @@ func listDueSessionStoreCommands(t *testing.T, ctx context.Context, store *sessi
 
 // providerCall is one recorded provider operation.
 type providerCall struct {
-	Primitive string
-	Op        string
-	Name      string
+	Primitive      string
+	Op             string
+	Name           string
+	RequestedLimit int
+	ReturnedRows   int
 }
 
 // providerRecorder collects provider calls. It is safe for concurrent use
@@ -831,6 +833,18 @@ func (r *providerRecorder) record(primitive, op, name string) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	r.calls = append(r.calls, providerCall{Primitive: primitive, Op: op, Name: name})
+}
+
+func (r *providerRecorder) recordQuery(primitive, op, name string, requestedLimit, returnedRows int) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.calls = append(r.calls, providerCall{
+		Primitive:      primitive,
+		Op:             op,
+		Name:           name,
+		RequestedLimit: requestedLimit,
+		ReturnedRows:   returnedRows,
+	})
 }
 
 func (r *providerRecorder) snapshot() []providerCall {
@@ -1014,18 +1028,21 @@ func (o recordingOrderedIndex) Delete(ctx context.Context, id storage.OrderedID,
 }
 
 func (o recordingOrderedIndex) ListOrdered(ctx context.Context, namespace string, orderingScope string, afterOrder uint64, limit int) (storage.OrderedPage, error) {
-	o.rec.record("OrderedIndex", "ListOrdered", namespace+"|"+orderingScope)
-	return o.inner.ListOrdered(ctx, namespace, orderingScope, afterOrder, limit)
+	page, err := o.inner.ListOrdered(ctx, namespace, orderingScope, afterOrder, limit)
+	o.rec.recordQuery("OrderedIndex", "ListOrdered", namespace+"|"+orderingScope, limit, len(page.Records))
+	return page, err
 }
 
 func (o recordingOrderedIndex) ListRanked(ctx context.Context, namespace string, rankingScope string, after storage.RankedCursor, limit int) (storage.RankedPage, error) {
-	o.rec.record("OrderedIndex", "ListRanked", namespace+"|"+rankingScope)
-	return o.inner.ListRanked(ctx, namespace, rankingScope, after, limit)
+	page, err := o.inner.ListRanked(ctx, namespace, rankingScope, after, limit)
+	o.rec.recordQuery("OrderedIndex", "ListRanked", namespace+"|"+rankingScope, limit, len(page.Records))
+	return page, err
 }
 
 func (o recordingOrderedIndex) ListDue(ctx context.Context, namespace string, dueAtOrBefore int64, after storage.DueCursor, limit int) (storage.DuePage, error) {
-	o.rec.record("OrderedIndex", "ListDue", namespace)
-	return o.inner.ListDue(ctx, namespace, dueAtOrBefore, after, limit)
+	page, err := o.inner.ListDue(ctx, namespace, dueAtOrBefore, after, limit)
+	o.rec.recordQuery("OrderedIndex", "ListDue", namespace, limit, len(page.Records))
+	return page, err
 }
 
 // instrumentComposite wraps every primitive of backend in a recorder. The
@@ -2066,7 +2083,7 @@ func TestSessionStorePagesAreBoundedByQueryWork(t *testing.T) {
 			if len(page.Sessions) != 3 {
 				t.Fatalf("page returned %d sessions, want the requested limit of 3", len(page.Sessions))
 			}
-			assertOneQueryPerPage(t, rec, "ListRanked")
+			assertOneQueryPerPage(t, rec, "ListRanked", 3, 3)
 
 			// The same page over a much longer history costs the same query.
 			for i := range 20 {
@@ -2080,7 +2097,7 @@ func TestSessionStorePagesAreBoundedByQueryWork(t *testing.T) {
 			if len(deeper.Sessions) != 3 {
 				t.Fatalf("page returned %d sessions, want the requested limit of 3", len(deeper.Sessions))
 			}
-			assertOneQueryPerPage(t, rec, "ListRanked")
+			assertOneQueryPerPage(t, rec, "ListRanked", 3, 3)
 
 			// A placement page is one ranked query too.
 			key := sessionstore.HostTargetKey{
@@ -2113,7 +2130,7 @@ func TestSessionStorePagesAreBoundedByQueryWork(t *testing.T) {
 			if len(hosts.Hosts) != 2 {
 				t.Fatalf("placement page returned %d hosts, want the requested limit of 2", len(hosts.Hosts))
 			}
-			assertOneQueryPerPage(t, rec, "ListRanked")
+			assertOneQueryPerPage(t, rec, "ListRanked", 2, 2)
 
 			// A due sweep is one due query per page, and it reads no catalog
 			// record and enumerates no session's inbox.
@@ -2145,7 +2162,7 @@ func TestSessionStorePagesAreBoundedByQueryWork(t *testing.T) {
 			if len(due.Commands) != 2 || due.Examined != 2 {
 				t.Fatalf("due page returned %d commands after examining %d rows, want 2 and 2", len(due.Commands), due.Examined)
 			}
-			assertOneQueryPerPage(t, rec, "ListDue")
+			assertOneQueryPerPage(t, rec, "ListDue", 2, 2)
 
 			// A journal page examines no more RECORDS than its budget, which is
 			// what the coverage watermark reports. Private records spend the
@@ -2214,7 +2231,7 @@ func TestSessionStorePagesAreBoundedByQueryWork(t *testing.T) {
 // assertOneQueryPerPage fails unless the recorded calls are exactly one ordered
 // query of the named kind: no per-row record read, no acceptance-order
 // enumeration, and no key-prefix scan behind it.
-func assertOneQueryPerPage(t *testing.T, rec *providerRecorder, query string) {
+func assertOneQueryPerPage(t *testing.T, rec *providerRecorder, query string, requestedLimit, returnedRows int) {
 	t.Helper()
 	calls := rec.snapshot()
 	if len(calls) != 1 {
@@ -2222,5 +2239,11 @@ func assertOneQueryPerPage(t *testing.T, rec *providerRecorder, query string) {
 	}
 	if calls[0].Primitive != "OrderedIndex" || calls[0].Op != query {
 		t.Fatalf("page recorded %+v, want a single OrderedIndex %s", calls[0], query)
+	}
+	if calls[0].RequestedLimit != requestedLimit {
+		t.Fatalf("page requested provider limit %d, want exactly %d", calls[0].RequestedLimit, requestedLimit)
+	}
+	if calls[0].ReturnedRows != returnedRows {
+		t.Fatalf("provider returned %d rows, want exactly %d", calls[0].ReturnedRows, returnedRows)
 	}
 }
