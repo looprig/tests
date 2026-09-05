@@ -28,6 +28,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"errors"
+	"fmt"
 	"io"
 	"strconv"
 	"strings"
@@ -63,7 +64,9 @@ type sessionStoreProvider struct {
 // shrunken matrix would not fail them — it would make them PASS with zero
 // subtests. The matrix is the single place that failure mode can be refused,
 // and refusing it is the same non-vacuity floor sessionstore's own
-// production-import test applies when it parses zero files.
+// production-import test applies when it parses zero files. That precedent
+// floors the requirement as well as the input, so emptying this list is itself
+// a failure: see the zero floor in assertSessionStoreProviderMatrix.
 var sessionStoreRequiredProviders = []string{"memstore", "natsstore"}
 
 // sessionStoreProviders is the provider matrix every neutral case runs over.
@@ -73,8 +76,12 @@ var sessionStoreRequiredProviders = []string{"memstore", "natsstore"}
 // lookup, and no external server. memstore is Storage's in-process oracle.
 //
 // It takes the case's *testing.T so the floor below is enforced at every call
-// site rather than in one guard test that could be skipped or deleted on its
-// own while eleven vacuous passes survived.
+// site: there is no separate guard test that could be -run-filtered away or
+// deleted while eleven vacuous passes survived. The floor is not proof against
+// someone who sets out to remove it — it is a normal function call in a test
+// file — but it is returned through rather than called for effect, so dropping
+// the line does not compile, and any edit that disables it disables it for all
+// eleven cases at once and visibly in review.
 func sessionStoreProviders(t *testing.T) []sessionStoreProvider {
 	t.Helper()
 	providers := []sessionStoreProvider{
@@ -104,29 +111,44 @@ func sessionStoreProviders(t *testing.T) []sessionStoreProvider {
 			},
 		},
 	}
-	assertSessionStoreProviderMatrix(t, providers)
-	return providers
+	return assertSessionStoreProviderMatrix(t, providers)
 }
 
-// assertSessionStoreProviderMatrix refuses a matrix that has lost a backend.
-// The floor is by NAME and not by length: a length of two would accept memstore
-// listed twice, it would not say which backend went missing, and it would have
-// to be edited — for no reason — the day a third released backend is added.
-// Every required name must appear exactly once; additional backends are fine.
-func assertSessionStoreProviderMatrix(t *testing.T, providers []sessionStoreProvider) {
+// assertSessionStoreProviderMatrix refuses a matrix that has lost a backend and
+// returns the matrix it accepted, so a caller cannot drop the check and still
+// compile. The floor is by NAME and not by length: a length of two would accept
+// memstore listed twice, it would not say which backend went missing, and it
+// would have to be edited — for no reason — the day a third released backend is
+// added. Every required name must appear exactly once; additional backends are
+// fine.
+func assertSessionStoreProviderMatrix(t *testing.T, providers []sessionStoreProvider) []sessionStoreProvider {
 	t.Helper()
+	if len(sessionStoreRequiredProviders) == 0 {
+		t.Fatal(
+			"sessionStoreRequiredProviders is empty, so this floor requires nothing and would accept any matrix, including an empty one. Emptying it makes every provider case in this file pass with zero subtests; name each backend the matrix must contain.",
+		)
+	}
 	counts := make(map[string]int, len(providers))
 	for _, provider := range providers {
 		counts[provider.name]++
 	}
 	for _, name := range sessionStoreRequiredProviders {
-		if counts[name] != 1 {
-			t.Fatalf(
-				"provider matrix contains %d %q backends, want exactly one; matrix is %v. A provider case over this matrix would run zero subtests and pass vacuously.",
-				counts[name], name, sessionStoreProviderNames(providers),
-			)
+		if counts[name] == 1 {
+			continue
 		}
+		// The tail must stay true in all three shapes this catches: a missing
+		// backend, an empty matrix, and a duplicate — where subtests DO run,
+		// just not the ones the case claims.
+		defect := fmt.Sprintf("no subtest would run against %q", name)
+		if counts[name] > 1 {
+			defect = fmt.Sprintf("the extra %q subtests displace a required backend and cover nothing the first one does not", name)
+		}
+		t.Fatalf(
+			"provider matrix contains %d %q backends, want exactly one; matrix is %v. Every provider case in this file runs over this matrix, so %s, and those cases would pass without the provider coverage they claim.",
+			counts[name], name, sessionStoreProviderNames(providers), defect,
+		)
 	}
+	return providers
 }
 
 // sessionStoreProviderNames renders a matrix for a failure message.
