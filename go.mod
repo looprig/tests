@@ -4,18 +4,20 @@ go 1.26.6
 
 require (
 	github.com/looprig/classifiers v0.2.1
-	github.com/looprig/core v0.6.1
+	github.com/looprig/core v0.7.0
 	github.com/looprig/credentials v0.2.0
 	github.com/looprig/eval v0.2.1
 	github.com/looprig/foreignloops v0.3.1
-	github.com/looprig/fsstore v0.4.1
+	github.com/looprig/fsstore v0.5.1
 	github.com/looprig/harness v0.26.0
 	github.com/looprig/inference v0.12.1
 	github.com/looprig/llm v0.14.1
 	github.com/looprig/mcp v0.7.1
+	github.com/looprig/natsstore v0.5.1
 	github.com/looprig/sandbox v0.9.0
 	github.com/looprig/secrets v0.2.0
-	github.com/looprig/storage v0.4.1
+	github.com/looprig/sessionstore v0.3.0
+	github.com/looprig/storage v0.6.0
 )
 
 require (
@@ -24,6 +26,7 @@ require (
 	cloud.google.com/go/compute/metadata v0.9.0 // indirect
 	github.com/BurntSushi/toml v1.6.0 // indirect
 	github.com/anthropics/anthropic-sdk-go v1.62.0 // indirect
+	github.com/antithesishq/antithesis-sdk-go v0.7.2 // indirect
 	github.com/bahlo/generic-list-go v0.2.0 // indirect
 	github.com/buger/jsonparser v1.6.1 // indirect
 	github.com/ccojocar/zxcvbn-go v1.0.4 // indirect
@@ -34,6 +37,7 @@ require (
 	github.com/go-logr/stdr v1.2.2 // indirect
 	github.com/google/go-cmp v0.7.0 // indirect
 	github.com/google/go-tdx-guest v0.3.1 // indirect
+	github.com/google/go-tpm v0.9.8 // indirect
 	github.com/google/jsonschema-go v0.4.3 // indirect
 	github.com/google/logger v1.1.2 // indirect
 	github.com/google/nftables v0.3.0 // indirect
@@ -44,10 +48,17 @@ require (
 	github.com/gookit/color v1.6.1 // indirect
 	github.com/gorilla/websocket v1.5.3 // indirect
 	github.com/invopop/jsonschema v0.14.0 // indirect
+	github.com/klauspost/compress v1.19.2 // indirect
 	github.com/landlock-lsm/go-landlock v0.9.0 // indirect
 	github.com/mdlayher/netlink v1.11.2 // indirect
 	github.com/mdlayher/socket v0.6.1 // indirect
+	github.com/minio/highwayhash v1.0.4 // indirect
 	github.com/modelcontextprotocol/go-sdk v1.7.0 // indirect
+	github.com/nats-io/jwt/v2 v2.8.2 // indirect
+	github.com/nats-io/nats-server/v2 v2.14.5 // indirect
+	github.com/nats-io/nats.go v1.53.1 // indirect
+	github.com/nats-io/nkeys v0.4.16 // indirect
+	github.com/nats-io/nuid v1.0.1 // indirect
 	github.com/openai/openai-go/v3 v3.50.0 // indirect
 	github.com/pb33f/ordered-map/v2 v2.3.1 // indirect
 	github.com/securego/gosec/v2 v2.28.0 // indirect
@@ -68,7 +79,7 @@ require (
 	go.uber.org/multierr v1.11.0 // indirect
 	go.yaml.in/yaml/v3 v3.0.5 // indirect
 	go.yaml.in/yaml/v4 v4.0.0-rc.6 // indirect
-	golang.org/x/crypto v0.54.0 // indirect
+	golang.org/x/crypto v0.55.0 // indirect
 	golang.org/x/exp/typeparams v0.0.0-20260810151157-a8b543ca52da // indirect
 	golang.org/x/mod v0.39.0 // indirect
 	golang.org/x/net v0.57.0 // indirect
@@ -76,7 +87,7 @@ require (
 	golang.org/x/sync v0.22.0 // indirect
 	golang.org/x/sys v0.47.0 // indirect
 	golang.org/x/telemetry v0.0.0-20260804195142-bdd03c3c8848 // indirect
-	golang.org/x/text v0.40.0 // indirect
+	golang.org/x/text v0.41.0 // indirect
 	golang.org/x/time v0.15.0 // indirect
 	golang.org/x/tools v0.48.0 // indirect
 	golang.org/x/vuln v1.6.0 // indirect
