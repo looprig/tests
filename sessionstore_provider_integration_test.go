@@ -58,13 +58,26 @@ type sessionStoreProvider struct {
 	open func(t *testing.T, ctx context.Context) *storage.Composite
 }
 
+// sessionStoreRequiredProviders names the backends the matrix must contain.
+// Eleven of the thirteen cases in this file are provider cases, so an empty or
+// shrunken matrix would not fail them — it would make them PASS with zero
+// subtests. The matrix is the single place that failure mode can be refused,
+// and refusing it is the same non-vacuity floor sessionstore's own
+// production-import test applies when it parses zero files.
+var sessionStoreRequiredProviders = []string{"memstore", "natsstore"}
+
 // sessionStoreProviders is the provider matrix every neutral case runs over.
 //
 // natsstore is opened through its public embedded mode on a temp dir this test
 // owns: an in-process JetStream engine with no TCP listener, no home or XDG
 // lookup, and no external server. memstore is Storage's in-process oracle.
-func sessionStoreProviders() []sessionStoreProvider {
-	return []sessionStoreProvider{
+//
+// It takes the case's *testing.T so the floor below is enforced at every call
+// site rather than in one guard test that could be skipped or deleted on its
+// own while eleven vacuous passes survived.
+func sessionStoreProviders(t *testing.T) []sessionStoreProvider {
+	t.Helper()
+	providers := []sessionStoreProvider{
 		{
 			name: "memstore",
 			open: func(t *testing.T, _ context.Context) *storage.Composite {
@@ -91,6 +104,38 @@ func sessionStoreProviders() []sessionStoreProvider {
 			},
 		},
 	}
+	assertSessionStoreProviderMatrix(t, providers)
+	return providers
+}
+
+// assertSessionStoreProviderMatrix refuses a matrix that has lost a backend.
+// The floor is by NAME and not by length: a length of two would accept memstore
+// listed twice, it would not say which backend went missing, and it would have
+// to be edited — for no reason — the day a third released backend is added.
+// Every required name must appear exactly once; additional backends are fine.
+func assertSessionStoreProviderMatrix(t *testing.T, providers []sessionStoreProvider) {
+	t.Helper()
+	counts := make(map[string]int, len(providers))
+	for _, provider := range providers {
+		counts[provider.name]++
+	}
+	for _, name := range sessionStoreRequiredProviders {
+		if counts[name] != 1 {
+			t.Fatalf(
+				"provider matrix contains %d %q backends, want exactly one; matrix is %v. A provider case over this matrix would run zero subtests and pass vacuously.",
+				counts[name], name, sessionStoreProviderNames(providers),
+			)
+		}
+	}
+}
+
+// sessionStoreProviderNames renders a matrix for a failure message.
+func sessionStoreProviderNames(providers []sessionStoreProvider) []string {
+	names := make([]string, 0, len(providers))
+	for _, provider := range providers {
+		names = append(names, provider.name)
+	}
+	return names
 }
 
 // randomSessionStoreTenant returns a fresh tenant namespace. Every case gets its
@@ -160,7 +205,7 @@ func createSessionStoreSession(t *testing.T, ctx context.Context, store *session
 // withholds both fences while still covering them.
 func TestSessionStoreOpeningFenceIsProviderNeutral(t *testing.T) {
 	t.Parallel()
-	for _, provider := range sessionStoreProviders() {
+	for _, provider := range sessionStoreProviders(t) {
 		t.Run(provider.name, func(t *testing.T) {
 			t.Parallel()
 			ctx, cancel := context.WithTimeout(context.Background(), sessionStoreCaseTimeout)
@@ -274,7 +319,7 @@ func appendSessionStoreRecord(t *testing.T, ctx context.Context, writer *session
 // the work one page does without losing a record.
 func TestSessionStoreMixedJournalPagingIsProviderNeutral(t *testing.T) {
 	t.Parallel()
-	for _, provider := range sessionStoreProviders() {
+	for _, provider := range sessionStoreProviders(t) {
 		t.Run(provider.name, func(t *testing.T) {
 			t.Parallel()
 			ctx, cancel := context.WithTimeout(context.Background(), sessionStoreCaseTimeout)
@@ -456,7 +501,7 @@ func TestSessionStoreMixedJournalPagingIsProviderNeutral(t *testing.T) {
 // that must see every session once therefore reconciles by identity.
 func TestSessionStoreCatalogRankMoveIsProviderNeutral(t *testing.T) {
 	t.Parallel()
-	for _, provider := range sessionStoreProviders() {
+	for _, provider := range sessionStoreProviders(t) {
 		t.Run(provider.name, func(t *testing.T) {
 			t.Parallel()
 			ctx, cancel := context.WithTimeout(context.Background(), sessionStoreCaseTimeout)
@@ -588,7 +633,7 @@ func (c *manualClock) advance(d time.Duration) {
 // carries exactly the outstanding commands, and a terminal command leaves it.
 func TestSessionStoreInboxOrderAndDueTransitionsAreProviderNeutral(t *testing.T) {
 	t.Parallel()
-	for _, provider := range sessionStoreProviders() {
+	for _, provider := range sessionStoreProviders(t) {
 		t.Run(provider.name, func(t *testing.T) {
 			t.Parallel()
 			ctx, cancel := context.WithTimeout(context.Background(), sessionStoreCaseTimeout)
@@ -1027,6 +1072,16 @@ func (o recordingOrderedIndex) Delete(ctx context.Context, id storage.OrderedID,
 	return o.inner.Delete(ctx, id, expectedRevision)
 }
 
+// ListOrdered is instrumented for symmetry, but NO published sessionstore
+// v0.3.0 code path reaches it: the only production ordered queries are the two
+// ListRanked call sites (catalog page, host placement page) and the three
+// ListDue ones (due gates, due commands, host-target sweep). There is therefore
+// no public API this repository can call to assert a ListOrdered limit/row
+// pair, and this file does not claim one. What is asserted instead is stronger
+// in the direction that matters: assertOneQueryPerPage requires the page to be
+// EXACTLY one recorded query of the named kind, so if a future release started
+// enumerating acceptance order behind a page, the extra ListOrdered call would
+// be recorded here and fail that assertion.
 func (o recordingOrderedIndex) ListOrdered(ctx context.Context, namespace string, orderingScope string, afterOrder uint64, limit int) (storage.OrderedPage, error) {
 	page, err := o.inner.ListOrdered(ctx, namespace, orderingScope, afterOrder, limit)
 	o.rec.recordQuery("OrderedIndex", "ListOrdered", namespace+"|"+orderingScope, limit, len(page.Records))
@@ -1078,7 +1133,7 @@ func instrumentComposite(t *testing.T, backend *storage.Composite) (*storage.Com
 // it, so a deployment that never sweeps accumulates capacity that is gone.
 func TestSessionStoreHostTargetExpiryIsProviderNeutral(t *testing.T) {
 	t.Parallel()
-	for _, provider := range sessionStoreProviders() {
+	for _, provider := range sessionStoreProviders(t) {
 		t.Run(provider.name, func(t *testing.T) {
 			t.Parallel()
 			ctx, cancel := context.WithTimeout(context.Background(), sessionStoreCaseTimeout)
@@ -1253,7 +1308,7 @@ func listSessionStoreHosts(t *testing.T, ctx context.Context, store *sessionstor
 // deleting the row.
 func TestSessionStoreRegistryTombstoneIsProviderNeutral(t *testing.T) {
 	t.Parallel()
-	for _, provider := range sessionStoreProviders() {
+	for _, provider := range sessionStoreProviders(t) {
 		t.Run(provider.name, func(t *testing.T) {
 			t.Parallel()
 			ctx, cancel := context.WithTimeout(context.Background(), sessionStoreCaseTimeout)
@@ -1401,7 +1456,7 @@ func TestSessionStoreRegistryTombstoneIsProviderNeutral(t *testing.T) {
 // provider key.
 func TestSessionStoreObjectFirstReferenceIsProviderNeutral(t *testing.T) {
 	t.Parallel()
-	for _, provider := range sessionStoreProviders() {
+	for _, provider := range sessionStoreProviders(t) {
 		t.Run(provider.name, func(t *testing.T) {
 			t.Parallel()
 			ctx, cancel := context.WithTimeout(context.Background(), sessionStoreCaseTimeout)
@@ -1581,7 +1636,7 @@ func readSessionStoreObject(t *testing.T, ctx context.Context, store *sessionsto
 // recorded.
 func TestSessionStoreOpaqueKeysAreProviderNeutral(t *testing.T) {
 	t.Parallel()
-	for _, provider := range sessionStoreProviders() {
+	for _, provider := range sessionStoreProviders(t) {
 		t.Run(provider.name, func(t *testing.T) {
 			t.Parallel()
 			ctx, cancel := context.WithTimeout(context.Background(), sessionStoreCaseTimeout)
@@ -1736,7 +1791,7 @@ func TestSessionStoreOpaqueKeysAreProviderNeutral(t *testing.T) {
 // behaviour rather than a copy of its internals.
 func TestSessionStoreLayoutAdoptionIsProviderNeutral(t *testing.T) {
 	t.Parallel()
-	for _, provider := range sessionStoreProviders() {
+	for _, provider := range sessionStoreProviders(t) {
 		t.Run(provider.name, func(t *testing.T) {
 			t.Parallel()
 			ctx, cancel := context.WithTimeout(context.Background(), sessionStoreCaseTimeout)
@@ -1814,7 +1869,7 @@ func TestSessionStoreLayoutAdoptionIsProviderNeutral(t *testing.T) {
 // must be canonical.
 func TestSessionStoreLegacyLayoutIsTenantBoundAndProviderNeutral(t *testing.T) {
 	t.Parallel()
-	for _, provider := range sessionStoreProviders() {
+	for _, provider := range sessionStoreProviders(t) {
 		t.Run(provider.name, func(t *testing.T) {
 			t.Parallel()
 			ctx, cancel := context.WithTimeout(context.Background(), sessionStoreCaseTimeout)
@@ -2052,7 +2107,7 @@ func TestSessionStoreComposesFsstorePrimitivesWithLifecycleBlobs(t *testing.T) {
 // more records than the budget it was given.
 func TestSessionStorePagesAreBoundedByQueryWork(t *testing.T) {
 	t.Parallel()
-	for _, provider := range sessionStoreProviders() {
+	for _, provider := range sessionStoreProviders(t) {
 		t.Run(provider.name, func(t *testing.T) {
 			t.Parallel()
 			ctx, cancel := context.WithTimeout(context.Background(), sessionStoreCaseTimeout)
