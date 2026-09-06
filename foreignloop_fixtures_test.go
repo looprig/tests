@@ -431,6 +431,40 @@ func waitForeignloopTurnTerminal(t *testing.T, ctx context.Context, store *sessi
 	}
 }
 
+// waitForeignloopTurnDoneCount blocks until a loop has committed want TurnDone
+// events. It is the quiescence barrier a queued-delegate case needs before its
+// cleanup shuts the session down: each backgrounded delegate request is handed
+// back as its own machine-originated parent turn, and a model step that has
+// returned its final chunk has not yet committed that turn's terminal. Shutting
+// down in that window cancels a running loop, which harness reports as
+// *command.LoopTerminatedError ("loop: terminated by context").
+func waitForeignloopTurnDoneCount(t *testing.T, ctx context.Context, store *sessionstore.Store, sessionID, loopID uuid.UUID, want int) {
+	t.Helper()
+	ticker := time.NewTicker(5 * time.Millisecond)
+	defer ticker.Stop()
+	for {
+		events := eventsFor(t, ctx, store, sessionID)
+		done := 0
+		for _, value := range events {
+			terminal, ok := value.(event.TurnDone)
+			if ok && terminal.LoopID == loopID {
+				done++
+			}
+		}
+		if done >= want {
+			if done != want {
+				t.Fatalf("loop %s committed %d TurnDone events, want exactly %d", loopID, done, want)
+			}
+			return
+		}
+		select {
+		case <-ctx.Done():
+			t.Fatalf("wait for loop %s to commit %d TurnDone events: reached %d: %v", loopID, want, done, ctx.Err())
+		case <-ticker.C:
+		}
+	}
+}
+
 // interruptForeignloopChild uses the public loop controller because the tagged
 // StopAgent tool waits for LoopIdle, while foreignloops v0.2.4 publishes only
 // the TurnInterrupted terminal for an interrupted turn.

@@ -249,6 +249,9 @@ func TestForeignloopQueuedDelegateInterrupt(t *testing.T) {
 		t.Fatalf("parent model calls = %d, want exactly 5: three scripted steps and one hand-back per backgrounded request", got)
 	}
 	assertForeignloopHandBacks(t, &handBacks, &handBacksMu, active.AgentID, 2)
+	// One committed parent turn per model call, and no live turn left for the
+	// cleanup shutdown to cancel.
+	waitForeignloopTurnDoneCount(t, ctx, store, sess.SessionID(), parentID, 3)
 }
 
 func TestForeignloopQueuedDelegateTimeout(t *testing.T) {
@@ -334,6 +337,7 @@ func TestForeignloopQueuedDelegateTimeout(t *testing.T) {
 		t.Fatalf("parent model calls = %d, want exactly 4: three scripted steps and one hand-back for the backgrounded start", got)
 	}
 	assertForeignloopHandBacks(t, &handBacks, &handBacksMu, active.AgentID, 1)
+	waitForeignloopTurnDoneCount(t, ctx, store, sess.SessionID(), parentID, 2)
 }
 
 func TestForeignloopProviderFailureWithQueuedDelegates(t *testing.T) {
@@ -418,6 +422,7 @@ func TestForeignloopProviderFailureWithQueuedDelegates(t *testing.T) {
 		t.Fatalf("parent model calls = %d, want exactly 7: four scripted steps and one hand-back per backgrounded request", got)
 	}
 	assertForeignloopHandBacks(t, &handBacks, &handBacksMu, active.AgentID, 3)
+	waitForeignloopTurnDoneCount(t, ctx, store, sess.SessionID(), parentID, 4)
 }
 
 func TestForeignloopSubagentQuota(t *testing.T) {
