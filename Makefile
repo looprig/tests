@@ -7,7 +7,7 @@
 GO_DIRS := $(shell GOWORK=off go list -f '{{.Dir}}' -tags integration ./...)
 
 test:
-	LOOPRIG_LIVE_NETWORK=0 GOWORK=off go test -tags integration -race ./...
+	LOOPRIG_LIVE_NETWORK=0 GOWORK=off go test -count=1 -tags integration -race ./...
 
 live-network:
 	LOOPRIG_LIVE_NETWORK=1 GOWORK=off go test -tags integration -race -count=1 -run '^TestSandboxBroadNetworkGrantCarriesDNS$$' .
@@ -39,13 +39,13 @@ vuln:
 secure: lint vuln
 
 dependency-boundary:
-	GOWORK=off go test -race -run '^TestCrossModuleOwnership' ./...
+	GOWORK=off go test -count=1 -race -run '^TestCrossModuleOwnership' ./...
 
 # Every sibling repository in this ecosystem (harness, classifiers, carbon,
 # and this tests module) carries the same minimal top-level marker set
 # (go.mod, Makefile, LICENSE, CONTRIBUTING.md). See root_layout_test.go.
 root-layout:
-	GOWORK=off go test -race -run '^(TestSiblingRootLayout|TestRepositoryRootLayoutMatchesEcosystemConvention)' ./...
+	GOWORK=off go test -count=1 -race -run '^(TestSiblingRootLayout|TestRepositoryRootLayoutMatchesEcosystemConvention)' ./...
 
 
 mod-check:
@@ -55,7 +55,7 @@ mod-check:
 
 release-check:
 	$(MAKE) mod-check
-	GOWORK=off go test -tags integration -race ./...
+	GOWORK=off go test -count=1 -tags integration -race ./...
 
 # --- standardized check surface -------------------------------------------
 # One target, the same set of checks, in every module. CI calls exactly this,
