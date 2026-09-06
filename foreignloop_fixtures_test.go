@@ -530,10 +530,20 @@ type foreignloopScenarioLLM struct {
 	mu    sync.Mutex
 	steps []foreignloopScenarioStep
 	next  int
+	// done counts steps whose body has returned, so a case that waits on a step
+	// also sees whatever that step recorded. next counts entries, so an
+	// unscripted extra call is still visible to an exact-count assertion.
+	done int
+	// changed is closed and replaced whenever done advances. It is the causal
+	// signal a case waits on instead of wall time: harness delivers a
+	// backgrounded delegate request's completion on the session's own
+	// goroutine, so the parent's step count is still converging at the moment a
+	// child's terminal event lands in the journal.
+	changed chan struct{}
 }
 
 func newForeignloopScenarioLLM(steps ...foreignloopScenarioStep) *foreignloopScenarioLLM {
-	return &foreignloopScenarioLLM{steps: steps}
+	return &foreignloopScenarioLLM{steps: steps, changed: make(chan struct{})}
 }
 
 func (*foreignloopScenarioLLM) Invoke(context.Context, inference.Request) (*inference.Response, error) {
@@ -546,9 +556,11 @@ func (s *foreignloopScenarioLLM) Stream(ctx context.Context, request inference.R
 	s.next++
 	s.mu.Unlock()
 	if index >= len(s.steps) {
+		s.finishStep()
 		return nil, fmt.Errorf("foreignloop scenario requested unexpected model step %d", index)
 	}
 	chunks, err := s.steps[index](ctx, request)
+	s.finishStep()
 	if err != nil {
 		return nil, fmt.Errorf("foreignloop scenario step %d: %w", index, err)
 	}
@@ -563,10 +575,47 @@ func (s *foreignloopScenarioLLM) Stream(ctx context.Context, request inference.R
 	}, nil), nil
 }
 
+// finishStep publishes a completed step. It is broadcast after the step body has
+// returned so a waiter observes the step's recorded effects, not merely its entry.
+func (s *foreignloopScenarioLLM) finishStep() {
+	s.mu.Lock()
+	s.done++
+	close(s.changed)
+	s.changed = make(chan struct{})
+	s.mu.Unlock()
+}
+
 func (s *foreignloopScenarioLLM) callCount() int {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return s.next
+}
+
+// waitCalls blocks until want model steps have completed, then returns the total
+// number of calls entered — so want is a floor for the wait and the caller's
+// equality check still fails on an unscripted extra call. A case that reads
+// callCount directly after a child's
+// terminal event reads a partial count: every backgrounded delegate request
+// produces one further machine-originated parent turn, and those hand-backs are
+// dispatched asynchronously by harness (internal/sessionruntime/delegation.go
+// handBackRequest starts a session-lifetime goroutine per request). Waiting on
+// the step signal makes the observation causal rather than timed; the surviving
+// exact-count assertion at the call site is what makes it an assertion.
+func (s *foreignloopScenarioLLM) waitCalls(t *testing.T, ctx context.Context, want int) int {
+	t.Helper()
+	for {
+		s.mu.Lock()
+		completed, entered, changed := s.done, s.next, s.changed
+		s.mu.Unlock()
+		if completed >= want {
+			return entered
+		}
+		select {
+		case <-ctx.Done():
+			t.Fatalf("wait for %d completed parent model calls: reached %d (%d entered): %v", want, completed, entered, ctx.Err())
+		case <-changed:
+		}
+	}
 }
 
 func foreignloopToolCall(id, input string) []content.Chunk {
@@ -678,6 +727,94 @@ func foreignloopExpectLastToolResult(request inference.Request, want string) err
 		return fmt.Errorf("tool result = %q, want %q", got, want)
 	}
 	return nil
+}
+
+// foreignloopBackgroundCompletion is the machine-originated SubagentResult that
+// harness hands back to a parent when a backgrounded delegate request reaches a
+// terminal state. It arrives as the newest user message of a fresh parent turn,
+// not as a tool result, and carries the correlation id of the request it closes.
+type foreignloopBackgroundCompletion struct {
+	AgentID        string `json:"agent_id"`
+	Name           string `json:"name"`
+	State          string `json:"state"`
+	ResponseStatus int    `json:"response_status"`
+	CorrelationID  string `json:"correlation_id"`
+	Response       string `json:"response"`
+}
+
+// foreignloopLastBackgroundCompletion decodes the newest hand-back in a model
+// request. It is the semantic notification a case waits for, in place of
+// asserting on the timing of the parent's step count alone.
+func foreignloopLastBackgroundCompletion(request inference.Request) (foreignloopBackgroundCompletion, error) {
+	for index := len(request.Messages) - 1; index >= 0; index-- {
+		message, ok := request.Messages[index].(*content.UserMessage)
+		if !ok {
+			continue
+		}
+		var text strings.Builder
+		for _, block := range message.Blocks {
+			if typed, ok := block.(*content.TextBlock); ok {
+				text.WriteString(typed.Text)
+			}
+		}
+		var completion foreignloopBackgroundCompletion
+		if err := json.Unmarshal([]byte(text.String()), &completion); err != nil || completion.CorrelationID == "" {
+			continue
+		}
+		return completion, nil
+	}
+	return foreignloopBackgroundCompletion{}, errors.New("model request carries no background completion hand-back")
+}
+
+// foreignloopExpectBackgroundCompletion asserts the newest hand-back closes a
+// request against the expected child and reports it as no longer working. The
+// caller keeps the returned correlation id so a case can require one hand-back
+// per backgrounded request rather than merely counting model calls.
+func foreignloopExpectBackgroundCompletion(request inference.Request, agentID string) (string, error) {
+	completion, err := foreignloopLastBackgroundCompletion(request)
+	if err != nil {
+		return "", err
+	}
+	if completion.AgentID != agentID {
+		return "", fmt.Errorf("hand-back = %+v, want agent %s", completion, agentID)
+	}
+	if completion.State != "idle" {
+		return "", fmt.Errorf("hand-back = %+v, want idle state for a terminal request", completion)
+	}
+	return completion.CorrelationID, nil
+}
+
+// foreignloopRecordHandBack scripts one model step that requires the newest
+// message to be a background completion for the started child and records the
+// request it closes.
+func foreignloopRecordHandBack(recorded *[]string, mu *sync.Mutex, active *foreignloopAgentToolResult) foreignloopScenarioStep {
+	return func(_ context.Context, request inference.Request) ([]content.Chunk, error) {
+		correlationID, err := foreignloopExpectBackgroundCompletion(request, active.AgentID)
+		if err != nil {
+			return nil, err
+		}
+		mu.Lock()
+		*recorded = append(*recorded, correlationID)
+		mu.Unlock()
+		return foreignloopFinal("hand-back observed"), nil
+	}
+}
+
+// assertForeignloopHandBacks requires exactly one distinct hand-back per
+// backgrounded request. Two deliveries for the same correlation id, or a repeat
+// of one request's hand-back, would satisfy a bare call count but not this.
+func assertForeignloopHandBacks(t *testing.T, recorded *[]string, mu *sync.Mutex, agentID string, want int) {
+	t.Helper()
+	mu.Lock()
+	got := append([]string(nil), *recorded...)
+	mu.Unlock()
+	distinct := make(map[string]struct{}, len(got))
+	for _, id := range got {
+		distinct[id] = struct{}{}
+	}
+	if len(got) != want || len(distinct) != want {
+		t.Fatalf("hand-backs for child %s = %v, want %d deliveries with %d distinct correlation ids", agentID, got, want, want)
+	}
 }
 
 func foreignloopExpectRawToolResult(request inference.Request, want string) error {

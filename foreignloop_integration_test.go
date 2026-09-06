@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"reflect"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -177,6 +178,8 @@ func TestForeignloopQueuedDelegateInterrupt(t *testing.T) {
 	process := newControlledForeignloopProcess(t, foreignloopClaude, "unused", "", foreignloopProcessBlock)
 	var active foreignloopAgentToolResult
 	var sess session.SessionController
+	var handBacksMu sync.Mutex
+	var handBacks []string
 	parentLLM := newForeignloopScenarioLLM(
 		func(context.Context, inference.Request) ([]content.Chunk, error) {
 			return foreignloopToolCall("interrupt-start", `{"agent_type":"child","instructions":"A","wait_for_response":false}`), nil
@@ -213,6 +216,15 @@ func TestForeignloopQueuedDelegateInterrupt(t *testing.T) {
 			}
 			return foreignloopFinal("parent done"), nil
 		},
+		// Both backgrounded requests — the wait_for_response:false start and the
+		// wait_for_response:false send — are handed back to the parent as their own
+		// machine-originated turn once the child reaches its terminal state. The
+		// scenario scripts one step per hand-back and records which request each one
+		// closes, so the case asserts the delegation contract (one hand-back per
+		// backgrounded request, correlated and terminal) rather than a step count
+		// that happens to be observable at one instant.
+		foreignloopRecordHandBack(&handBacks, &handBacksMu, &active),
+		foreignloopRecordHandBack(&handBacks, &handBacksMu, &active),
 	)
 	parent := foreignloopManagedDefinition(t, "planner", loop.EngineNative, parentLLM, "child")
 	child := foreignloopDefinition(t, "child", loop.EngineForeignClaude, deterministicLLM{})
@@ -231,9 +243,12 @@ func TestForeignloopQueuedDelegateInterrupt(t *testing.T) {
 	assertForeignloopTurnKinds(t, events, childStarted.LoopID, []string{"TurnStarted", "TurnInterrupted"})
 	assertForeignloopInputCancelled(t, events, childStarted.LoopID, event.CancelTurnInterrupted)
 	process.assertCallCount(t, 1)
-	if parentLLM.callCount() != 4 {
-		t.Fatalf("parent model calls = %d, want 4", parentLLM.callCount())
+	// The child's terminal event does not order the parent's consumption of the
+	// hand-backs it releases, so wait for the model calls that carry them.
+	if got := parentLLM.waitCalls(t, ctx, 5); got != 5 {
+		t.Fatalf("parent model calls = %d, want exactly 5: three scripted steps and one hand-back per backgrounded request", got)
 	}
+	assertForeignloopHandBacks(t, &handBacks, &handBacksMu, active.AgentID, 2)
 }
 
 func TestForeignloopQueuedDelegateTimeout(t *testing.T) {
@@ -244,6 +259,8 @@ func TestForeignloopQueuedDelegateTimeout(t *testing.T) {
 	process := newControlledForeignloopProcess(t, foreignloopClaude, "unused", "", foreignloopProcessBlock)
 	var active foreignloopAgentToolResult
 	var sess session.SessionController
+	var handBacksMu sync.Mutex
+	var handBacks []string
 	parentLLM := newForeignloopScenarioLLM(
 		func(context.Context, inference.Request) ([]content.Chunk, error) {
 			return foreignloopToolCall("timeout-start", `{"agent_type":"child","instructions":"A","wait_for_response":false}`), nil
@@ -275,6 +292,9 @@ func TestForeignloopQueuedDelegateTimeout(t *testing.T) {
 			}
 			return foreignloopFinal("parent done"), nil
 		},
+		// The wait_for_response:false start is handed back to the parent as its own
+		// machine-originated turn once the child terminates.
+		foreignloopRecordHandBack(&handBacks, &handBacksMu, &active),
 	)
 	parent := foreignloopManagedDefinition(t, "planner", loop.EngineNative, parentLLM, "child")
 	child := foreignloopDefinition(t, "child", loop.EngineForeignClaude, deterministicLLM{})
@@ -295,6 +315,10 @@ func TestForeignloopQueuedDelegateTimeout(t *testing.T) {
 	// interrupts the still-running active turn.
 	assertForeignloopInputCancelled(t, events, childStarted.LoopID, event.CancelClientRetracted)
 	process.assertCallCount(t, 1)
+	if got := parentLLM.waitCalls(t, ctx, 4); got != 4 {
+		t.Fatalf("parent model calls = %d, want exactly 4: three scripted steps and one hand-back for the backgrounded start", got)
+	}
+	assertForeignloopHandBacks(t, &handBacks, &handBacksMu, active.AgentID, 1)
 }
 
 func TestForeignloopProviderFailureWithQueuedDelegates(t *testing.T) {
@@ -304,6 +328,8 @@ func TestForeignloopProviderFailureWithQueuedDelegates(t *testing.T) {
 
 	process := newControlledForeignloopProcess(t, foreignloopClaude, "unused", "", foreignloopProcessFailAfterRelease)
 	var active foreignloopAgentToolResult
+	var handBacksMu sync.Mutex
+	var handBacks []string
 	parentLLM := newForeignloopScenarioLLM(
 		func(context.Context, inference.Request) ([]content.Chunk, error) {
 			return foreignloopToolCall("failure-start", `{"agent_type":"child","instructions":"A","wait_for_response":false}`), nil
@@ -347,6 +373,10 @@ func TestForeignloopProviderFailureWithQueuedDelegates(t *testing.T) {
 			}
 			return foreignloopFinal("parent done"), nil
 		},
+		// One hand-back per backgrounded request: the start and both queued sends.
+		foreignloopRecordHandBack(&handBacks, &handBacksMu, &active),
+		foreignloopRecordHandBack(&handBacks, &handBacksMu, &active),
+		foreignloopRecordHandBack(&handBacks, &handBacksMu, &active),
 	)
 	parent := foreignloopManagedDefinition(t, "planner", loop.EngineNative, parentLLM, "child")
 	child := foreignloopDefinition(t, "child", loop.EngineForeignClaude, deterministicLLM{})
@@ -367,6 +397,12 @@ func TestForeignloopProviderFailureWithQueuedDelegates(t *testing.T) {
 	assertForeignloopAcceptedOrder(t, events, childStarted.LoopID, queuedIDs...)
 	assertForeignloopInputCancelledCount(t, events, childStarted.LoopID, event.CancelTurnFailed, 2)
 	process.assertCallCount(t, 1)
+	// The child's terminal event does not order the parent's consumption of the
+	// three hand-backs the provider failure releases.
+	if got := parentLLM.waitCalls(t, ctx, 7); got != 7 {
+		t.Fatalf("parent model calls = %d, want exactly 7: four scripted steps and one hand-back per backgrounded request", got)
+	}
+	assertForeignloopHandBacks(t, &handBacks, &handBacksMu, active.AgentID, 3)
 }
 
 func TestForeignloopSubagentQuota(t *testing.T) {
