@@ -1749,6 +1749,15 @@ func TestSessionStoreOpaqueKeysAreProviderNeutral(t *testing.T) {
 			}
 
 			// A catalog cursor is bound to the tenant it was issued for.
+			//
+			// The error CODE alone does not prove that binding: a catalog
+			// cursor carries the provider's own ranked cursor as its payload,
+			// and a provider handed a token from another ranking scope rejects
+			// it too, which this Store reports as the same CatalogErrorCursor.
+			// So the refusal is pinned to where it must happen instead — in the
+			// Store, BEFORE the provider is asked anything. That is the claim
+			// worth holding: a foreign cursor is never forwarded to a backend,
+			// so tenant isolation does not depend on a provider noticing.
 			page, err := store.ListSessions(ctx, sessionstore.ListSessionsRequest{TenantID: tenant, Limit: 1})
 			if err != nil {
 				t.Fatalf("ListSessions: %v", err)
@@ -1756,6 +1765,7 @@ func TestSessionStoreOpaqueKeysAreProviderNeutral(t *testing.T) {
 			if page.NextCursor == "" {
 				t.Fatal("ListSessions issued no cursor, want a continuation over the second session")
 			}
+			rec.reset()
 			_, err = store.ListSessions(ctx, sessionstore.ListSessionsRequest{
 				TenantID: randomSessionStoreTenant(t),
 				Cursor:   page.NextCursor,
@@ -1764,6 +1774,9 @@ func TestSessionStoreOpaqueKeysAreProviderNeutral(t *testing.T) {
 			var foreignCursor *sessionstore.CatalogError
 			if !errors.As(err, &foreignCursor) || foreignCursor.Code != sessionstore.CatalogErrorCursor {
 				t.Fatalf("cross-tenant cursor error = %v, want *CatalogError code %q", err, sessionstore.CatalogErrorCursor)
+			}
+			if forwarded := rec.snapshot(); len(forwarded) != 0 {
+				t.Fatalf("rejected cross-tenant cursor reached the provider as %+v, want no provider I/O: the Store's own tenant binding must refuse the token", forwarded)
 			}
 
 			// A journal cursor is bound to its projection: a public token
@@ -1787,6 +1800,33 @@ func TestSessionStoreOpaqueKeysAreProviderNeutral(t *testing.T) {
 			}
 
 			// And to the session: a cursor cannot be moved between sessions.
+			//
+			// The target session needs a journal at least as long as the
+			// snapshot the cursor names, or the reader's unrelated "captured
+			// tip wider than the live stream" guard rejects the token first and
+			// this assertion passes without the session binding ever being
+			// consulted.
+			secondWriter, err := store.OpenJournal(ctx, sessionstore.OpenJournalRequest{TenantID: tenant, SessionID: second})
+			if err != nil {
+				t.Fatalf("OpenJournal on the second session: %v", err)
+			}
+			for i := range 3 {
+				appendSessionStoreRecord(t, ctx, secondWriter, sessionstore.Envelope{
+					Kind:    sessionstore.EnvelopeKindPublicEvent,
+					EventID: sessionwire.EventID("event-second-" + strconv.Itoa(i)),
+					Public:  sessionstore.BodySlot{Inline: []byte(`{"step":` + strconv.Itoa(i) + `}`)},
+				})
+			}
+			if err := secondWriter.Close(ctx); err != nil {
+				t.Fatalf("close second journal: %v", err)
+			}
+			secondLive, err := store.ReadPublicJournal(ctx, sessionstore.ReadPublicJournalRequest{TenantID: tenant, SessionID: second, Limit: 10})
+			if err != nil {
+				t.Fatalf("ReadPublicJournal on the second session: %v", err)
+			}
+			if len(secondLive.Events) < 1 {
+				t.Fatalf("second session journal returned %d events, want a stream at least as long as the replayed cursor's snapshot", len(secondLive.Events))
+			}
 			_, err = store.ReadPublicJournal(ctx, sessionstore.ReadPublicJournalRequest{
 				TenantID:  tenant,
 				SessionID: second,
@@ -2076,7 +2116,8 @@ func TestSessionStoreComposesFsstorePrimitivesWithLifecycleBlobs(t *testing.T) {
 		t.Fatalf("compose fsstore primitives with lifecycle Blobs: %v", err)
 	}
 
-	store := openSessionStore(t, ctx, composed)
+	instrumented, rec := instrumentComposite(t, composed)
+	store := openSessionStore(t, ctx, instrumented)
 	tenant := randomSessionStoreTenant(t)
 	session := sessionwire.SessionID("session-" + randomSessionStoreToken(t))
 	base := time.Date(2026, 9, 5, 12, 0, 0, 0, time.UTC)
@@ -2092,13 +2133,53 @@ func TestSessionStoreComposesFsstorePrimitivesWithLifecycleBlobs(t *testing.T) {
 		}
 	}()
 	// An over-threshold body exercises the composed Blobs primitive rather than
-	// only the filesystem ones.
+	// only the filesystem ones — and that is ASSERTED here rather than assumed,
+	// because a round-trip alone cannot tell the two apart. The body sits above
+	// the overflow threshold and below MaxInlineBodyBytes, which is the only
+	// band in which an offloaded reference is also resolvable, so an offload
+	// that silently stopped happening would leave the body inline and every
+	// value below would still match. What distinguishes them is WHERE the bytes
+	// went: a Blobs.Put on this composite, and a reference in place of the
+	// inline slot.
 	body := []byte(`{"blob":"` + strings.Repeat("c", sessionstore.DefaultJournalOverflowThresholdBytes) + `"}`)
+	rec.reset()
 	appendSessionStoreRecord(t, ctx, writer, sessionstore.Envelope{
 		Kind:    sessionstore.EnvelopeKindPublicEvent,
 		EventID: "event-composed",
 		Public:  sessionstore.BodySlot{Inline: body},
 	})
+	var composedBlobPut bool
+	for _, call := range rec.snapshot() {
+		if call.Primitive == "Blobs" && call.Op == "Put" {
+			composedBlobPut = true
+		}
+	}
+	if !composedBlobPut {
+		t.Fatalf("over-threshold append recorded %+v, want a Blobs.Put: the body never reached the composed lifecycle-capable Blobs primitive", rec.snapshot())
+	}
+
+	// And the record that names it carries the reference, not the bytes, so the
+	// Put above is the body's storage rather than an incidental write.
+	runtime, err := store.ReadRuntimeJournal(ctx, sessionstore.ReadRuntimeJournalRequest{TenantID: tenant, SessionID: session, Limit: 10})
+	if err != nil {
+		t.Fatalf("ReadRuntimeJournal: %v", err)
+	}
+	var offloaded *sessionstore.BodyReference
+	for _, record := range runtime.Records {
+		if record.Envelope.EventID != "event-composed" {
+			continue
+		}
+		if record.Envelope.Public.Inline != nil {
+			t.Fatalf("record kept a %d-byte inline body over the composed backend, want it offloaded to an object", len(record.Envelope.Public.Inline))
+		}
+		offloaded = record.Envelope.Public.Reference
+	}
+	if offloaded == nil {
+		t.Fatal("no runtime record for the over-threshold append carries a public object reference")
+	}
+	if offloaded.SizeBytes != uint64(len(body)) {
+		t.Fatalf("reference size = %d, want the body's %d", offloaded.SizeBytes, len(body))
+	}
 
 	page, err := store.ReadPublicJournal(ctx, sessionstore.ReadPublicJournalRequest{TenantID: tenant, SessionID: session, Limit: 10})
 	if err != nil {
