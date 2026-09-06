@@ -1083,8 +1083,15 @@ func TestOptionalBindingFailureDegradesOnlyItself(t *testing.T) {
 	}
 
 	// The optional binding settles in the background; wait for its failure rather
-	// than for a clock.
+	// than for a clock. The published status is the host-facing half of that.
 	f.events.waitStatus(t, "nice-to-have", event.IntegrationFailed)
+
+	// It is NOT the half this test's last assertions read, and the two are not
+	// simultaneous. See waitSettled: the status is published from inside
+	// client.Connect, strictly before the Manager records the outcome that
+	// Manager.Status reports. So wait for the surface being asserted on to
+	// settle, without presupposing what it settled to.
+	f.waitSettled(t, "nice-to-have")
 
 	if err := f.adopter.Install(ctx, sess.ActiveLoop().ID(), "planner"); err != nil {
 		t.Fatalf("Install: %v", err)
@@ -1118,6 +1125,52 @@ func TestOptionalBindingFailureDegradesOnlyItself(t *testing.T) {
 }
 
 // --- 8, 9, 10. snapshots, adoption at idle, and structured unavailability ----
+
+// waitSettled blocks until the Manager's own status surface has settled for the
+// named binding — until Manager.Status reports something other than the
+// pre-connection posture — and returns what it settled to.
+//
+// It is deliberately NOT a wait for the state the caller expects. Manager.Status
+// reports client.StateConfigured for a binding whose connect goroutine has not
+// returned yet: bindingState.status has neither a *client.Client nor a recorded
+// failure to report and says so (mcp/pkg/harness/manager.go). "Not configured" is
+// therefore exactly "the connect attempt landed", whatever it landed on, so an
+// assertion made after this wait still fails on a wrong outcome with a value and
+// an expectation. Waiting for the expected state instead would make that
+// assertion vacuous and would report a genuinely wrong outcome as a timeout.
+//
+// The published event.IntegrationStatus stream cannot serve this purpose, which
+// is the whole reason this helper exists. A client emits its failed transition
+// synchronously, from inside client.Connect, and the adapter publishes on that
+// same goroutine (mcp/pkg/harness/events.go: onClientEvent "runs on the client's
+// emitting goroutine"). Manager.connect only calls bindingState.settle after
+// Connect RETURNS. So IntegrationFailed is observable strictly before the status
+// surface can corroborate it, and a test that waits on the event and then reads
+// Manager.Status is racing that window. Measured with a publisher that reads the
+// surface at the instant it publishes: "configured", every run.
+func (f *rigFixture) waitSettled(t *testing.T, binding string) client.State {
+	t.Helper()
+	deadline := time.Now().Add(settle)
+	for {
+		found := false
+		for _, st := range f.mgr.Status() {
+			if st.Name != binding {
+				continue
+			}
+			found = true
+			if st.Client.State != client.StateConfigured {
+				return st.Client.State
+			}
+		}
+		if !found {
+			t.Fatalf("no binding named %q", binding)
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("binding %q never left %v: its connect attempt has not landed", binding, client.StateConfigured)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
 
 // waitCandidate blocks until the named binding's client holds a validated
 // catalog generation past `after`.
