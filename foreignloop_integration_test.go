@@ -259,6 +259,7 @@ func TestForeignloopQueuedDelegateTimeout(t *testing.T) {
 	process := newControlledForeignloopProcess(t, foreignloopClaude, "unused", "", foreignloopProcessBlock)
 	var active foreignloopAgentToolResult
 	var sess session.SessionController
+	var store *sessionstore.Store
 	var handBacksMu sync.Mutex
 	var handBacks []string
 	parentLLM := newForeignloopScenarioLLM(
@@ -284,6 +285,21 @@ func TestForeignloopQueuedDelegateTimeout(t *testing.T) {
 			if err := foreignloopExpectRawToolResult(request, "error: agent timed out"); err != nil {
 				return nil, err
 			}
+			childID, err := uuid.Parse(active.AgentID)
+			if err != nil {
+				return nil, fmt.Errorf("parse foreignloop agent id %q: %w", active.AgentID, err)
+			}
+			// The timed-out foreground request retracts its own queued input, but
+			// harness dispatches that retraction on a detached goroutine (v0.26.0
+			// internal/sessionruntime/drain.go, `go interrupt()` in
+			// drainCorrelatedWithState's ctx.Done branch) and returns the timeout to
+			// the model without waiting for it. Interrupting the child before that
+			// retraction has landed would resolve the same queued input under
+			// CancelTurnInterrupted instead, so wait for the retraction this case is
+			// about rather than racing it.
+			if err := waitForeignloopInputCancelledReason(stepCtx, store, sess.SessionID(), childID, event.CancelClientRetracted); err != nil {
+				return nil, err
+			}
 			// StopAgent has the same tagged foreign LoopIdle incompatibility as the
 			// interrupt case; use the supported public controller after observing
 			// the timeout while retaining the raw published timeout error assertion.
@@ -298,7 +314,6 @@ func TestForeignloopQueuedDelegateTimeout(t *testing.T) {
 	)
 	parent := foreignloopManagedDefinition(t, "planner", loop.EngineNative, parentLLM, "child")
 	child := foreignloopDefinition(t, "child", loop.EngineForeignClaude, deterministicLLM{})
-	var store *sessionstore.Store
 	sess, store = newForeignloopSession(t, ctx, process, "planner", parent, child)
 	sub := subscribeForeignloopEvents(t, sess)
 	parentID := sess.ActiveLoop().ID()
@@ -311,8 +326,8 @@ func TestForeignloopQueuedDelegateTimeout(t *testing.T) {
 	childStarted := childForeignloopStarted(t, events, parentID)
 	events = waitForeignloopTurnTerminal(t, ctx, store, sess.SessionID(), childStarted.LoopID)
 	assertForeignloopTurnKinds(t, events, childStarted.LoopID, []string{"TurnStarted", "TurnInterrupted"})
-	// The timed-out foreground request retracts itself before the controller
-	// interrupts the still-running active turn.
+	// The timed-out foreground request retracts itself; the case waited for that
+	// retraction above before interrupting the still-running active turn.
 	assertForeignloopInputCancelled(t, events, childStarted.LoopID, event.CancelClientRetracted)
 	process.assertCallCount(t, 1)
 	if got := parentLLM.waitCalls(t, ctx, 4); got != 4 {

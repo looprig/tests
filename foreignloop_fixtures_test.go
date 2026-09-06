@@ -23,6 +23,7 @@ import (
 	"github.com/looprig/foreignloops/driver/codex"
 	"github.com/looprig/harness/pkg/event"
 	"github.com/looprig/harness/pkg/identity"
+	"github.com/looprig/harness/pkg/journal"
 	"github.com/looprig/harness/pkg/loop"
 	"github.com/looprig/harness/pkg/rig"
 	"github.com/looprig/harness/pkg/session"
@@ -782,6 +783,61 @@ func foreignloopExpectBackgroundCompletion(request inference.Request, agentID st
 		return "", fmt.Errorf("hand-back = %+v, want idle state for a terminal request", completion)
 	}
 	return completion.CorrelationID, nil
+}
+
+// foreignloopEvents replays the durable journal for use inside a model step,
+// where a *testing.T failure would be reported on the wrong goroutine.
+func foreignloopEvents(ctx context.Context, store *sessionstore.Store, sessionID uuid.UUID) ([]event.Event, error) {
+	replayer, err := store.OpenEventReplayer(sessionID, sessionstore.ReplayRequest{FromSeq: 0})
+	if err != nil {
+		return nil, fmt.Errorf("OpenEventReplayer: %w", err)
+	}
+	cursor, err := replayer.Open(ctx, journal.ReplayRequest{From: journal.Beginning()})
+	if err != nil {
+		return nil, fmt.Errorf("replayer.Open: %w", err)
+	}
+	defer cursor.Close()
+	var events []event.Event
+	for {
+		value, _, err := cursor.Next(ctx)
+		if errors.Is(err, io.EOF) {
+			return events, nil
+		}
+		if err != nil {
+			return nil, fmt.Errorf("cursor.Next: %w", err)
+		}
+		events = append(events, value)
+	}
+}
+
+// waitForeignloopInputCancelledReason blocks until the durable journal carries an
+// InputCancelled for one loop with the given reason. Harness retracts a timed-out
+// managed delegate request on a detached goroutine (harness v0.26.0
+// internal/sessionruntime/drain.go, the `go interrupt()` in
+// drainCorrelatedWithState's ctx.Done branch), so the retraction is NOT ordered
+// against the tool result the model already received. A case that wants to act on
+// the child afterwards must wait for the retraction it expects, or its own action
+// races that goroutine and resolves the queued input under a different cause.
+func waitForeignloopInputCancelledReason(ctx context.Context, store *sessionstore.Store, sessionID, loopID uuid.UUID, want event.CancelReason) error {
+	ticker := time.NewTicker(5 * time.Millisecond)
+	defer ticker.Stop()
+	for {
+		events, err := foreignloopEvents(ctx, store, sessionID)
+		if err != nil {
+			return err
+		}
+		for _, value := range events {
+			cancelled, ok := value.(event.InputCancelled)
+			if ok && cancelled.LoopID == loopID && cancelled.Reason == want {
+				return nil
+			}
+		}
+		select {
+		case <-ctx.Done():
+			return fmt.Errorf("wait for loop %s InputCancelled reason %v: %w", loopID, want, ctx.Err())
+		case <-ticker.C:
+		}
+	}
 }
 
 // foreignloopRecordHandBack scripts one model step that requires the newest
