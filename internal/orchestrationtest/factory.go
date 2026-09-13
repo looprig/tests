@@ -53,6 +53,12 @@ type FactoryFixture struct {
 
 	served  chan error
 	stopped sync.Once
+
+	// serveWait bounds how long Stop waits for Serve to return. It is a field
+	// rather than a constant ONLY so the kit's own positive control can reach
+	// the timeout branch without costing the suite ten seconds; production
+	// fixtures never set it.
+	serveWait time.Duration
 }
 
 // SessionReaderSeam is factory.SessionReader, restated so a fixture can be
@@ -112,9 +118,16 @@ func NewFactoryFixtureWithReader(tb TB, store *StoreFixture, clock *Clock, reade
 		Placement: placement,
 		Directory: directory,
 		served:    make(chan error, 1),
+		serveWait: 10 * time.Second,
 	}
 	fixture.Client = &http.Client{Timeout: 10 * time.Second}
-	go func() { fixture.served <- server.Serve(listener) }()
+	// Capture the channel in a LOCAL. Reading fixture.served inside the
+	// goroutine would dereference the field at send time, which is both a data
+	// race with any test that swaps it and the reason the kit's own "Serve
+	// never returns" control first failed: the goroutine delivered into the
+	// replacement channel instead of the original.
+	results := fixture.served
+	go func() { results <- server.Serve(listener) }()
 	tb.Cleanup(func() { fixture.Stop(tb) })
 	return fixture
 }
@@ -137,7 +150,7 @@ func (f *FactoryFixture) Stop(tb TB) {
 			if err != nil && !errors.Is(err, http.ErrServerClosed) {
 				tb.Errorf("orchestrationtest: Serve returned %v, want http.ErrServerClosed", err)
 			}
-		case <-time.After(10 * time.Second):
+		case <-time.After(f.serveWait):
 			tb.Errorf("orchestrationtest: Serve did not return after Stop")
 		}
 	})
@@ -311,9 +324,24 @@ type StoreDirectory struct{ Store *sessionstore.Store }
 func (d *StoreDirectory) Owner(ctx context.Context, tenant sessionwire.TenantID, session sessionwire.SessionID) (sessionwire.HostLinkRegistryObservation, bool, error) {
 	entry, err := d.Store.GetHostRegistration(ctx, sessionstore.GetHostRegistrationRequest{TenantID: tenant, SessionID: session})
 	if err != nil {
-		var registrationErr *sessionstore.PointerError
-		if errors.As(err, &registrationErr) {
-			return sessionwire.HostLinkRegistryObservation{}, false, nil
+		// "No owner" is *RegistryError with one of three codes, NOT a
+		// *PointerError -- which is what this adapter originally matched, and
+		// it was wrong. Nothing caught it until a case actually CALLED this
+		// seam: a composed-but-undriven adapter is an untested adapter, and
+		// this is what that costs.
+		//
+		// Expired and released are absences too, not failures: a registration
+		// whose lease has lapsed or been given up names no current owner, and
+		// reporting them as errors would make Factory treat an ordinary
+		// handover as a durable-plane fault.
+		var registryErr *sessionstore.RegistryError
+		if errors.As(err, &registryErr) {
+			switch registryErr.Code {
+			case sessionstore.RegistryErrorNotFound,
+				sessionstore.RegistryErrorExpired,
+				sessionstore.RegistryErrorReleased:
+				return sessionwire.HostLinkRegistryObservation{}, false, nil
+			}
 		}
 		return sessionwire.HostLinkRegistryObservation{}, false, err
 	}

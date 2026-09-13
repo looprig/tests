@@ -163,15 +163,28 @@ func AssertPublicFrameIsClean(tb TB, what string, frame []byte) {
 // NotComposedRoutes are the Factory routes that answer "not composed" in this
 // build, with the status each answers.
 //
-// These are TRIP-WIRES. /v1/realtime is the ClientLink WebSocket endpoint and
-// it answers 501: factory.New composes no clientlink handler, and nothing in
-// Factory's non-test source imports its realtime packages at all. The control
-// routes answer 503 because factory.New passes a nil admission service. So the
-// kit's "bounded ClientLink client" (runbook 07 I0.1 step 2) and the whole of
-// task I0.2 are blocked on a Factory composition change, not on test work.
+// This map holds exactly ONE route, /v1/realtime, and the comment says so
+// because an earlier version of it described the control routes too and the map
+// never contained them.
 //
-// AssertFactoryComposesNoLinkPlane fails the day any of them starts answering
-// something else -- which is the day that blocker lifts.
+// /v1/realtime is the ClientLink WebSocket endpoint and it answers 501:
+// factory.New composes no clientlink handler. Be precise about the import
+// claim: no non-test file in factory imports internal/realtime/clientlink or
+// internal/realtime/hostlink -- but factory/internal/routing/repair.go:11 DOES
+// import internal/realtime/delivery, so "nothing imports realtime" is false and
+// must not be written down again.
+//
+// The control routes (/v1/sessions/{id}/input, /interrupt, /restore, and the
+// gate response) separately answer 503 on factory.New's nil admission service,
+// and the object routes answer 503 on its absent object store. They are NOT in
+// this map: they are POST-only, so the kit's GET helper would read 405 from
+// them and the row would pass for the wrong reason. They are booked as owed
+// instead.
+//
+// So the kit's "bounded ClientLink client" (runbook 07 I0.1 step 2) and the
+// whole of task I0.2 are blocked on a Factory composition change, not on test
+// work. AssertFactoryComposesNoLinkPlane fails the day this route starts
+// answering something else -- which is the day that blocker lifts.
 var NotComposedRoutes = map[string]int{
 	"/v1/realtime": http.StatusNotImplemented,
 }

@@ -3,8 +3,10 @@
 package orchestrationtest
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"strings"
@@ -387,6 +389,97 @@ func TestOrchestrationTestKit(t *testing.T) {
 		faulty.AssertFired(t, "ListSessions")
 	})
 
+	t.Run("every composed seam is driven at least once", func(t *testing.T) {
+		// These five seams are COMPOSED into Host and Factory and no service
+		// code path in this build reaches any of them: Host exposes nothing
+		// runnable, and Factory's control and object routes answer 503 on a
+		// nil admission service, so nothing ever asks the Directory to resolve
+		// an owner or asks the placement controller for anything.
+		//
+		// "Composed" is not "driven" and the difference is not cosmetic. With
+		// this row absent, a hashForPath that returns a CONSTANT -- giving
+		// every tenant and every session one shared workspace directory --
+		// survives mutation, because the only caller is never called. The kit
+		// therefore drives them directly here and says plainly that a kit
+		// self-test, not a service, is what drives them.
+		seamSession := store.SeedSession(ctx, kitAgent, string(kitCompatibility))
+		otherSession := store.SeedSession(ctx, kitAgent, string(kitCompatibility))
+		if seamSession == otherSession {
+			t.Fatalf("the two seam sessions collided (%q)", seamSession)
+		}
+
+		raw, err := (&CatalogSessionStore{Store: store.Store}).LoadSession(ctx, store.Tenant, seamSession)
+		if err != nil {
+			t.Fatalf("CatalogSessionStore.LoadSession: %v", err)
+		}
+		if !bytes.Contains(raw, []byte(seamSession)) {
+			t.Fatalf("LoadSession returned bytes naming no session: %s", truncate(raw))
+		}
+		if _, err := (&CatalogSessionStore{Store: store.Store}).LoadSession(ctx, store.Tenant, "session-absent"); err == nil {
+			t.Fatalf("LoadSession answered for a session that does not exist")
+		}
+
+		first, err := hostFixture.Workspaces.EnsureWorkspace(ctx, store.Tenant, seamSession)
+		if err != nil {
+			t.Fatalf("EnsureWorkspace: %v", err)
+		}
+		second, err := hostFixture.Workspaces.EnsureWorkspace(ctx, store.Tenant, otherSession)
+		if err != nil {
+			t.Fatalf("EnsureWorkspace: %v", err)
+		}
+		if first == second {
+			t.Fatalf("two sessions were handed the same workspace directory %q", first)
+		}
+		again, err := hostFixture.Workspaces.EnsureWorkspace(ctx, store.Tenant, seamSession)
+		if err != nil {
+			t.Fatalf("EnsureWorkspace (repeat): %v", err)
+		}
+		if again != first {
+			t.Fatalf("the same session was handed two workspaces, %q then %q", first, again)
+		}
+		if hostFixture.Workspaces.Ensured() != 2 {
+			t.Fatalf("Ensured() = %d, want 2", hostFixture.Workspaces.Ensured())
+		}
+
+		observation, owned, err := factoryFixture.Directory.Owner(ctx, store.Tenant, seamSession)
+		if err != nil {
+			t.Fatalf("StoreDirectory.Owner: %v", err)
+		}
+		if owned {
+			t.Fatalf("an unplaced session reported an owner: %+v", observation)
+		}
+		page, err := factoryFixture.Directory.Candidates(ctx, sessionstore.ListCompatibleHostsRequest{
+			Key: sessionstore.HostTargetKey{
+				AgentID:                kitAgent,
+				RuntimeCompatibilityID: string(kitCompatibility),
+				Placement:              sessionwire.HostPlacementPooled,
+			},
+		})
+		if err != nil {
+			t.Fatalf("StoreDirectory.Candidates: %v", err)
+		}
+		if len(page.Hosts) != 0 {
+			t.Fatalf("no host advertised capacity, yet %d candidates came back", len(page.Hosts))
+		}
+
+		if err := factoryFixture.Placement.EnsurePlacement(ctx, sessionstore.DesiredWorkload{
+			PayloadVersion: "orchestrationtest/v1",
+			Payload:        []byte(`{"replicas":1}`),
+		}); err != nil {
+			t.Fatalf("RecordingPlacement.EnsurePlacement: %v", err)
+		}
+		ensured := factoryFixture.Placement.Ensured()
+		if len(ensured) != 1 || ensured[0].PayloadVersion != "orchestrationtest/v1" {
+			t.Fatalf("Ensured() = %+v", ensured)
+		}
+		if err := factoryFixture.Placement.ReleasePlacement(ctx, store.Tenant, seamSession); err != nil {
+			t.Fatalf("RecordingPlacement.ReleasePlacement: %v", err)
+		}
+		if factoryFixture.Placement.Released() != 1 {
+			t.Fatalf("Released() = %d, want 1", factoryFixture.Placement.Released())
+		}
+	})
+
 	t.Run("two factories share one durable plane", func(t *testing.T) {
 		secondFactory = NewFactoryFixture(t, store, clock)
 		status, body := secondFactory.Get(t, ctx, "/v1/sessions")
@@ -409,10 +502,19 @@ func TestOrchestrationTestKit(t *testing.T) {
 
 // TestOrchestrationTestKitAssertionsCanFail is the kit's own correctness gate.
 //
-// Every assertion the kit exports gets a row here proving it reports a failure
-// when its premise is false. An assertion with no row is an assertion nobody
-// has seen fail, and a kit made of those is worse than no kit: it converts
-// "untested" into "green".
+// Every assertion the kit exports, AND every assertion a kit fixture makes
+// internally, gets a row here proving it reports a failure when its premise is
+// false. An assertion with no row is an assertion nobody has seen fail, and a
+// kit made of those is worse than no kit: it converts "untested" into "green".
+//
+// This sentence was once false about the one assertion the kit singles out as
+// protecting another assertion's meaning. FactoryFixture.Stop checks that Serve
+// returned http.ErrServerClosed -- the check that stops AssertNoLeaks's listener
+// row passing because nothing was ever listening -- and it had no row, so
+// replacing its comparison with `if false` survived mutation. It is rowed now,
+// in both branches. The lesson is the scope of the word "exports": Stop is
+// exported, but it is an assertion made BY a fixture rather than one a case
+// calls, and that is the class this claim quietly excluded.
 func TestOrchestrationTestKitAssertionsCanFail(t *testing.T) {
 	ctx := kitContext(t)
 
@@ -476,6 +578,27 @@ func TestOrchestrationTestKitAssertionsCanFail(t *testing.T) {
 			fixture.stopped = sync.Once{}
 			fixture.Stop(tb)
 		})
+	})
+
+	t.Run("FactoryFixture.Stop rejects a Serve that returned the wrong error", func(t *testing.T) {
+		clock := NewClock(time.Unix(kitEpoch, 0))
+		store := NewStoreFixture(t, ctx, clock)
+		fixture := NewFactoryFixture(t, store, clock)
+		// Hijack the channel Stop reads. The real Serve goroutine still sends
+		// its own result to the original BUFFERED channel, so nothing blocks
+		// and no goroutine leaks; the server really is stopped by this call.
+		fixture.served = make(chan error, 1)
+		fixture.served <- errors.New("orchestrationtest: a Serve failure that is not ErrServerClosed")
+		mustFail(t, "want http.ErrServerClosed", func(tb TB) { fixture.Stop(tb) })
+	})
+
+	t.Run("FactoryFixture.Stop reports a Serve that never returns", func(t *testing.T) {
+		clock := NewClock(time.Unix(kitEpoch, 0))
+		store := NewStoreFixture(t, ctx, clock)
+		fixture := NewFactoryFixture(t, store, clock)
+		fixture.served = make(chan error) // nothing will ever arrive
+		fixture.serveWait = 50 * time.Millisecond
+		mustFail(t, "did not return after Stop", func(tb TB) { fixture.Stop(tb) })
 	})
 
 	t.Run("AssertFactoryComposesNoLinkPlane", func(t *testing.T) {
