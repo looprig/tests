@@ -252,7 +252,7 @@ func TestOrchestrationTestKit(t *testing.T) {
 		if hostFixture.Host.Placement() != sessionwire.HostPlacementPooled {
 			t.Fatalf("host placement = %q", hostFixture.Host.Placement())
 		}
-		AssertHostExposesNoRuntimeSurface(t)
+		AssertHostExposesNoRuntimeCapability(t)
 	})
 
 	t.Run("host refuses an invalid composition", func(t *testing.T) {
@@ -607,18 +607,6 @@ func TestOrchestrationTestKitAssertionsCanFail(t *testing.T) {
 		}
 	})
 
-	t.Run("AssertHostExposesNoDrainSurface names what would unblock I2.3", func(t *testing.T) {
-		mustFail(t, "no longer blocked", func(tb TB) {
-			saved := hostDrainSurfaceNames
-			// *host.Host does export Capacity; standing it in for "StartDrain"
-			// proves the assertion reads the real method set rather than a list
-			// that happens to match nothing.
-			hostDrainSurfaceNames = []string{"Capacity"}
-			defer func() { hostDrainSurfaceNames = saved }()
-			AssertHostExposesNoDrainSurface(tb)
-		})
-	})
-
 	t.Run("FactoryFixture.Post reports an unreachable server", func(t *testing.T) {
 		clock := NewClock(time.Unix(kitEpoch, 0))
 		store := NewStoreFixture(t, ctx, clock)
@@ -659,14 +647,44 @@ func TestOrchestrationTestKitAssertionsCanFail(t *testing.T) {
 		}
 	})
 
-	t.Run("AssertHostExposesNoRuntimeSurface names what would unblock I0.2", func(t *testing.T) {
-		mustFail(t, "no longer blocked", func(tb TB) {
-			saved := hostRuntimeSurfaceNames
-			// *host.Host does export Capacity; standing it in for "Serve"
-			// proves the assertion reads the real method set.
-			hostRuntimeSurfaceNames = []string{"Capacity"}
-			defer func() { hostRuntimeSurfaceNames = saved }()
-			AssertHostExposesNoRuntimeSurface(tb)
-		})
+	t.Run("the host surface wires fire on a runtime capability, whatever carries it", func(t *testing.T) {
+		// The positive control for BOTH widened wires, and it is the row that
+		// makes the widening real rather than argued.
+		//
+		// The narrow wires these replace read *host.Host's method set. This one
+		// stands a verb in on the module's whole exported surface -- the shape a
+		// review proved the old wires blind to: a separate exported type, or a
+		// package-level func. The substitution is at the VOCABULARY, because the
+		// surface itself belongs to another module and this kit must not write
+		// into it.
+		saved := runtimeVerbs
+		// "Capacity" is a real method on *host.Host and "New" is a real
+		// package-level func, so standing them in proves the scan reads both
+		// declaration forms rather than a list that happens to match nothing.
+		runtimeVerbs = []string{"Capacity"}
+		mustFail(t, "no longer blocked", func(tb TB) { AssertHostExposesNoRuntimeCapability(tb) })
+		runtimeVerbs = []string{"New"}
+		mustFail(t, "no longer blocked", func(tb TB) { AssertHostExposesNoRuntimeCapability(tb) })
+		runtimeVerbs = saved
+
+		savedDrain := drainVerbs
+		drainVerbs = []string{"Capacity"}
+		defer func() { drainVerbs = savedDrain }()
+		mustFail(t, "no longer blocked", func(tb TB) { AssertHostExposesNoDrainCapability(tb) })
+	})
+
+	t.Run("the host surface scan refuses to be vacuous", func(t *testing.T) {
+		// An absence assertion that read no files would report "no runtime
+		// surface" forever. The guard is rowed rather than trusted.
+		surface := hostExportedNames(t)
+		if len(surface) == 0 {
+			t.Fatalf("the host surface scan found no exported names at all")
+		}
+		if _, ok := surface["New"]; !ok {
+			t.Fatalf("the host surface scan missed host.New; it is not reading the module")
+		}
+		if _, ok := surface["NewRigTarget"]; !ok {
+			t.Fatalf("the host surface scan missed department.NewRigTarget; it reads only one package")
+		}
 	})
 }

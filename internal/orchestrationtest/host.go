@@ -8,8 +8,6 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
-	"reflect"
-	"sort"
 	"sync"
 	"time"
 
@@ -219,32 +217,12 @@ func (a *FixedCredentialAuth) Calls() int {
 	return a.calls
 }
 
-// hostRuntimeSurfaceNames are method names whose appearance on *host.Host would
-// mean Host has grown the exported composition surface this kit is blocked on.
-var hostRuntimeSurfaceNames = []string{"Attach", "Close", "Handler", "Run", "Serve", "ServeHTTP", "Start", "Stop"}
-
-// AssertHostExposesNoRuntimeSurface is a TRIP-WIRE, not a preference.
+// The narrow runtime trip-wire lived here and is REPLACED by
+// AssertHostExposesNoRuntimeCapability in hostsurface.go.
 //
-// The kit cannot drive Host's HostLink server because no exported Host surface
-// runs anything, so runbook 07 task I0.2 is blocked on a release that gives
-// Host one. This assertion records that premise in executable form. It fails
-// the DAY Host grows any of those methods -- which is the day I0.2 unblocks
-// and the day the surrounding "we fake nothing here because we cannot drive
-// it" comments stop being true. An unverified absence claim is as wide as an
-// unverified presence claim; this is the verification.
-func AssertHostExposesNoRuntimeSurface(tb TB) {
-	tb.Helper()
-	hostType := reflect.TypeOf(&host.Host{})
-	found := make([]string, 0, len(hostRuntimeSurfaceNames))
-	for _, name := range hostRuntimeSurfaceNames {
-		if _, ok := hostType.MethodByName(name); ok {
-			found = append(found, name)
-		}
-	}
-	if len(found) == 0 {
-		return
-	}
-	sort.Strings(found)
-	tb.Fatalf("orchestrationtest: *host.Host now exports %v. Host has grown a composition surface, "+
-		"so runbook 07 I0.2 is no longer blocked: drive the HostLink server for real and delete this trip-wire", found)
-}
+// It reflected over *host.Host's method set. The subject was right -- the
+// dependency rather than this kit's fixture -- but it read ONE syntactic form of
+// it, and a review built the likely alternative: a separate exported Runtime
+// type carrying Serve/Start, plus a package-level func host.Serve. The wire
+// stayed green. host.Host is documented as an immutable configuration value, so
+// that is the shape a runtime surface will probably arrive in.

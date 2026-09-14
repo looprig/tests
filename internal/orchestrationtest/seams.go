@@ -52,6 +52,7 @@ type StoreCommands struct {
 
 	mu       sync.Mutex
 	due      []sessionstore.ListDueCommandsRequest
+	claims   []sessionstore.AcquireReconciliationClaimRequest
 	admitted int
 }
 
@@ -103,8 +104,42 @@ func (c *StoreCommands) ListDueCommands(ctx context.Context, req sessionstore.Li
 	return c.Store.ListDueCommands(ctx, req)
 }
 
-// AcquireReconciliationClaim satisfies factory.Commands.
+// ClaimRequests reports every reconciliation claim this replica's sweeper
+// attempted, in order.
+//
+// It exists because the holder id is the ONLY thing that suppresses duplicate
+// work between two replicas, and nothing else in this module can see which
+// string Factory actually files. A row that called the store directly would be
+// exercising SessionStore's compare-and-swap against two strings the TEST
+// supplies -- which is what this case used to do, and a Factory filing every
+// claim under one constant holder id survived it.
+func (c *StoreCommands) ClaimRequests() []sessionstore.AcquireReconciliationClaimRequest {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return append([]sessionstore.AcquireReconciliationClaimRequest(nil), c.claims...)
+}
+
+// ClaimHolders reports the distinct holder ids this replica's sweeper filed
+// under.
+func (c *StoreCommands) ClaimHolders() []string {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	seen := map[string]bool{}
+	holders := []string{}
+	for _, req := range c.claims {
+		if !seen[req.HolderID] {
+			seen[req.HolderID] = true
+			holders = append(holders, req.HolderID)
+		}
+	}
+	return holders
+}
+
+// AcquireReconciliationClaim satisfies factory.Commands and records the claim.
 func (c *StoreCommands) AcquireReconciliationClaim(ctx context.Context, req sessionstore.AcquireReconciliationClaimRequest) (sessionstore.ReconciliationClaimEntry, error) {
+	c.mu.Lock()
+	c.claims = append(c.claims, req)
+	c.mu.Unlock()
 	return c.Store.AcquireReconciliationClaim(ctx, req)
 }
 

@@ -139,7 +139,7 @@ func TestFactoryClientLinkIsComposedButNotYetDrivable(t *testing.T) {
 		// can do today is observe them arriving at a subscriber, because the
 		// only publisher into a session channel is a Host live tail and no Host
 		// can run.
-		orchestrationtest.AssertHostExposesNoRuntimeSurface(t)
+		orchestrationtest.AssertHostExposesNoRuntimeCapability(t)
 
 		for i := 1; i <= 3; i++ {
 			store.AppendPublicEvent(ctx, session,

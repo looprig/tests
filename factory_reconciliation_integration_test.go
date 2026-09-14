@@ -75,6 +75,46 @@ func awaitDue(t *testing.T, commands *orchestrationtest.StoreCommands, want int)
 	}
 }
 
+// awaitClaims polls until one replica's sweeper has filed at least one
+// reconciliation claim, and FAILS naming the replica rather than hanging.
+// seedOverdueCommand admits one command whose apply deadline has already passed
+// at the kit clock, which is what makes it settleable due work.
+func seedOverdueCommand(t *testing.T, ctx context.Context, store *orchestrationtest.StoreFixture, clock *orchestrationtest.Clock, tag string) sessionwire.SessionID {
+	t.Helper()
+	session := store.SeedSession(ctx, blockedAgent, string(blockedCompatibility))
+	now := clock.Now()
+	if _, _, err := store.Store.AdmitCommand(ctx, sessionstore.AdmitCommandRequest{
+		TenantID:                 store.Tenant,
+		SessionID:                session,
+		CommandID:                sessionwire.CommandID("orchestrationtest-claim-" + tag + "-" + string(session)),
+		ProposedRuntimeCommandID: sessionstore.RuntimeCommandID(kitRuntimeCommandUUID()),
+		Kind:                     "input",
+		Payload:                  []byte(`{"text":"claim me"}`),
+		AcceptedAt:               now.Add(-time.Minute),
+		ApplyDeadline:            now.Add(-time.Second),
+	}); err != nil {
+		t.Fatalf("admitting overdue work for %s: %v", tag, err)
+	}
+	return session
+}
+
+func awaitClaims(t *testing.T, commands *orchestrationtest.StoreCommands, who string) []string {
+	t.Helper()
+	deadline := time.Now().Add(30 * time.Second)
+	for {
+		holders := commands.ClaimHolders()
+		if len(holders) > 0 {
+			return holders
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("%s's sweeper filed no reconciliation claim in 30s; either it is not sweeping or "+
+				"the seeded work is not due", who)
+			return nil
+		}
+		time.Sleep(time.Millisecond)
+	}
+}
+
 func awaitDueGates(t *testing.T, gates *orchestrationtest.StoreGates, want int) []sessionstore.ListDueGatesRequest {
 	t.Helper()
 	deadline := time.Now().Add(30 * time.Second)
@@ -221,63 +261,53 @@ func TestFactoryReconciliationSweeps(t *testing.T) {
 		}
 	})
 
-	t.Run("case 3: two replicas hold distinct claim identities", func(t *testing.T) {
-		// The duplicate-suppression mechanism is the reconciliation claim, and
-		// the claim is filed under the replica's HOLDER id. Two replicas sharing
-		// one string would each read the other's claim as its own, and the case
-		// would pass with no suppression happening at all -- which is why
-		// FactorySeams.ReplicaID is a required structural input here and why
-		// this row asserts the two differ before asserting anything about them.
-		replicaB := orchestrationtest.NewFactoryFixtureWithSeams(t, store, clock, orchestrationtest.FactorySeams{
-			ReplicaID: "orchestrationtest-replica-b",
-			Reconcile: reconcileLimits(),
-		})
-		if replicaA.ReplicaID == replicaB.ReplicaID {
-			t.Fatalf("both replicas composed the holder id %q", replicaA.ReplicaID)
-		}
-
-		session := store.SeedSession(ctx, blockedAgent, string(blockedCompatibility))
-		held, err := store.Store.AcquireReconciliationClaim(ctx, sessionstore.AcquireReconciliationClaimRequest{
-			TenantID:  store.Tenant,
+	t.Run("case 3: a claim refuses a peer and recovers after expiry", func(t *testing.T) {
+		// The durable half, and labelled as what it is: this exercises
+		// SessionStore's claim compare-and-swap directly, with the two holder
+		// ids supplied by the test. It is NOT evidence about Factory -- the row
+		// above is -- and the previous version of this file said otherwise.
+		//
+		// It is kept because the mechanism it covers is the one the row above
+		// depends on: distinct holder ids are only worth anything if the store
+		// refuses a second holder and releases on expiry.
+		isolated := orchestrationtest.NewStoreFixture(t, ctx, clock)
+		session := isolated.SeedSession(ctx, blockedAgent, string(blockedCompatibility))
+		held, err := isolated.Store.AcquireReconciliationClaim(ctx, sessionstore.AcquireReconciliationClaimRequest{
+			TenantID:  isolated.Tenant,
 			SessionID: session,
-			HolderID:  replicaA.ReplicaID,
+			HolderID:  "orchestrationtest-holder-one",
 			ExpiresAt: clock.Now().Add(time.Minute),
 		})
 		if err != nil {
-			t.Fatalf("replica A could not claim: %v", err)
+			t.Fatalf("the first holder could not claim: %v", err)
 		}
-		if held.Claim.HolderID != replicaA.ReplicaID {
-			t.Fatalf("the claim names holder %q, want %q", held.Claim.HolderID, replicaA.ReplicaID)
+		if held.Claim.HolderID != "orchestrationtest-holder-one" {
+			t.Fatalf("the claim names holder %q", held.Claim.HolderID)
 		}
-		// The peer is refused while the claim is live. This is the whole of
-		// "two replicas do not create duplicate placements" at the layer this
-		// module can observe: the second holder never gets the work.
-		if _, err := store.Store.AcquireReconciliationClaim(ctx, sessionstore.AcquireReconciliationClaimRequest{
-			TenantID:  store.Tenant,
+		if _, err := isolated.Store.AcquireReconciliationClaim(ctx, sessionstore.AcquireReconciliationClaimRequest{
+			TenantID:  isolated.Tenant,
 			SessionID: session,
-			HolderID:  replicaB.ReplicaID,
+			HolderID:  "orchestrationtest-holder-two",
 			ExpiresAt: clock.Now().Add(time.Minute),
 		}); err == nil {
-			t.Fatalf("replica B took a claim replica A holds")
+			t.Fatalf("a second holder took a live claim")
 		}
-
 		// And it RECOVERS: a holder that never returns must not own the session
 		// forever, which is the "claims expire/recover after reconciler crash"
 		// half. The clock moves past the expiry rather than the test sleeping.
 		clock.Advance(2 * time.Minute)
-		recovered, err := store.Store.AcquireReconciliationClaim(ctx, sessionstore.AcquireReconciliationClaimRequest{
-			TenantID:  store.Tenant,
+		recovered, err := isolated.Store.AcquireReconciliationClaim(ctx, sessionstore.AcquireReconciliationClaimRequest{
+			TenantID:  isolated.Tenant,
 			SessionID: session,
-			HolderID:  replicaB.ReplicaID,
+			HolderID:  "orchestrationtest-holder-two",
 			ExpiresAt: clock.Now().Add(time.Minute),
 		})
 		if err != nil {
-			t.Fatalf("replica B could not recover an expired claim: %v", err)
+			t.Fatalf("the second holder could not recover an expired claim: %v", err)
 		}
-		if recovered.Claim.HolderID != replicaB.ReplicaID {
-			t.Fatalf("the recovered claim names %q, want replica B", recovered.Claim.HolderID)
+		if recovered.Claim.HolderID != "orchestrationtest-holder-two" {
+			t.Fatalf("the recovered claim names %q", recovered.Claim.HolderID)
 		}
-		replicaB.Stop(t)
 	})
 
 	t.Run("case 4: the gate sweep runs and Factory does not resolve an open gate", func(t *testing.T) {
@@ -316,6 +346,74 @@ func TestFactoryReconciliationSweeps(t *testing.T) {
 		}
 		if page.OpenGateCount == 0 {
 			t.Fatalf("the open gate count fell to zero while the gate is still open")
+		}
+	})
+
+	t.Run("case 3: each replica's own sweeper files claims under its own holder id", func(t *testing.T) {
+		// THIS is the row that makes case 3's replica half evidence about
+		// Factory, and it replaces one that was not.
+		//
+		// The previous version composed two Factory servers, asserted their
+		// ReplicaID fields differed, and then called
+		// store.Store.AcquireReconciliationClaim three times itself. Factory
+		// was not in the path: it demonstrated SessionStore's claim CAS against
+		// two strings the TEST supplied. A Factory that filed EVERY claim under
+		// one constant holder id -- precisely the deployment failure the row's
+		// own comment named -- survived that as a mutation, exit 0.
+		//
+		// The holder id is the only thing that suppresses duplicate work
+		// between replicas, so what has to be observed is which string each
+		// replica's OWN SWEEPER files. The composed command seam records it.
+		// The two replicas are observed on SEPARATE work rather than racing for
+		// one row, and that is a deliberate choice with a measured reason.
+		//
+		// Factory's own predicate refuses a row whose claim is live BEFORE it
+		// attempts a claim of its own (settleable -> DispositionClaimLive), and
+		// the winner then SETTLES the row, so it stops being due. Two replicas
+		// contending for one command therefore produce exactly one claim, and
+		// the loser files nothing -- which is the suppression working, and is
+		// also indistinguishable from a replica that is not sweeping at all.
+		// Measured: waiting for the peer's claim on a contended row times out.
+		//
+		// So each replica is given its own due row, and the assertion is the
+		// one that actually discriminates: the string each sweeper files.
+		seedOverdueCommand(t, ctx, store, clock, "a")
+		holdersA := awaitClaims(t, commands, "replica A")
+		if len(holdersA) != 1 || holdersA[0] != replicaA.ReplicaID {
+			t.Fatalf("replica A's sweeper filed claims under %v, want exactly [%q]", holdersA, replicaA.ReplicaID)
+		}
+
+		// Replica A is stopped and replica B composed only now, so the second
+		// row is unambiguously B's. Stop shuts the sweeps down and WAITS for
+		// them, so this is a fence rather than a hope -- which is why this
+		// subtest runs last.
+		replicaA.Stop(t)
+		second := orchestrationtest.NewStoreCommands(store.Store)
+		replicaB := orchestrationtest.NewFactoryFixtureWithSeams(t, store, clock, orchestrationtest.FactorySeams{
+			Commands:  second,
+			ReplicaID: "orchestrationtest-replica-b",
+			Reconcile: reconcileLimits(),
+		})
+		t.Cleanup(func() { replicaB.Stop(t) })
+		if replicaA.ReplicaID == replicaB.ReplicaID {
+			t.Fatalf("both replicas composed the holder id %q", replicaA.ReplicaID)
+		}
+		seedOverdueCommand(t, ctx, store, clock, "b")
+		holdersB := awaitClaims(t, second, "replica B")
+		if len(holdersB) != 1 || holdersB[0] != replicaB.ReplicaID {
+			t.Fatalf("replica B's sweeper filed claims under %v, want exactly [%q]", holdersB, replicaB.ReplicaID)
+		}
+
+		if holdersA[0] == holdersB[0] {
+			t.Fatalf("both replicas' sweepers filed under one holder id %q; a claim cannot suppress "+
+				"duplicate work between replicas that share an identity", holdersA[0])
+		}
+		// Neither replica ever filed under the other's name. Without this the
+		// pair above would pass for a build that used whichever id it saw last.
+		for _, holder := range second.ClaimHolders() {
+			if holder == replicaA.ReplicaID {
+				t.Fatalf("replica B's sweeper filed a claim under replica A's holder id")
+			}
 		}
 	})
 

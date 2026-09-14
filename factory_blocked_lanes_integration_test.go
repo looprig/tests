@@ -100,8 +100,8 @@ func TestIntegrationLaneBlockers(t *testing.T) {
 		// Unchanged by A9.1 stage 2, and deliberately re-asserted rather than
 		// assumed: the Host lane is complete and host v0.1.0 is released, and
 		// neither fact grew an exported composition or drain surface.
-		orchestrationtest.AssertHostExposesNoRuntimeSurface(t)
-		orchestrationtest.AssertHostExposesNoDrainSurface(t)
+		orchestrationtest.AssertHostExposesNoRuntimeCapability(t)
+		orchestrationtest.AssertHostExposesNoDrainCapability(t)
 		if hostFixture.Host.Placement() != sessionwire.HostPlacementPooled {
 			t.Fatalf("the drain premise was recorded against a non-pooled Host")
 		}
