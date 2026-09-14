@@ -14,15 +14,11 @@
 //
 // # What this file does NOT do, and where to find out why
 //
-// I1.1's five cases do not all reach a composed Factory. Cases 3 and 4 --
-// disconnect a browser, commit three enduring events, reconnect to the other
-// Factory with the old cursor; kill Factory A after it has buffered -- are
-// assertions about a ClientLink subscription. factory.New composes no ClientLink
-// handler, /v1/realtime answers 501, and the kit's
-// AssertFactoryComposesNoLinkPlane holds that premise. There is no cursor to
-// carry across a reconnect because there is no connection. Those two cases are
-// recorded as owed in factory_blocked_lanes_integration_test.go rather than
-// approximated with a fake of both ends of a link that does not exist.
+// I1.1 cases 3 and 4 -- disconnect a browser, commit three enduring events,
+// reconnect to the other Factory with the old cursor; kill Factory A after it
+// has buffered -- live in factory_reconnect_integration_test.go, which drives a
+// real ClientLink against the handler A9.1 stage 2 composed. The objects leg of
+// case 1 lives in factory_object_reads_integration_test.go.
 
 package tests
 
@@ -33,10 +29,12 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"strings"
 	"testing"
 	"time"
 
 	sessionwire "github.com/looprig/core/sessionwire/v1"
+	"github.com/looprig/factory"
 	"github.com/looprig/host/department"
 	"github.com/looprig/sessionstore"
 	"github.com/looprig/tests/internal/orchestrationtest"
@@ -187,12 +185,65 @@ func TestFactoryColdReadsWithEveryHostStopped(t *testing.T) {
 		}
 	})
 
-	t.Run("the agents leg is reachable but cannot discriminate", func(t *testing.T) {
-		orchestrationtest.AssertFactoryAdvertisesNoLaunchTargets(t, ctx, factoryA)
-	})
+	t.Run("the agents leg discriminates on the target directory", func(t *testing.T) {
+		// This row used to be a trip-wire recording that /v1/agents could not
+		// discriminate: the route aggregates the deployment's CONFIGURED launch
+		// templates against the observed directory, and factory.New exposed no
+		// option to supply one, so the answer was the empty list whatever the
+		// directory held. WithDepartment now exists, so the leg is a real cold
+		// read and is driven as one.
+		//
+		// The assertion is a DIFFERENCE across the directory's two states, not a
+		// literal body: a fixed expected body would pass for a route that read
+		// no directory at all, which is the exact failure this row replaces.
+		advertised := orchestrationtest.NewFactoryFixtureWithSeams(t, store, clock, orchestrationtest.FactorySeams{
+			Templates: []factory.LaunchTemplate{
+				orchestrationtest.KitLaunchTemplate(coldReadAgent, string(coldReadCompatibility)),
+			},
+		})
+		t.Cleanup(func() { advertised.Stop(t) })
 
-	t.Run("the objects leg of case 1 and of I1.1-hostgone is blocked", func(t *testing.T) {
-		orchestrationtest.AssertFactoryComposesNoObjectPlane(t, ctx, factoryA, resident)
+		key := sessionstore.HostTargetKey{
+			AgentID:                coldReadAgent,
+			RuntimeCompatibilityID: string(coldReadCompatibility),
+			Placement:              sessionwire.HostPlacementPooled,
+		}
+		statusCold, cold := advertised.Get(t, ctx, "/v1/agents")
+		if statusCold != http.StatusOK {
+			t.Fatalf("GET /v1/agents with every host stopped = %d: %s", statusCold, cold)
+		}
+		// MEASURED, and the opposite of what this row first assumed: a
+		// configured template with no live capacity is omitted ENTIRELY rather
+		// than listed as unlaunchable. That is the cold answer, and it is the
+		// discriminating one -- it is a fact about the directory, not about the
+		// configuration.
+		if strings.Contains(string(cold), string(coldReadAgent)) {
+			t.Fatalf("a template with no advertised capacity is listed while every host is stopped: %s", cold)
+		}
+
+		store.PublishTarget(ctx, key, "orchestrationtest-live-host", "wss://live.internal.test/hostlink", 3)
+		statusLive, live := advertised.Get(t, ctx, "/v1/agents")
+		if statusLive != http.StatusOK {
+			t.Fatalf("GET /v1/agents with a live target = %d: %s", statusLive, live)
+		}
+		if !strings.Contains(string(live), string(coldReadAgent)) {
+			t.Fatalf("an advertised target is absent from the agents list: %s", live)
+		}
+		if bytes.Equal(cold, live) {
+			t.Fatalf("the agents list is identical with and without advertised capacity; it reads no directory: %s", live)
+		}
+
+		// And back: withdrawing the capacity must return the cold answer. The
+		// negative is rowed because "the body changed once" would also pass for
+		// a route whose answer merely varies.
+		store.DrainTarget(ctx, key, "orchestrationtest-live-host")
+		statusAgain, again := advertised.Get(t, ctx, "/v1/agents")
+		if statusAgain != http.StatusOK {
+			t.Fatalf("GET /v1/agents after the drain = %d", statusAgain)
+		}
+		if !bytes.Equal(again, cold) {
+			t.Fatalf("withdrawing the capacity did not restore the cold answer:\ncold %s\nagain %s", cold, again)
+		}
 	})
 
 	t.Run("opening a detail view causes no lease, placement, restore or runtime", func(t *testing.T) {

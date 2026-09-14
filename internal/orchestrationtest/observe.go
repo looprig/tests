@@ -4,7 +4,6 @@ package orchestrationtest
 
 import (
 	"context"
-	"fmt"
 	"io"
 	"sync"
 	"time"
@@ -141,122 +140,25 @@ func (o *ObservedReader) GetObjectMetadata(ctx context.Context, req sessionstore
 	return o.Inner.GetObjectMetadata(ctx, req)
 }
 
-// ---------------------------------------------------------------------------
-// Panic seams: the probe that tells "composed" from "driven".
-// ---------------------------------------------------------------------------
-
-// ErrSeamDriven is never returned. It exists so the panic seams below have one
-// greppable identity in a panic message.
-var ErrSeamDriven = fmt.Errorf("orchestrationtest: a seam this build believes is never driven was driven")
-
-// PanicCommands satisfies factory.Commands and panics on every method.
+// The PANIC SEAMS lived here and are DELETED. Two things killed them, and both
+// are worth carrying forward.
 //
-// It is the falsifiable half of an ABSENCE claim. factory.New ACCEPTS
-// WithCommands, validates it as non-nil, stores it -- and composeRouter never
-// passes it to the router, so no request in this build can reach the durable
-// command plane. That claim is worth exactly as much as the probe behind it: a
-// recording fake would record nothing and a reader could not tell "never
-// called" from "the case forgot to look". A panic cannot be missed, and it
-// fires on the DAY the composition changes rather than on a mutation of the
-// test.
+// First, they worked. Composed as factory.Commands against a Serve-ing Factory,
+// the seam fired from Server.Start's own sweep goroutine --
+// admission.Reconciler.Sweep -> ListDueCommands -- which is exactly the event it
+// existed to announce and is how this lane learned the command sweep was live.
 //
-// A panic is not an assertion kill and must never be counted as one in a
-// mutation table. Here the panic is the SUBJECT of the case, not its verdict:
-// the case asserts that a full traversal of every route completes WITHOUT one.
-// It RECORDS before it panics, and both halves matter. A panic raised inside an
-// http.Handler is recovered by net/http, so a handler that reached this seam
-// would close the connection rather than fail the process -- loud, but not
-// attributable. The record survives that, so the case's verdict is an ASSERTION
-// on Driven() rather than the absence of a crash. A panic raised anywhere else
-// -- a background sweep in Serve, say -- still takes the process down, which is
-// the right answer for a plane nobody expected to be running.
-type PanicCommands struct {
-	mu     sync.Mutex
-	driven []string
-}
-
-// Driven reports every method that was reached, in order.
-func (p *PanicCommands) Driven() []string {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	return append([]string(nil), p.driven...)
-}
-
-func (p *PanicCommands) panicked(method string) {
-	p.mu.Lock()
-	p.driven = append(p.driven, method)
-	p.mu.Unlock()
-	panic(fmt.Sprintf("%v: factory.Commands.%s", ErrSeamDriven, method))
-}
-
-// AdmitCommand satisfies factory.Commands.
-func (p *PanicCommands) AdmitCommand(context.Context, sessionstore.AdmitCommandRequest) (sessionstore.InboxEntry, bool, error) {
-	p.panicked("AdmitCommand")
-	return sessionstore.InboxEntry{}, false, nil
-}
-
-// GetCommand satisfies factory.Commands.
-func (p *PanicCommands) GetCommand(context.Context, sessionstore.GetCommandRequest) (sessionstore.InboxEntry, error) {
-	p.panicked("GetCommand")
-	return sessionstore.InboxEntry{}, nil
-}
-
-// RejectCommand satisfies factory.Commands.
-func (p *PanicCommands) RejectCommand(context.Context, sessionstore.RejectCommandRequest) (sessionstore.InboxEntry, error) {
-	p.panicked("RejectCommand")
-	return sessionstore.InboxEntry{}, nil
-}
-
-// ListDueCommands satisfies factory.Commands.
-func (p *PanicCommands) ListDueCommands(context.Context, sessionstore.ListDueCommandsRequest) (sessionstore.DueCommandPage, error) {
-	p.panicked("ListDueCommands")
-	return sessionstore.DueCommandPage{}, nil
-}
-
-// AcquireReconciliationClaim satisfies factory.Commands.
-func (p *PanicCommands) AcquireReconciliationClaim(context.Context, sessionstore.AcquireReconciliationClaimRequest) (sessionstore.ReconciliationClaimEntry, error) {
-	p.panicked("AcquireReconciliationClaim")
-	return sessionstore.ReconciliationClaimEntry{}, nil
-}
-
-// ReleaseReconciliationClaim satisfies factory.Commands.
-func (p *PanicCommands) ReleaseReconciliationClaim(context.Context, sessionstore.ReleaseReconciliationClaimRequest) (sessionstore.ReconciliationClaimEntry, error) {
-	p.panicked("ReleaseReconciliationClaim")
-	return sessionstore.ReconciliationClaimEntry{}, nil
-}
-
-// PanicPlacement satisfies factory.PlacementController and panics on every
-// method. See PanicCommands for why a panic rather than a recorder.
-type PanicPlacement struct {
-	mu     sync.Mutex
-	driven []string
-}
-
-// Driven reports every method that was reached, in order.
-func (p *PanicPlacement) Driven() []string {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	return append([]string(nil), p.driven...)
-}
-
-func (p *PanicPlacement) panicked(method string) {
-	p.mu.Lock()
-	p.driven = append(p.driven, method)
-	p.mu.Unlock()
-	panic(fmt.Sprintf("%v: factory.PlacementController.%s", ErrSeamDriven, method))
-}
-
-// EnsurePlacement satisfies factory.PlacementController.
-func (p *PanicPlacement) EnsurePlacement(context.Context, sessionstore.DesiredWorkload) error {
-	p.panicked("EnsurePlacement")
-	return nil
-}
-
-// ReleasePlacement satisfies factory.PlacementController.
-func (p *PanicPlacement) ReleasePlacement(context.Context, sessionwire.TenantID, sessionwire.SessionID) error {
-	p.panicked("ReleasePlacement")
-	return nil
-}
+// Second, they cannot be used again at this seam, for two independent reasons.
+// The durable command plane is now DRIVEN, so a panicking Commands turns every
+// composition that serves into a crash rather than a probe. And Factory's router
+// RECOVERS a handler panic (recoverPanic, internal/httpapi/routes.go) and
+// converts it to a 500 indistinguishable from any other internal failure, so a
+// panic at an HTTP seam carries no identity even where one would not crash.
+//
+// What replaces them is composition-site value substitution plus
+// identity-carriage assertions: two readers that can be told apart
+// (RecordingObjectStoreResolver), and recorders on the composed seams that say
+// what was ASKED FOR (StoreCommands.DueRequests, StoreGates.DueRequests).
 
 // ---------------------------------------------------------------------------
 // Durable residency helpers: what "every Host is stopped" means on the plane.

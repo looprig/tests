@@ -1,36 +1,45 @@
 //go:build integration && orchestration
 
-// This file records, in executable form, the integration-lane cases that cannot
-// be driven against the composed services released today, and drives the parts
-// of them that CAN be.
+// This file records, in executable form, the integration-lane cases that still
+// cannot be driven against the composed services, and it is much smaller than it
+// was.
 //
-// It is deliberately one file rather than four stubs. A task deferred in prose
-// disappears -- I1.1-hostgone has been deferred twice already and survived only
-// because someone re-homed it by name each time -- and a stub named after a task
-// it does not perform is worse, because a skipped row and a passing row are the
-// same colour on every dashboard. Nothing here skips. Every case asserts a
-// PREMISE, and fails on the day that premise stops holding, which is the day the
-// task it names becomes writable.
+// # What A9.1 stage 2 removed from it
 //
-// What is recorded here, and what blocks it:
+// Four premises this file used to hold have LIFTED, and each one's trip-wire
+// fired on the day it did -- which is what they were for:
 //
-//   - I1.1 cases 3 and 4 (browser disconnect/reconnect with a cursor, Factory
-//     killed mid-buffer) -- factory.New composes no ClientLink handler.
-//   - I1.3 cases 2, 3 and 4 (fixed shard sweep, claim expiry and duplicate
-//     placement, gate deadline intents) -- factory.New constructs neither
-//     internal/admission.Reconciler nor internal/reconcile's gate sweep, and
-//     both are internal to Factory.
-//   - I1.4 (link backpressure blast radius) -- there is no DeliveryBinding and
-//     no HostBinding in a composed Factory, so there is nothing to overflow.
-//   - I2.3 (pooled drain ordering) -- *host.Host exposes nothing runnable and no
-//     drain surface; the Drainer and its RPC are host-internal. Case 1's durable
-//     observable IS reachable and is driven below.
+//   - `/v1/realtime` left the 501 table (`AssertFactoryComposesNoLinkPlane`).
+//   - the control routes left 503 (`AssertFactoryComposesNoAdmissionPlane`).
+//   - `*factory.Server` grew `Start` (`AssertFactoryExposesNoReconciler`).
+//   - the command sweep reached the durable command plane, announced by the
+//     recording panic seam from `Serve`'s own sweep goroutine.
+//
+// Those four assertions are DELETED rather than inverted. A trip-wire's whole
+// job is to stop being true; keeping one after its blocker lifts turns it into a
+// claim about the past that a later reader will mistake for a claim about now.
+// The work they were holding is in factory_reconciliation_integration_test.go,
+// factory_object_reads_integration_test.go and
+// factory_reconnect_integration_test.go.
+//
+// # Two trip-wires did NOT fire, and one of those is a finding
+//
+// The Host trip-wires did not fire, and that is CORRECT: `host v0.1.0` is still
+// `New` plus accessors, so I2.3's ordering content is still blocked. They stay.
+//
+// But `AssertFactoryComposesNoObjectPlane` and
+// `AssertFactoryAdvertisesNoLaunchTargets` also did not fire, and they should
+// have: `WithObjectPolicy` and `WithDepartment` both arrived. They went BLIND
+// rather than staying true, because each probed a composition the KIT builds
+// rather than a capability Factory has -- and the kit's composition still
+// omitted the new options, so the answer never changed. That is the failure mode
+// of a trip-wire written against one's own fixture, and it is why both are
+// deleted here and replaced by cases that drive the real thing.
 
 package tests
 
 import (
 	"context"
-	"net/http"
 	"testing"
 	"time"
 
@@ -46,8 +55,8 @@ const (
 	blockedCompatibility = department.CompatibilityID("orchestrationtest-blocked-compat-1")
 )
 
-// TestIntegrationLaneBlockers holds the premises the blocked integration cases
-// rest on, and drives the reachable half of I2.3 case 1.
+// TestIntegrationLaneBlockers holds the premises the still-blocked cases rest
+// on, and drives the reachable half of I2.3 case 1.
 func TestIntegrationLaneBlockers(t *testing.T) {
 	ctx := coldReadContext(t)
 	baseline := orchestrationtest.CaptureGoroutines()
@@ -58,25 +67,25 @@ func TestIntegrationLaneBlockers(t *testing.T) {
 	served := orchestrationtest.NewFactoryFixture(t, store, clock)
 	session := store.SeedSession(ctx, blockedAgent, string(blockedCompatibility))
 
-	t.Run("I1.1 cases 3 and 4 need a ClientLink nothing composes", func(t *testing.T) {
-		// A browser disconnect, three enduring events, a reconnect to the other
-		// replica with the old cursor, and a Factory killed after buffering are
-		// all assertions about ONE subscription's delivery. There is no
-		// subscription: /v1/realtime is a pending route.
-		orchestrationtest.AssertFactoryComposesNoLinkPlane(t, ctx, served)
-	})
-
-	t.Run("I1.4 has nothing to overflow", func(t *testing.T) {
+	t.Run("I1.4 waits on a Host, not on Factory", func(t *testing.T) {
 		// I1.4's four cases name a DeliveryBinding, a HostBinding, the selected
 		// Centrifuge slow-consumer threshold, and the enduring/ephemeral drop
-		// policy. All four live behind the same absent composition as above, and
-		// case 3 in particular says "do not encode an assumed library behavior"
-		// -- which is precisely what a fake of both ends would do.
+		// policy. Factory now composes all of that machinery -- the ClientLink
+		// node, the HostLink pool and the routing table.
 		//
-		// factory.New ACCEPTS WithClientLinkLimits and WithHostLinkLimits and
-		// validates them, so a composition looks configured for a plane that is
-		// never built. That gap is the thing worth recording: the accessors
-		// answer, and no request can reach anything they bound.
+		// What it cannot do is FILL a DeliveryBinding. A session channel's
+		// records come from the Host live tail (routing.Tail, "the Host live
+		// tail's control surface for one session"), which arrives over HostLink
+		// from a running Host. There is no running Host, so there is no stream
+		// to overflow, and I1.4 case 3's own instruction -- "record whether it
+		// closes a subscription or physical link ... do not encode an assumed
+		// library behavior" -- forbids the only alternative, which is a fake of
+		// both ends.
+		//
+		// So the blocker MOVED rather than lifted: it was Factory's composition
+		// and it is now Host's missing runtime surface, which the rows below
+		// hold. The limits are still validated and still reachable, which is
+		// what this row proves is not the obstacle.
 		clientLimits := served.Server.ClientLinkLimits()
 		hostLimits := served.Server.HostLinkLimits()
 		if clientLimits.MaxConnections <= 0 || clientLimits.PerConnectionQueueBytes <= 0 {
@@ -85,76 +94,12 @@ func TestIntegrationLaneBlockers(t *testing.T) {
 		if hostLimits == (factory.HostLinkLimits{}) {
 			t.Fatalf("the composed host link limits are zero: %+v", hostLimits)
 		}
-		orchestrationtest.AssertFactoryComposesNoLinkPlane(t, ctx, served)
-	})
-
-	t.Run("I1.2, I1.3 case 1 and I2.3's admission half need an admission service", func(t *testing.T) {
-		orchestrationtest.AssertFactoryComposesNoAdmissionPlane(t, ctx, served, session)
-	})
-
-	t.Run("I1.3 cases 2-4 need a sweep no composition runs", func(t *testing.T) {
-		orchestrationtest.AssertFactoryExposesNoReconciler(t)
-	})
-
-	t.Run("no composed route reaches the durable command plane", func(t *testing.T) {
-		// This is the half reflection cannot see. A sweep armed by a timer
-		// inside Serve would export no method at all, and a control route wired
-		// to a real admission service would reach Commands without exporting
-		// one either. So the command plane is composed as a seam that PANICS,
-		// and every route this build serves is driven through it.
-		//
-		// A panic is the SUBJECT here, not the verdict: the case asserts that a
-		// full traversal completes without one. It is not an assertion kill and
-		// must not be scored as one.
-		commands := &orchestrationtest.PanicCommands{}
-		placement := &orchestrationtest.PanicPlacement{}
-		probe := orchestrationtest.NewFactoryFixtureWithSeams(t, store, clock, orchestrationtest.FactorySeams{
-			Commands:  commands,
-			Placement: placement,
-		})
-		for _, path := range []string{
-			"/v1/bootstrap", "/v1/agents", "/v1/capabilities", "/v1/sessions", "/v1/csrf-token",
-			orchestrationtest.SessionPath(session, "/status"),
-			orchestrationtest.SessionPath(session, "/journal"),
-			orchestrationtest.SessionPath(session, "/gates"),
-			orchestrationtest.SessionPath(session, "/objects/obj-1"),
-			"/v1/realtime",
-		} {
-			if status, body := probe.Get(t, ctx, path); status >= 500 && status != http.StatusServiceUnavailable &&
-				status != http.StatusNotImplemented {
-				t.Fatalf("GET %s answered %d: %s", path, status, body)
-			}
-		}
-		for _, route := range orchestrationtest.NotComposedControlRoutes {
-			probe.Post(t, ctx, orchestrationtest.SessionPath(session, route.Suffix), []byte(route.Body))
-		}
-		// Reaching here without a panic is the finding: WithCommands and
-		// WithPlacementController are accepted, validated, stored and never
-		// read. The day either is wired, this case dies with a panic naming the
-		// method -- loudly, and at the composition change rather than at a
-		// mutation of this test.
-		//
-		// Sanity: the probe really did serve. Without this the traversal could
-		// have been empty and the absence of a panic would mean nothing.
-		if status, _ := probe.Get(t, ctx, "/v1/sessions"); status != http.StatusOK {
-			t.Fatalf("the panic-seam probe served %d for the tenant list; the traversal proves nothing", status)
-		}
-		// The verdict is this assertion rather than the absence of a crash.
-		// net/http RECOVERS a panic raised inside a handler, so a route that
-		// reached either seam would have closed its connection and left the
-		// process alive; the seams record before they panic so that case is
-		// attributable rather than merely noisy.
-		if driven := commands.Driven(); len(driven) != 0 {
-			t.Fatalf("a composed route reached the durable command plane: %v. Factory now wires "+
-				"WithCommands, so runbook 07 I1.2 and I1.3 are no longer blocked on composition", driven)
-		}
-		if driven := placement.Driven(); len(driven) != 0 {
-			t.Fatalf("a composed route reached the placement controller: %v. Factory now wires "+
-				"WithPlacementController", driven)
-		}
 	})
 
 	t.Run("I2.3 needs a runnable Host with a drain surface", func(t *testing.T) {
+		// Unchanged by A9.1 stage 2, and deliberately re-asserted rather than
+		// assumed: the Host lane is complete and host v0.1.0 is released, and
+		// neither fact grew an exported composition or drain surface.
 		orchestrationtest.AssertHostExposesNoRuntimeSurface(t)
 		orchestrationtest.AssertHostExposesNoDrainSurface(t)
 		if hostFixture.Host.Placement() != sessionwire.HostPlacementPooled {
@@ -163,16 +108,13 @@ func TestIntegrationLaneBlockers(t *testing.T) {
 	})
 
 	t.Run("I2.3 case 1's durable observable: drain un-ranks target capacity", func(t *testing.T) {
-		// This is the one leg of I2.3 that does not need a running Host. "Drain
+		// The one leg of I2.3 that does not need a running Host. "Drain
 		// un-ranks target capacity" is a durable fact about the target
-		// directory, and the directory is the SAME seam Factory reads through:
-		// the assertion below goes through the kit's real Directory adapter,
-		// which is the object factory.New was composed with.
+		// directory, and the directory is the SAME seam Factory reads through.
 		//
 		// What it does NOT prove is the ORDERING in I2.3 case 1 -- that the
 		// un-rank happens BEFORE the Host stops admitting. Admission is the
-		// Host's own state and no composed surface reports it. Do not read this
-		// row as case 1 discharged; read it as case 1's observable half.
+		// Host's own state and no composed surface reports it.
 		key := sessionstore.HostTargetKey{
 			AgentID:                blockedAgent,
 			RuntimeCompatibilityID: string(blockedCompatibility),

@@ -52,6 +52,15 @@ type FactoryFixture struct {
 	Placement *RecordingPlacement
 	Directory *StoreDirectory
 
+	// Commands, Gates and Targets are the composed durable seams the three
+	// periodic sweeps drive. They are exposed so a case can read what a sweep
+	// ASKED FOR rather than infer a sweep happened from elapsed time.
+	Commands  factory.Commands
+	Gates     *StoreGates
+	Targets   *StoreHostTargets
+	Token     *FixedServiceToken
+	ReplicaID string
+
 	served  chan error
 	stopped sync.Once
 
@@ -88,10 +97,11 @@ func NewFactoryFixtureWithReader(tb TB, store *StoreFixture, clock *Clock, reade
 // FactorySeams names the collaborators a case wants to choose for itself.
 //
 // Every zero member takes the kit's default, so a case states only the seam it
-// is making a claim about. Commands and Placement exist here so a case can
-// substitute PanicCommands and PanicPlacement: a seam that factory.New accepts
-// and never calls is an ABSENCE claim, and an absence claim with no probe
-// behind it is as wide as an unverified presence claim.
+// is making a claim about. Substitution HERE, at the composition site, is the
+// technique this kit relies on for identity: Factory's router recovers a handler
+// panic and answers 500, so a panic probe at an HTTP seam is indistinguishable
+// from any other internal failure. Two collaborators a case can tell apart are
+// distinguishable; a panic is not.
 type FactorySeams struct {
 	// Reader is the durable read plane. Nil takes the real Store.
 	Reader SessionReaderSeam
@@ -104,6 +114,28 @@ type FactorySeams struct {
 	// Directory is the observed target directory. Nil takes a StoreDirectory
 	// over the real Store.
 	Directory factory.Directory
+
+	// ReplicaID names this replica. Empty mints a distinct one.
+	//
+	// It must DIFFER between two replicas of one deployment: it is the holder
+	// identity a reconciliation claim is filed under, so two Factories sharing
+	// one string would each see the other's claim as its own and the
+	// duplicate-suppression case would pass without any suppression happening.
+	ReplicaID string
+
+	// Templates are the launch targets this deployment advertises. Nil takes
+	// none, which is a supported composition and the one every read-only case
+	// uses.
+	Templates []factory.LaunchTemplate
+
+	// ObjectPolicy and ObjectStore compose the object plane. They travel
+	// TOGETHER: factory.New refuses a policy without a resolver, and the
+	// router's legacy-binding fallback is why.
+	ObjectPolicy factory.ObjectPolicy
+	ObjectStore  factory.ObjectStoreResolver
+
+	// Reconcile bounds the periodic sweeps. Zero takes Factory's defaults.
+	Reconcile factory.ReconcileLimits
 }
 
 // NewFactoryFixtureWithSeams composes a Factory over chosen collaborators.
@@ -135,29 +167,77 @@ func NewFactoryFixtureWithSeams(tb TB, store *StoreFixture, clock *Clock, seams 
 		storeDirectory = &StoreDirectory{Store: store.Store}
 		directory = storeDirectory
 	}
+	gates := NewStoreGates(store.Store)
+	targets := &StoreHostTargets{Store: store.Store}
+	token := &FixedServiceToken{Token: KitServiceToken}
+	replica := seams.ReplicaID
+	if replica == "" {
+		replica = "orchestrationtest-replica-" + randomSuffix(tb)
+	}
+	// The service identity is a SERVICE principal, not an actor. Factory
+	// authorizes the cross-tenant sweep for a service identity and for nothing
+	// else, so composing an actor here would compose a replica whose sweeps
+	// cannot authorize -- and the symptom would be a sweep that runs and
+	// silently does nothing.
+	service, err := identity.NewPrincipal(store.Tenant, "orchestrationtest-service", identity.KindService)
+	if err != nil {
+		tb.Fatalf("orchestrationtest: minting the service identity: %v", err)
+		return nil
+	}
 
-	server, err := factory.New(
+	// The listener is opened BEFORE the composition, not after, so the CSRF
+	// guard can trust the loopback authority the listener actually got.
+	//
+	// That matters for exactly one caller and it is not cosmetic: a WebSocket
+	// dialer cannot set the Host header through net/http's header map, so a
+	// ClientLink upgrade arrives with the authority `127.0.0.1:<port>`. The
+	// guard rejects an untrusted authority before anything else, so a kit that
+	// trusted only KitOrigin could compose a ClientLink it could never connect
+	// to -- and the failure reads as "websocket: bad handshake", a long way
+	// from its cause.
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		tb.Fatalf("orchestrationtest: opening a loopback listener: %v", err)
+		return nil
+	}
+	loopbackOrigin := "http://" + listener.Addr().String()
+
+	options := []factory.Option{
 		factory.WithCredentialVerifier(&FixedBearerVerifier{Tenant: store.Tenant, Credential: KitActorCredential, Clock: clock}),
 		factory.WithAuthorizer(authorizer),
 		factory.WithSessionReader(reader),
 		factory.WithCommands(commands),
 		factory.WithDirectory(directory),
 		factory.WithPlacementController(placement),
+		factory.WithCatalog(store.Store),
+		factory.WithGates(gates),
+		factory.WithHostTargets(targets),
+		factory.WithHostLinkCredential(token),
+		factory.WithServiceIdentity(service),
+		factory.WithReplicaID(replica),
 		factory.WithClock(clock),
 		factory.WithCSRF(identity.CSRFConfig{
 			SharedKey:      make([]byte, identity.MinCSRFSharedKeyBytes),
 			TokenTTL:       time.Hour,
-			TrustedOrigins: []string{KitOrigin},
+			TrustedOrigins: []string{KitOrigin, loopbackOrigin},
 		}),
-	)
-	if err != nil {
-		tb.Fatalf("orchestrationtest: composing a factory: %v", err)
-		return nil
+	}
+	if len(seams.Templates) > 0 {
+		options = append(options, factory.WithDepartment(seams.Templates...))
+	}
+	if seams.ObjectPolicy != nil {
+		options = append(options,
+			factory.WithObjectPolicy(seams.ObjectPolicy),
+			factory.WithObjectStoreResolver(seams.ObjectStore))
+	}
+	if seams.Reconcile != (factory.ReconcileLimits{}) {
+		options = append(options, factory.WithReconcileLimits(seams.Reconcile))
 	}
 
-	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	server, err := factory.New(options...)
 	if err != nil {
-		tb.Fatalf("orchestrationtest: opening a loopback listener: %v", err)
+		_ = listener.Close()
+		tb.Fatalf("orchestrationtest: composing a factory: %v", err)
 		return nil
 	}
 
@@ -168,6 +248,11 @@ func NewFactoryFixtureWithSeams(tb TB, store *StoreFixture, clock *Clock, seams 
 		Authorize: authorizer,
 		Placement: recording,
 		Directory: storeDirectory,
+		Commands:  commands,
+		Gates:     gates,
+		Targets:   targets,
+		Token:     token,
+		ReplicaID: replica,
 		served:    make(chan error, 1),
 		serveWait: 10 * time.Second,
 	}
@@ -179,8 +264,50 @@ func NewFactoryFixtureWithSeams(tb TB, store *StoreFixture, clock *Clock, seams 
 	// replacement channel instead of the original.
 	results := fixture.served
 	go func() { results <- server.Serve(listener) }()
+	fixture.awaitServing(tb)
 	tb.Cleanup(func() { fixture.Stop(tb) })
 	return fixture
+}
+
+// awaitServing blocks until the server answers, bounded, and fails naming what
+// did not happen.
+//
+// It closes a REAL race rather than papering over one. As of A9.1 stage 2 Serve
+// claims the serving state as its first action -- "the cost of getting it wrong
+// is a leaked socket" -- so a Stop that lands before Serve's goroutine is
+// scheduled makes Serve return ErrServerStopped instead of serving at all. The
+// fixture's own Stop assertion then reports "Serve returned factory: server is
+// stopped", intermittently, a long way from its cause. This was observed as a
+// flake in a mutation baseline and is fixed here rather than tolerated.
+func (f *FactoryFixture) awaitServing(tb TB) {
+	tb.Helper()
+	deadline := time.Now().Add(20 * time.Second)
+	for {
+		req, err := http.NewRequest(http.MethodGet, f.BaseURL+"/v1/csrf-token", nil)
+		if err != nil {
+			tb.Fatalf("orchestrationtest: building the readiness probe: %v", err)
+			return
+		}
+		req.Host = KitHost
+		req.Header.Set("Authorization", "Bearer "+KitActorCredential)
+		resp, err := f.Client.Do(req)
+		if err == nil {
+			_ = resp.Body.Close()
+			return
+		}
+		select {
+		case serveErr := <-f.served:
+			// Put it back so Stop still sees it, then report the real cause.
+			f.served <- serveErr
+			tb.Fatalf("orchestrationtest: Serve returned %v before the server answered", serveErr)
+			return
+		default:
+		}
+		if time.Now().After(deadline) {
+			tb.Fatalf("orchestrationtest: the factory did not answer /v1/csrf-token within 20s: %v", err)
+			return
+		}
+	}
 }
 
 // Stop shuts the server down and asserts Serve returned http.ErrServerClosed.

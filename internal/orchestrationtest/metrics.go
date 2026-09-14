@@ -6,7 +6,6 @@ import (
 	"bytes"
 	"context"
 	"net"
-	"net/http"
 	"runtime"
 	"strings"
 	"time"
@@ -160,48 +159,19 @@ func AssertPublicFrameIsClean(tb TB, what string, frame []byte) {
 	}
 }
 
-// NotComposedRoutes are the Factory routes that answer "not composed" in this
-// build, with the status each answers.
+// The link-plane trip-wire lived here and is DELETED.
 //
-// This map holds exactly ONE route, /v1/realtime, and the comment says so
-// because an earlier version of it described the control routes too and the map
-// never contained them.
+// It asserted /v1/realtime answered 501 because factory.New composed no
+// ClientLink handler, and it FIRED the day A9.1 stage 2 composed one: the route
+// now answers 400 to a plain GET, which is a WebSocket endpoint refusing a
+// non-upgrade request rather than a route nothing serves. Keeping an assertion
+// after its premise lifts turns it into a claim about the past.
 //
-// /v1/realtime is the ClientLink WebSocket endpoint and it answers 501:
-// factory.New composes no clientlink handler. Be precise about the import
-// claim: no non-test file in factory imports internal/realtime/clientlink or
-// internal/realtime/hostlink -- but factory/internal/routing/repair.go:11 DOES
-// import internal/realtime/delivery, so "nothing imports realtime" is false and
-// must not be written down again.
-//
-// The control routes (/v1/sessions/{id}/input, /interrupt, /restore, and the
-// gate response) separately answer 503 on factory.New's nil admission service,
-// and the object routes answer 503 on its absent object store. They are NOT in
-// this map: they are POST-only, so the kit's GET helper would read 405 from
-// them and the row would pass for the wrong reason. They are booked as owed
-// instead.
-//
-// So the kit's "bounded ClientLink client" (runbook 07 I0.1 step 2) and the
-// whole of task I0.2 are blocked on a Factory composition change, not on test
-// work. AssertFactoryComposesNoLinkPlane fails the day this route starts
-// answering something else -- which is the day that blocker lifts.
-var NotComposedRoutes = map[string]int{
-	"/v1/realtime": http.StatusNotImplemented,
-}
-
-// AssertFactoryComposesNoLinkPlane records the blocker in executable form.
-func AssertFactoryComposesNoLinkPlane(tb TB, ctx context.Context, f *FactoryFixture) {
-	tb.Helper()
-	for path, want := range NotComposedRoutes {
-		status, body := f.Get(tb, ctx, path)
-		if status != want {
-			tb.Fatalf("orchestrationtest: %s answered %d, want %d. Factory has composed its link plane, "+
-				"so runbook 07 I0.2 is no longer blocked: drive ClientLink for real and delete this trip-wire (body %s)",
-				path, status, want, truncate(body))
-			return
-		}
-	}
-}
+// The correction it forced on this file's prose is kept: no non-test file in
+// factory imports internal/realtime/clientlink or internal/realtime/hostlink was
+// true only of the pre-stage-2 build, and "nothing imports realtime" was never
+// true at all -- factory/internal/routing/repair.go imports
+// internal/realtime/delivery. Do not write either sentence again.
 
 func truncate(body []byte) string {
 	const limit = 200

@@ -372,10 +372,6 @@ func TestOrchestrationTestKit(t *testing.T) {
 		}
 	})
 
-	t.Run("factory composes no link plane", func(t *testing.T) {
-		AssertFactoryComposesNoLinkPlane(t, ctx, factoryFixture)
-	})
-
 	var faultyFactory, secondFactory *FactoryFixture
 
 	t.Run("a store fault surfaces through the real router", func(t *testing.T) {
@@ -601,20 +597,6 @@ func TestOrchestrationTestKitAssertionsCanFail(t *testing.T) {
 		mustFail(t, "did not return after Stop", func(tb TB) { fixture.Stop(tb) })
 	})
 
-	t.Run("AssertFactoryComposesNoLinkPlane", func(t *testing.T) {
-		clock := NewClock(time.Unix(kitEpoch, 0))
-		store := NewStoreFixture(t, ctx, clock)
-		fixture := NewFactoryFixture(t, store, clock)
-		mustFail(t, "no longer blocked", func(tb TB) {
-			// A served route that is NOT the not-composed one stands in for
-			// "/v1/realtime started answering something else".
-			saved := NotComposedRoutes
-			NotComposedRoutes = map[string]int{"/v1/sessions": http.StatusNotImplemented}
-			defer func() { NotComposedRoutes = saved }()
-			AssertFactoryComposesNoLinkPlane(tb, ctx, fixture)
-		})
-	})
-
 	t.Run("FakeRuntime refuses an unframed command", func(t *testing.T) {
 		runtime := NewFakeRuntime(mustKitUUID())
 		if err := runtime.ApplyCommand(ctx, department.RuntimeCommand{CommandID: "cmd-1"}); err == nil {
@@ -634,58 +616,6 @@ func TestOrchestrationTestKitAssertionsCanFail(t *testing.T) {
 			hostDrainSurfaceNames = []string{"Capacity"}
 			defer func() { hostDrainSurfaceNames = saved }()
 			AssertHostExposesNoDrainSurface(tb)
-		})
-	})
-
-	t.Run("AssertFactoryExposesNoReconciler names what would unblock I1.3", func(t *testing.T) {
-		mustFail(t, "no longer blocked", func(tb TB) {
-			saved := factoryReconcilerSurfaceNames
-			// *factory.Server does export Handler; standing it in for "Sweep"
-			// proves the assertion reads the real method set.
-			factoryReconcilerSurfaceNames = []string{"Handler"}
-			defer func() { factoryReconcilerSurfaceNames = saved }()
-			AssertFactoryExposesNoReconciler(tb)
-		})
-	})
-
-	t.Run("AssertFactoryComposesNoAdmissionPlane", func(t *testing.T) {
-		clock := NewClock(time.Unix(kitEpoch, 0))
-		store := NewStoreFixture(t, ctx, clock)
-		fixture := NewFactoryFixture(t, store, clock)
-		session := store.SeedSession(ctx, kitAgent, string(kitCompatibility))
-		mustFail(t, "no longer blocked", func(tb TB) {
-			// /status is SERVED and is GET-only, so a POST to it answers 405.
-			// Any answer other than 503 must fail the assertion, and 405 is the
-			// one a wrongly-built probe would most plausibly read.
-			saved := NotComposedControlRoutes
-			NotComposedControlRoutes = []ControlRoute{{Suffix: "/status", Body: `{}`}}
-			defer func() { NotComposedControlRoutes = saved }()
-			AssertFactoryComposesNoAdmissionPlane(tb, ctx, fixture, session)
-		})
-	})
-
-	t.Run("AssertFactoryComposesNoObjectPlane", func(t *testing.T) {
-		clock := NewClock(time.Unix(kitEpoch, 0))
-		store := NewStoreFixture(t, ctx, clock)
-		fixture := NewFactoryFixture(t, store, clock)
-		session := store.SeedSession(ctx, kitAgent, string(kitCompatibility))
-		mustFail(t, "no longer blocked", func(tb TB) {
-			saved := notComposedObjectSuffixes
-			notComposedObjectSuffixes = []string{"/status"}
-			defer func() { notComposedObjectSuffixes = saved }()
-			AssertFactoryComposesNoObjectPlane(tb, ctx, fixture, session)
-		})
-	})
-
-	t.Run("AssertFactoryAdvertisesNoLaunchTargets", func(t *testing.T) {
-		clock := NewClock(time.Unix(kitEpoch, 0))
-		store := NewStoreFixture(t, ctx, clock)
-		fixture := NewFactoryFixture(t, store, clock)
-		mustFail(t, "discriminating", func(tb TB) {
-			saved := emptyAgentsBody
-			emptyAgentsBody = `{"agents":["something"]}`
-			defer func() { emptyAgentsBody = saved }()
-			AssertFactoryAdvertisesNoLaunchTargets(tb, ctx, fixture)
 		})
 	})
 

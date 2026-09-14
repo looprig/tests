@@ -82,7 +82,18 @@ func NewStoreFixture(tb TB, ctx context.Context, clock *Clock) *StoreFixture {
 
 func (f *StoreFixture) open(ctx context.Context) {
 	f.tb.Helper()
-	store, err := sessionstore.Open(ctx, f.Backend, sessionstore.WithClock(f.Clock))
+	// The shard count is stated HERE as well as on the kit's Commands and Gates
+	// seams, and the two MUST agree. They are two statements of one number with
+	// no composition-time check between them: factory.Commands.ControlShards()
+	// is what the sweeper rotates over, sessionstore's WithControlShards is
+	// where due work is filed, and a deployment whose Factory reports 4 against
+	// a store configured for the default 16 sweeps shards 0-3 and NEVER REACHES
+	// the other twelve. Work filed there is never reconciled and nothing
+	// anywhere reports it. This kit found that by making the fake faithful; see
+	// KitControlShards.
+	store, err := sessionstore.Open(ctx, f.Backend,
+		sessionstore.WithClock(f.Clock),
+		sessionstore.WithControlShards(KitControlShards))
 	if err != nil {
 		f.tb.Fatalf("orchestrationtest: opening sessionstore over memstore: %v", err)
 		return
@@ -101,6 +112,17 @@ func (f *StoreFixture) Reopen(ctx context.Context) {
 		f.Store = nil
 	}
 	f.open(ctx)
+}
+
+// randomSuffix mints a short random token for a per-fixture identity.
+func randomSuffix(tb TB) string {
+	tb.Helper()
+	raw := make([]byte, 6)
+	if _, err := rand.Read(raw); err != nil {
+		tb.Fatalf("orchestrationtest: minting a random suffix: %v", err)
+		return ""
+	}
+	return hex.EncodeToString(raw)
 }
 
 // SeedSession creates one catalog entry and returns its session id.
