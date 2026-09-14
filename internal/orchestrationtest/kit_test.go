@@ -625,6 +625,110 @@ func TestOrchestrationTestKitAssertionsCanFail(t *testing.T) {
 		}
 	})
 
+	t.Run("AssertHostExposesNoDrainSurface names what would unblock I2.3", func(t *testing.T) {
+		mustFail(t, "no longer blocked", func(tb TB) {
+			saved := hostDrainSurfaceNames
+			// *host.Host does export Capacity; standing it in for "StartDrain"
+			// proves the assertion reads the real method set rather than a list
+			// that happens to match nothing.
+			hostDrainSurfaceNames = []string{"Capacity"}
+			defer func() { hostDrainSurfaceNames = saved }()
+			AssertHostExposesNoDrainSurface(tb)
+		})
+	})
+
+	t.Run("AssertFactoryExposesNoReconciler names what would unblock I1.3", func(t *testing.T) {
+		mustFail(t, "no longer blocked", func(tb TB) {
+			saved := factoryReconcilerSurfaceNames
+			// *factory.Server does export Handler; standing it in for "Sweep"
+			// proves the assertion reads the real method set.
+			factoryReconcilerSurfaceNames = []string{"Handler"}
+			defer func() { factoryReconcilerSurfaceNames = saved }()
+			AssertFactoryExposesNoReconciler(tb)
+		})
+	})
+
+	t.Run("AssertFactoryComposesNoAdmissionPlane", func(t *testing.T) {
+		clock := NewClock(time.Unix(kitEpoch, 0))
+		store := NewStoreFixture(t, ctx, clock)
+		fixture := NewFactoryFixture(t, store, clock)
+		session := store.SeedSession(ctx, kitAgent, string(kitCompatibility))
+		mustFail(t, "no longer blocked", func(tb TB) {
+			// /status is SERVED and is GET-only, so a POST to it answers 405.
+			// Any answer other than 503 must fail the assertion, and 405 is the
+			// one a wrongly-built probe would most plausibly read.
+			saved := NotComposedControlRoutes
+			NotComposedControlRoutes = []ControlRoute{{Suffix: "/status", Body: `{}`}}
+			defer func() { NotComposedControlRoutes = saved }()
+			AssertFactoryComposesNoAdmissionPlane(tb, ctx, fixture, session)
+		})
+	})
+
+	t.Run("AssertFactoryComposesNoObjectPlane", func(t *testing.T) {
+		clock := NewClock(time.Unix(kitEpoch, 0))
+		store := NewStoreFixture(t, ctx, clock)
+		fixture := NewFactoryFixture(t, store, clock)
+		session := store.SeedSession(ctx, kitAgent, string(kitCompatibility))
+		mustFail(t, "no longer blocked", func(tb TB) {
+			saved := notComposedObjectSuffixes
+			notComposedObjectSuffixes = []string{"/status"}
+			defer func() { notComposedObjectSuffixes = saved }()
+			AssertFactoryComposesNoObjectPlane(tb, ctx, fixture, session)
+		})
+	})
+
+	t.Run("AssertFactoryAdvertisesNoLaunchTargets", func(t *testing.T) {
+		clock := NewClock(time.Unix(kitEpoch, 0))
+		store := NewStoreFixture(t, ctx, clock)
+		fixture := NewFactoryFixture(t, store, clock)
+		mustFail(t, "discriminating", func(tb TB) {
+			saved := emptyAgentsBody
+			emptyAgentsBody = `{"agents":["something"]}`
+			defer func() { emptyAgentsBody = saved }()
+			AssertFactoryAdvertisesNoLaunchTargets(tb, ctx, fixture)
+		})
+	})
+
+	t.Run("FactoryFixture.Post reports an unreachable server", func(t *testing.T) {
+		clock := NewClock(time.Unix(kitEpoch, 0))
+		store := NewStoreFixture(t, ctx, clock)
+		fixture := NewFactoryFixture(t, store, clock)
+		// Port 1 on loopback refuses immediately. Stopping the fixture's own
+		// server would work too, but it would also race Serve's return and make
+		// this row report the WRONG failure -- which is the shape the kit's Stop
+		// assertion exists to catch.
+		fixture.BaseURL = "http://127.0.0.1:1"
+		mustFail(t, "posting", func(tb TB) {
+			fixture.Post(tb, ctx, "/v1/sessions/session-1/input", []byte(`{}`))
+		})
+	})
+
+	t.Run("ObservedReader records the request, not merely the call", func(t *testing.T) {
+		// The counter is not the evidence: I1.1 case 5 turns on WHAT was asked
+		// for. A wrapper that counted calls and dropped the request would make
+		// every bound assertion above unwritable, and nothing else would notice.
+		clock := NewClock(time.Unix(kitEpoch, 0))
+		store := NewStoreFixture(t, ctx, clock)
+		session := store.SeedSession(ctx, kitAgent, string(kitCompatibility))
+		store.AppendPublicEvent(ctx, session, "event-1", []byte(`{"n":1}`))
+		observer := NewObservedReader(store.Store)
+		fixture := NewFactoryFixtureWithSeams(t, store, clock, FactorySeams{Reader: observer})
+		if status, _ := fixture.Get(t, ctx, SessionPath(session, "/journal")); status != http.StatusOK {
+			t.Fatalf("the journal read answered %d", status)
+		}
+		requests := observer.JournalRequests()
+		if len(requests) != 1 || observer.Count("ReadPublicJournal") != 1 {
+			t.Fatalf("observed %d requests and %d calls, want 1 of each", len(requests), observer.Count("ReadPublicJournal"))
+		}
+		if !requests[0].Tail || requests[0].Limit <= 0 {
+			t.Fatalf("the recorded request is empty of the values a bound assertion reads: %+v", requests[0])
+		}
+		observer.Reset()
+		if len(observer.JournalRequests()) != 0 || observer.Total() != 0 {
+			t.Fatalf("Reset left recorded state behind")
+		}
+	})
+
 	t.Run("AssertHostExposesNoRuntimeSurface names what would unblock I0.2", func(t *testing.T) {
 		mustFail(t, "no longer blocked", func(tb TB) {
 			saved := hostRuntimeSurfaceNames

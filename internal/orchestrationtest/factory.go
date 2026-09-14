@@ -3,6 +3,7 @@
 package orchestrationtest
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"io"
@@ -81,15 +82,65 @@ func NewFactoryFixture(tb TB, store *StoreFixture, clock *Clock) *FactoryFixture
 // NewFactoryFixtureWithReader composes a Factory over a chosen read plane.
 func NewFactoryFixtureWithReader(tb TB, store *StoreFixture, clock *Clock, reader SessionReaderSeam) *FactoryFixture {
 	tb.Helper()
+	return NewFactoryFixtureWithSeams(tb, store, clock, FactorySeams{Reader: reader})
+}
+
+// FactorySeams names the collaborators a case wants to choose for itself.
+//
+// Every zero member takes the kit's default, so a case states only the seam it
+// is making a claim about. Commands and Placement exist here so a case can
+// substitute PanicCommands and PanicPlacement: a seam that factory.New accepts
+// and never calls is an ABSENCE claim, and an absence claim with no probe
+// behind it is as wide as an unverified presence claim.
+type FactorySeams struct {
+	// Reader is the durable read plane. Nil takes the real Store.
+	Reader SessionReaderSeam
+	// Commands is the durable command plane. Nil takes the real Store.
+	Commands factory.Commands
+	// Placement is the placement controller. Nil takes a RecordingPlacement,
+	// which is also what FactoryFixture.Placement reports; a case that
+	// substitutes its own gets a nil there and must not read it.
+	Placement factory.PlacementController
+	// Directory is the observed target directory. Nil takes a StoreDirectory
+	// over the real Store.
+	Directory factory.Directory
+}
+
+// NewFactoryFixtureWithSeams composes a Factory over chosen collaborators.
+func NewFactoryFixtureWithSeams(tb TB, store *StoreFixture, clock *Clock, seams FactorySeams) *FactoryFixture {
+	tb.Helper()
 	authorizer := &RecordingAuthorizer{}
-	placement := &RecordingPlacement{}
-	directory := &StoreDirectory{Store: store.Store}
+
+	var reader factory.SessionReader = store.Store
+	if seams.Reader != nil {
+		reader = seams.Reader
+	}
+	var commands factory.Commands = store.Store
+	if seams.Commands != nil {
+		commands = seams.Commands
+	}
+	var recording *RecordingPlacement
+	var placement factory.PlacementController
+	if seams.Placement != nil {
+		placement = seams.Placement
+	} else {
+		recording = &RecordingPlacement{}
+		placement = recording
+	}
+	var storeDirectory *StoreDirectory
+	var directory factory.Directory
+	if seams.Directory != nil {
+		directory = seams.Directory
+	} else {
+		storeDirectory = &StoreDirectory{Store: store.Store}
+		directory = storeDirectory
+	}
 
 	server, err := factory.New(
 		factory.WithCredentialVerifier(&FixedBearerVerifier{Tenant: store.Tenant, Credential: KitActorCredential, Clock: clock}),
 		factory.WithAuthorizer(authorizer),
 		factory.WithSessionReader(reader),
-		factory.WithCommands(store.Store),
+		factory.WithCommands(commands),
 		factory.WithDirectory(directory),
 		factory.WithPlacementController(placement),
 		factory.WithClock(clock),
@@ -115,8 +166,8 @@ func NewFactoryFixtureWithReader(tb TB, store *StoreFixture, clock *Clock, reade
 		Listener:  listener,
 		BaseURL:   "http://" + listener.Addr().String(),
 		Authorize: authorizer,
-		Placement: placement,
-		Directory: directory,
+		Placement: recording,
+		Directory: storeDirectory,
 		served:    make(chan error, 1),
 		serveWait: 10 * time.Second,
 	}
@@ -181,6 +232,41 @@ func (f *FactoryFixture) Get(tb TB, ctx context.Context, path string) (int, []by
 		return 0, nil
 	}
 	return resp.StatusCode, body
+}
+
+// Post issues an authenticated POST with a JSON body and returns the status and
+// body.
+//
+// It exists because the kit's GET helper cannot probe a control route: the
+// control routes are POST-only, so a GET reads 405 and a row built on one would
+// pass for the wrong reason -- which is exactly why the kit's earlier
+// NotComposedRoutes map excluded them and booked them as owed instead.
+//
+// A bearer credential is CSRF-exempt by Factory's documented guard order, which
+// is why no token is fetched here. A cookie-authenticated control POST would
+// need one, and this helper must not be extended to cookies without it.
+func (f *FactoryFixture) Post(tb TB, ctx context.Context, path string, body []byte) (int, []byte) {
+	tb.Helper()
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, f.BaseURL+path, bytes.NewReader(body))
+	if err != nil {
+		tb.Fatalf("orchestrationtest: building a POST for %q: %v", path, err)
+		return 0, nil
+	}
+	req.Host = KitHost
+	req.Header.Set("Authorization", "Bearer "+KitActorCredential)
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := f.Client.Do(req)
+	if err != nil {
+		tb.Fatalf("orchestrationtest: posting %q: %v", path, err)
+		return 0, nil
+	}
+	defer func() { _ = resp.Body.Close() }()
+	answer, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	if err != nil {
+		tb.Fatalf("orchestrationtest: reading the answer to %q: %v", path, err)
+		return 0, nil
+	}
+	return resp.StatusCode, answer
 }
 
 // FixedBearerVerifier accepts exactly one bearer value for one tenant.
