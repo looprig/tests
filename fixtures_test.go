@@ -48,7 +48,7 @@ func openFSStores(t *testing.T, root string) fsStores {
 		t.Fatalf("fsstore.Open: %v", err)
 	}
 	raw := fs.Backend()
-	sessionBlobs := newUntouchedBlobs()
+	sessionBlobs := newUntouchedBlobs(t)
 	composed, err := storage.NewCompositeWithOrderedIndex(raw.Ledger, raw.Leaser, raw.KV, sessionBlobs, raw.OrderedIndex)
 	if err != nil {
 		_ = fs.Close()
@@ -100,16 +100,22 @@ func openFSStores(t *testing.T, root string) fsStores {
 //
 // BlobReaderCloseBound is not counted: sessionstore reads it once at Open to
 // check the capability, which is not Blobs I/O.
+//
+// It does not reuse recordingBlobs/recordingLifecycleBlobs from
+// sessionstore_provider_integration_test.go: those log every key into a shared
+// providerRecorder and take a caller-asserted bound, while this guard needs
+// per-method counts over a fresh memstore whose real bound is passed through.
 type untouchedBlobs struct {
 	inner storage.BlobReaderLifecycle
 	mu    sync.Mutex
 	hits  map[string]int
 }
 
-func newUntouchedBlobs() *untouchedBlobs {
+func newUntouchedBlobs(t testing.TB) *untouchedBlobs {
+	t.Helper()
 	inner, ok := memstore.New().Blobs.(storage.BlobReaderLifecycle)
 	if !ok {
-		panic("memstore Blobs no longer advertises storage.BlobReaderLifecycle; openFSStores needs a new lifecycle provider")
+		t.Fatalf("memstore Blobs no longer advertises storage.BlobReaderLifecycle; openFSStores needs a new lifecycle provider")
 	}
 	return &untouchedBlobs{inner: inner, hits: make(map[string]int)}
 }
@@ -199,25 +205,61 @@ func TestUntouchedBlobsGuardReportsEveryMethod(t *testing.T) {
 		t.Run(method+" is reported by name", func(t *testing.T) {
 			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 			defer cancel()
-			guard := newUntouchedBlobs()
+			guard := newUntouchedBlobs(t)
 			calls[method](ctx, guard)
 			rec := &guardRecorder{}
 			checkUntouchedBlobs(rec, guard)
 			if len(rec.messages) != 1 {
 				t.Fatalf("a deliberate %s produced %d guard failures %q, want exactly 1", method, len(rec.messages), rec.messages)
 			}
-			if !strings.Contains(rec.messages[0], method+":1") {
-				t.Fatalf("guard failure %q does not name %s:1", rec.messages[0], method)
-			}
-			for _, other := range guarded {
-				if other != method && strings.Contains(rec.messages[0], other+":") {
-					t.Fatalf("guard failure %q names %s, but only %s was called", rec.messages[0], other, method)
-				}
+			// The whole message, spelled out here rather than shared with the check:
+			// the count must be exactly 1 and the remedy must survive.
+			want := "sessionstore touched its Blobs primitive (calls by method: map[" + method + ":1]). " +
+				"openFSStores' Blobs is a fresh in-memory provider: these cases prove Ledger durability, " +
+				"not Blobs durability. A case that offloads needs a lifecycle-conforming durable provider " +
+				"(s3store) in the integration lane"
+			if rec.messages[0] != want {
+				t.Fatalf("guard failure\n got: %q\nwant: %q", rec.messages[0], want)
 			}
 		})
 	}
+	t.Run("concurrent calls are all counted", func(t *testing.T) {
+		// Run under -race (the Makefile gate does). Writers call every guarded
+		// method while readers take the report, so dropping hit's lock or handing
+		// out the live map instead of a copy is a data race here; the exact totals
+		// also catch a lost update.
+		const writers, perWriter = 2, 20
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		guard := newUntouchedBlobs(t)
+		var wg sync.WaitGroup
+		for w := 0; w < writers; w++ {
+			wg.Add(2)
+			go func() {
+				defer wg.Done()
+				for i := 0; i < perWriter; i++ {
+					for _, method := range guarded {
+						calls[method](ctx, guard)
+					}
+				}
+			}()
+			go func() {
+				defer wg.Done()
+				for i := 0; i < perWriter; i++ {
+					for method, n := range guard.touched() {
+						_, _ = method, n
+					}
+				}
+			}()
+		}
+		wg.Wait()
+		want := map[string]int{"Put": writers * perWriter, "Get": writers * perWriter, "Delete": writers * perWriter, "List": writers * perWriter}
+		if got := guard.touched(); !reflect.DeepEqual(got, want) {
+			t.Fatalf("concurrent totals = %v, want %v", got, want)
+		}
+	})
 	t.Run("an untouched guard reports nothing", func(t *testing.T) {
-		guard := newUntouchedBlobs()
+		guard := newUntouchedBlobs(t)
 		if bound := guard.BlobReaderCloseBound(); bound <= 0 {
 			t.Fatalf("BlobReaderCloseBound = %v, want positive", bound)
 		}
