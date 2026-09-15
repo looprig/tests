@@ -10,6 +10,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -164,6 +165,68 @@ func checkUntouchedBlobs(tb interface {
 			"in-memory provider: these cases prove Ledger durability, not Blobs durability. A case that offloads "+
 			"needs a lifecycle-conforming durable provider (s3store) in the integration lane", touched)
 	}
+}
+
+// guardRecorder observes checkUntouchedBlobs' failure without failing the real
+// test: it satisfies the check's {Helper, Errorf} parameter and records messages.
+type guardRecorder struct{ messages []string }
+
+func (*guardRecorder) Helper() {}
+
+func (r *guardRecorder) Errorf(format string, args ...any) {
+	r.messages = append(r.messages, fmt.Sprintf(format, args...))
+}
+
+// TestUntouchedBlobsGuardReportsEveryMethod is the committed positive control for
+// openFSStores' Blobs guard. The guard's only evidence in the suite is otherwise
+// that it stays silent, and a guard that has gone blind is silent too. Each row
+// makes one deliberate call on a guard built by the SAME constructor openFSStores
+// uses and requires the report to name that method and no other, so dropping any
+// single method from the recording is killed by its own row.
+func TestUntouchedBlobsGuardReportsEveryMethod(t *testing.T) {
+	guarded := []string{"Put", "Get", "Delete", "List"}
+	calls := map[string]func(context.Context, *untouchedBlobs){
+		"Put": func(ctx context.Context, b *untouchedBlobs) { _ = b.Put(ctx, "guard-control", strings.NewReader("x")) },
+		"Get": func(ctx context.Context, b *untouchedBlobs) {
+			if rc, err := b.Get(ctx, "guard-control"); err == nil {
+				_ = rc.Close()
+			}
+		},
+		"Delete": func(ctx context.Context, b *untouchedBlobs) { _ = b.Delete(ctx, "guard-control") },
+		"List":   func(ctx context.Context, b *untouchedBlobs) { _, _ = b.List(ctx, "guard-") },
+	}
+	for _, method := range guarded {
+		t.Run(method+" is reported by name", func(t *testing.T) {
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			guard := newUntouchedBlobs()
+			calls[method](ctx, guard)
+			rec := &guardRecorder{}
+			checkUntouchedBlobs(rec, guard)
+			if len(rec.messages) != 1 {
+				t.Fatalf("a deliberate %s produced %d guard failures %q, want exactly 1", method, len(rec.messages), rec.messages)
+			}
+			if !strings.Contains(rec.messages[0], method+":1") {
+				t.Fatalf("guard failure %q does not name %s:1", rec.messages[0], method)
+			}
+			for _, other := range guarded {
+				if other != method && strings.Contains(rec.messages[0], other+":") {
+					t.Fatalf("guard failure %q names %s, but only %s was called", rec.messages[0], other, method)
+				}
+			}
+		})
+	}
+	t.Run("an untouched guard reports nothing", func(t *testing.T) {
+		guard := newUntouchedBlobs()
+		if bound := guard.BlobReaderCloseBound(); bound <= 0 {
+			t.Fatalf("BlobReaderCloseBound = %v, want positive", bound)
+		}
+		rec := &guardRecorder{}
+		checkUntouchedBlobs(rec, guard)
+		if len(rec.messages) != 0 {
+			t.Fatalf("untouched guard (capability read only) reported %q, want nothing", rec.messages)
+		}
+	})
 }
 
 // registerSessionCleanup immediately protects an acquired controller with bounded,
