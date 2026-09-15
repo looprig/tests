@@ -17,7 +17,7 @@ import (
 	"github.com/looprig/harness/pkg/event"
 	"github.com/looprig/harness/pkg/loop"
 	"github.com/looprig/harness/pkg/rig"
-	//lint:ignore SA1019 harness v0.34.0 froze pkg/serve as a compatibility surface; this case verifies that
+	//lint:ignore SA1019 since harness v0.33.0 pkg/serve is a frozen compatibility surface; this case verifies that
 	// surface over a concrete rig and must keep importing it until the surface is retired.
 	"github.com/looprig/harness/pkg/serve"
 	"github.com/looprig/harness/pkg/session"

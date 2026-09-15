@@ -10,7 +10,11 @@
 // more; runbook 07 I0.1 half (a)'s extra `orchestration` tag and the untagged
 // doc file that shadowed it are gone. As with every other integration file,
 // naming this package without `-tags integration` reports "build constraints
-// exclude all Go files"; `./...` patterns and every Makefile target are unaffected.
+// exclude all Go files", and an untagged `go list ./...` no longer lists it. So
+// `make check`'s gosec dir list (CHECK_GO_DIRS, untagged) does NOT include this
+// package; it only ever saw the comment-only doc file. `make lint` runs gosec over
+// the tagged GO_DIRS, which does include it. An untagged file added here is not
+// covered by `make check`'s gosec.
 //
 // DO NOT RUN `go mod tidy` TO MOVE A PIN IN THIS MODULE.
 //
