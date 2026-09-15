@@ -43,6 +43,16 @@ type fsStores struct {
 
 func openFSStores(t *testing.T, root string) fsStores {
 	t.Helper()
+	return openFSStoresWith(t, root, t)
+}
+
+// openFSStoresWith is openFSStores with the Blobs guard's report routed to
+// report and extra harness sessionstore options. It exists so
+// TestOpenFSStoresRoutesSessionBlobsThroughGuard can drive the REAL wiring --
+// the guarded Blobs handed to sessionstore and the cleanup check -- and observe
+// the report without failing itself. Every case uses openFSStores.
+func openFSStoresWith(t *testing.T, root string, report guardReporter, opts ...sessionstore.Option) fsStores {
+	t.Helper()
 	fs, err := fsstore.Open(fsstore.Options{Root: root})
 	if err != nil {
 		t.Fatalf("fsstore.Open: %v", err)
@@ -54,8 +64,8 @@ func openFSStores(t *testing.T, root string) fsStores {
 		_ = fs.Close()
 		t.Fatalf("compose fsstore primitives with lifecycle Blobs: %v", err)
 	}
-	t.Cleanup(func() { checkUntouchedBlobs(t, sessionBlobs) })
-	sessions, err := sessionstore.Open(composed)
+	t.Cleanup(func() { checkUntouchedBlobs(report, sessionBlobs) })
+	sessions, err := sessionstore.Open(composed, opts...)
 	if err != nil {
 		_ = fs.Close()
 		t.Fatalf("sessionstore.Open: %v", err)
@@ -161,10 +171,14 @@ func (b *untouchedBlobs) BlobReaderCloseBound() time.Duration { return b.inner.B
 var _ storage.BlobReaderLifecycle = (*untouchedBlobs)(nil)
 
 // checkUntouchedBlobs fails the case if sessionstore used its Blobs primitive.
-func checkUntouchedBlobs(tb interface {
+// guardReporter is what the guard reports to: a *testing.T in every case, a
+// guardRecorder in its controls.
+type guardReporter interface {
 	Helper()
 	Errorf(format string, args ...any)
-}, b *untouchedBlobs) {
+}
+
+func checkUntouchedBlobs(tb guardReporter, b *untouchedBlobs) {
 	tb.Helper()
 	if touched := b.touched(); len(touched) > 0 {
 		tb.Errorf("sessionstore touched its Blobs primitive (calls by method: %v). openFSStores' Blobs is a fresh "+
@@ -269,6 +283,45 @@ func TestUntouchedBlobsGuardReportsEveryMethod(t *testing.T) {
 			t.Fatalf("untouched guard (capability read only) reported %q, want nothing", rec.messages)
 		}
 	})
+}
+
+// TestOpenFSStoresRoutesSessionBlobsThroughGuard pins the guard's WIRING, which
+// TestUntouchedBlobsGuardReportsEveryMethod cannot: that test builds the guard
+// directly. Here a session runs through openFSStores' own composition with a
+// one-byte offload threshold, so sessionstore genuinely writes and reads Blobs;
+// the guard must report it at cleanup. Handing sessionstore any other Blobs, or
+// dropping the cleanup check, leaves the recorder empty and fails this test.
+func TestOpenFSStoresRoutesSessionBlobsThroughGuard(t *testing.T) {
+	rec := &guardRecorder{}
+	t.Run("an offloading session through openFSStores", func(t *testing.T) {
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
+		stores := openFSStoresWith(t, filepath.Join(t.TempDir(), "persistence"), rec, sessionstore.WithOffloadThreshold(1))
+		r := defineSessionRig(t, stores, filepath.Join(t.TempDir(), "workspaces"), false, rig.SnapshotPolicy{Trigger: rig.SnapshotManual})
+		sess, err := r.NewSession(ctx)
+		registerSessionCleanup(t, sess)
+		if err != nil {
+			t.Fatalf("NewSession: %v", err)
+		}
+		if _, err := sess.Submit(ctx, textBlock("offload")); err != nil {
+			t.Fatalf("Submit: %v", err)
+		}
+		if err := waitIdle(ctx, sess); err != nil {
+			t.Fatalf("waitIdle: %v", err)
+		}
+	})
+	// The subtest's cleanups -- session shutdown, then the guard check -- have run.
+	if len(rec.messages) != 1 {
+		t.Fatalf("guard reports after an offloading session = %d %q, want exactly 1", len(rec.messages), rec.messages)
+	}
+	const prefix = "sessionstore touched its Blobs primitive (calls by method: map["
+	const suffix = "]). openFSStores' Blobs is a fresh in-memory provider: these cases prove Ledger durability, " +
+		"not Blobs durability. A case that offloads needs a lifecycle-conforming durable provider " +
+		"(s3store) in the integration lane"
+	msg := rec.messages[0]
+	if !strings.HasPrefix(msg, prefix) || !strings.HasSuffix(msg, suffix) || !strings.Contains(msg, "Put:") {
+		t.Fatalf("guard report %q is not the guard's message naming Put", msg)
+	}
 }
 
 // registerSessionCleanup immediately protects an acquired controller with bounded,
