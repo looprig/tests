@@ -1,5 +1,25 @@
-//go:build integration && orchestration
+//go:build integration
 
+// Package orchestrationtest is the black-box service test kit for the Factory
+// and Host orchestration program.
+//
+// It composes real `github.com/looprig/factory` and `github.com/looprig/host`
+// objects at their RELEASED pins -- `host v0.1.0` and `factory v0.1.0` -- and
+// is verified standalone, `GOWORK=off`, exactly as a consumer would get them.
+// Every file carries the module's ordinary `integration` constraint and nothing
+// more; runbook 07 I0.1 half (a)'s extra `orchestration` tag and the untagged
+// doc file that shadowed it are gone. As with every other integration file,
+// naming this package without `-tags integration` reports "build constraints
+// exclude all Go files"; `./...` patterns and every Makefile target are unaffected.
+//
+// DO NOT RUN `go mod tidy` TO MOVE A PIN IN THIS MODULE.
+//
+// Measured during half (a): with a dependency the module could not name at a
+// release, tidy EXITED 0 and silently rewrote `go.mod`/`go.sum` to
+// pseudo-versions. A command that goes green and moves your pins is the
+// dangerous shape. Move a pin with `go get module@version`, then confirm
+// `GOWORK=off go mod tidy -diff` (read-only; what `make mod-check` runs) is
+// empty. Never add a `replace`.
 package orchestrationtest
 
 import (

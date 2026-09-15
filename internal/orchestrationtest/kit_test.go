@@ -1,4 +1,4 @@
-//go:build integration && orchestration
+//go:build integration
 
 package orchestrationtest
 
@@ -112,7 +112,8 @@ func kitContext(t *testing.T) context.Context {
 	return ctx
 }
 
-// TestOrchestrationTestKit is runbook 07 I0.1's acceptance test for half (a).
+// TestOrchestrationTestKit is runbook 07 I0.1's acceptance test: half (a) under
+// go.work, half (b) standalone (`GOWORK=off`) against released host and factory.
 func TestOrchestrationTestKit(t *testing.T) {
 	ctx := kitContext(t)
 	baseline := CaptureGoroutines()

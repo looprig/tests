@@ -1,4 +1,4 @@
-//go:build integration && orchestration
+//go:build integration
 
 // This file is runbook 07 task I1.3 cases 2, 3 and 4.
 //

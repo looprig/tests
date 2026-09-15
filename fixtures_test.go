@@ -29,6 +29,7 @@ import (
 	"github.com/looprig/inference/model"
 	"github.com/looprig/inference/stream"
 	"github.com/looprig/storage"
+	"github.com/looprig/storage/memstore"
 )
 
 const integrationCleanupTimeout = 5 * time.Second
@@ -45,7 +46,15 @@ func openFSStores(t *testing.T, root string) fsStores {
 	if err != nil {
 		t.Fatalf("fsstore.Open: %v", err)
 	}
-	sessions, err := sessionstore.Open(fs.Backend())
+	raw := fs.Backend()
+	sessionBlobs := newUntouchedBlobs()
+	composed, err := storage.NewCompositeWithOrderedIndex(raw.Ledger, raw.Leaser, raw.KV, sessionBlobs, raw.OrderedIndex)
+	if err != nil {
+		_ = fs.Close()
+		t.Fatalf("compose fsstore primitives with lifecycle Blobs: %v", err)
+	}
+	t.Cleanup(func() { checkUntouchedBlobs(t, sessionBlobs) })
+	sessions, err := sessionstore.Open(composed)
 	if err != nil {
 		_ = fs.Close()
 		t.Fatalf("sessionstore.Open: %v", err)
@@ -64,6 +73,97 @@ func openFSStores(t *testing.T, root string) fsStores {
 	// shuts live sessions down before closing their backing store.
 	t.Cleanup(func() { _ = fs.Close() })
 	return fsStores{fs: fs, sessions: sessions, workspace: workspace}
+}
+
+// untouchedBlobs is the Blobs primitive openFSStores hands to sessionstore, and
+// the guard on it.
+//
+// Why it exists. harness v0.34.0's sessionstore (sessionstore v0.9.0) refuses a
+// Blobs provider without storage.BlobReaderLifecycle, and fsstore deliberately
+// does not claim it. So these cases keep fsstore for Ledger, Leaser, KV and
+// OrderedIndex -- the primitives their reopen assertions are about -- and give
+// sessionstore a FRESH memstore Blobs on every open. A fresh one, never one
+// shared across opens: a case that ever offloads a body would then fail loudly
+// on reopen rather than pass on memory that outlived the "fresh" store.
+//
+// What these cases therefore prove is LEDGER durability across a fresh store,
+// NOT Blobs durability. Measured when this was introduced: across every open in
+// every case using this fixture, sessionstore made zero Blobs calls, because
+// nothing crosses its offload threshold. The guard turns that measurement into
+// an asserted premise: if any case touches this Blobs at all, it fails at
+// cleanup naming the method. A case that needs offloaded bodies to survive a
+// reopen needs a lifecycle-conforming durable provider (s3store) and belongs to
+// the integration lane, not to this fixture. Do NOT wrap fsstore Blobs in a type
+// that claims the lifecycle to make this go away; that is exactly the
+// best-effort filesystem claim the rule forbids.
+//
+// BlobReaderCloseBound is not counted: sessionstore reads it once at Open to
+// check the capability, which is not Blobs I/O.
+type untouchedBlobs struct {
+	inner storage.BlobReaderLifecycle
+	mu    sync.Mutex
+	hits  map[string]int
+}
+
+func newUntouchedBlobs() *untouchedBlobs {
+	inner, ok := memstore.New().Blobs.(storage.BlobReaderLifecycle)
+	if !ok {
+		panic("memstore Blobs no longer advertises storage.BlobReaderLifecycle; openFSStores needs a new lifecycle provider")
+	}
+	return &untouchedBlobs{inner: inner, hits: make(map[string]int)}
+}
+
+func (b *untouchedBlobs) hit(method string) {
+	b.mu.Lock()
+	b.hits[method]++
+	b.mu.Unlock()
+}
+
+func (b *untouchedBlobs) touched() map[string]int {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	out := make(map[string]int, len(b.hits))
+	for method, n := range b.hits {
+		out[method] = n
+	}
+	return out
+}
+
+func (b *untouchedBlobs) Put(ctx context.Context, key string, r io.Reader) error {
+	b.hit("Put")
+	return b.inner.Put(ctx, key, r)
+}
+
+func (b *untouchedBlobs) Get(ctx context.Context, key string) (io.ReadCloser, error) {
+	b.hit("Get")
+	return b.inner.Get(ctx, key)
+}
+
+func (b *untouchedBlobs) Delete(ctx context.Context, key string) error {
+	b.hit("Delete")
+	return b.inner.Delete(ctx, key)
+}
+
+func (b *untouchedBlobs) List(ctx context.Context, prefix string) ([]string, error) {
+	b.hit("List")
+	return b.inner.List(ctx, prefix)
+}
+
+func (b *untouchedBlobs) BlobReaderCloseBound() time.Duration { return b.inner.BlobReaderCloseBound() }
+
+var _ storage.BlobReaderLifecycle = (*untouchedBlobs)(nil)
+
+// checkUntouchedBlobs fails the case if sessionstore used its Blobs primitive.
+func checkUntouchedBlobs(tb interface {
+	Helper()
+	Errorf(format string, args ...any)
+}, b *untouchedBlobs) {
+	tb.Helper()
+	if touched := b.touched(); len(touched) > 0 {
+		tb.Errorf("sessionstore touched its Blobs primitive (calls by method: %v). openFSStores' Blobs is a fresh "+
+			"in-memory provider: these cases prove Ledger durability, not Blobs durability. A case that offloads "+
+			"needs a lifecycle-conforming durable provider (s3store) in the integration lane", touched)
+	}
 }
 
 // registerSessionCleanup immediately protects an acquired controller with bounded,

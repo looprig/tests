@@ -285,7 +285,10 @@ func TestForeignloopQueuedDelegateTimeout(t *testing.T) {
 			return foreignloopToolCall("timeout-send", input), nil
 		},
 		func(stepCtx context.Context, request inference.Request) ([]content.Chunk, error) {
-			if err := foreignloopExpectRawToolResult(request, "error: agent timed out"); err != nil {
+			// Harness v0.28.0+ (5fbc312b) returns a failed wait as a structured error
+			// result named for the tool that issued it, not the older "error: agent …"
+			// text; the raw published string is still asserted exactly.
+			if err := foreignloopExpectRawToolResult(request, "MessageAgent failed: agent timed out"); err != nil {
 				return nil, err
 			}
 			childID, err := uuid.Parse(active.AgentID)
@@ -442,13 +445,15 @@ func TestForeignloopSubagentQuota(t *testing.T) {
 			return foreignloopToolCall("quota-second", `{"agent_type":"child","instructions":"second","wait_for_response":true}`), nil
 		},
 		func(_ context.Context, request inference.Request) ([]content.Chunk, error) {
-			// The typed SessionLoopQuotaExceeded is consumed by Harness's
-			// StartAgent tool at this boundary. Quota rejection publishes no
-			// LoopStarted (or quota-specific durable event), and the tool's
-			// fail-closed model-facing contract intentionally exposes only this
-			// generic result. Harness's own session-runtime tests assert the typed
-			// error before this integration boundary.
-			const want = "error: agent failed"
+			// Quota rejection publishes no LoopStarted (or quota-specific durable
+			// event), so the model-facing tool result is the only place this case can
+			// see it. Since harness v0.28.0 (5fbc312b) StartAgent no longer collapses
+			// the refusal to a generic "error: agent failed": it returns a structured
+			// error result carrying the typed SessionLoopQuotaExceeded text, so the
+			// exact string below pins that it is the QUOTA that refused the second
+			// start rather than any other failure. Harness's own session-runtime tests
+			// assert the typed error before this integration boundary.
+			const want = "StartAgent failed: session: loop spawn quota exceeded"
 			if err := foreignloopExpectLastToolResult(request, want); err != nil {
 				return nil, err
 			}

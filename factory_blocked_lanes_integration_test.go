@@ -1,4 +1,4 @@
-//go:build integration && orchestration
+//go:build integration
 
 // This file records, in executable form, the integration-lane cases that still
 // cannot be driven against the composed services, and it is much smaller than it

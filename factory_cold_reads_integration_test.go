@@ -1,16 +1,15 @@
-//go:build integration && orchestration
+//go:build integration
 
 // This file is runbook 07 task I1.1: cold reads with every Host stopped, and the
 // carried I1.1-hostgone criterion.
 //
-// # Why the extra build tag
+// # Pins
 //
 // It composes the black-box kit in internal/orchestrationtest, which composes
-// real `factory` and `host` objects. Neither module has a tag, so neither can
-// appear in this module's go.mod, and the kit therefore only builds inside the
-// workspace go.work. See the kit's doc.go: the `orchestration` constraint is
-// what keeps this module's own standalone gate green today, and it is deleted in
-// I0.1 half (b) once the two tags exist.
+// real `factory` and `host` objects at their released pins (`host v0.1.0`,
+// `factory v0.1.0`) under the ordinary `integration` tag, so it runs in this
+// module's standalone `GOWORK=off` gate. The extra `orchestration` tag that half
+// (a) of runbook 07 I0.1 needed is gone.
 //
 // # What this file does NOT do, and where to find out why
 //

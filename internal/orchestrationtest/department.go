@@ -1,4 +1,4 @@
-//go:build integration && orchestration
+//go:build integration
 
 package orchestrationtest
 

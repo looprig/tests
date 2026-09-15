@@ -1,4 +1,4 @@
-//go:build integration && orchestration
+//go:build integration
 
 // This file closes the OBJECT half of the carried `I1.1-hostgone` criterion, and
 // runbook 07 I1.1 case 1's objects leg with it.

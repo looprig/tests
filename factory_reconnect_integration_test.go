@@ -1,4 +1,4 @@
-//go:build integration && orchestration
+//go:build integration
 
 // This file is runbook 07 I1.1's cases 3 and 4, and it reports them as STILL
 // BLOCKED with a different blocker than before and with the evidence measured
