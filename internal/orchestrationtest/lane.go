@@ -118,7 +118,13 @@ func (l *FactoryHostLane) Command(tb TB, ctx context.Context, session sessionwir
 func (l *FactoryHostLane) AwaitCommandState(tb TB, ctx context.Context, session sessionwire.SessionID, command sessionwire.CommandID, want sessionstore.InboxState) sessionstore.DispositionInboxEntry {
 	tb.Helper()
 	for {
-		entry := l.Command(tb, ctx, session, command)
+		// Each READ is bounded on its own and is not cut short by the wait's
+		// deadline: a deadline landing mid-read would report a store error
+		// instead of the state the wait never saw, which is the answer a
+		// failing case needs.
+		readCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
+		entry := l.Command(tb, readCtx, session, command)
+		cancel()
 		if entry.Record.State == want {
 			return entry
 		}
