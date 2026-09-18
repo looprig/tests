@@ -24,8 +24,10 @@
 //
 // # Two trip-wires did NOT fire, and one of those is a finding
 //
-// The Host trip-wires did not fire, and that is CORRECT: `host v0.1.0` is still
-// `New` plus accessors, so I2.3's ordering content is still blocked. They stay.
+// The Host trip-wires did not fire then, and that was correct for `host
+// v0.1.0`. They FIRED on the `host v0.2.1` pin -- Compose, Service, Run and a
+// HostLink drain surface -- and are deleted; the I2.3 row below now pins the
+// capability on a running Host instead.
 //
 // But `AssertFactoryComposesNoObjectPlane` and
 // `AssertFactoryAdvertisesNoLaunchTargets` also did not fire, and they should
@@ -67,7 +69,7 @@ func TestIntegrationLaneBlockers(t *testing.T) {
 	served := orchestrationtest.NewFactoryFixture(t, store, clock)
 	session := store.SeedSession(ctx, blockedAgent, string(blockedCompatibility))
 
-	t.Run("I1.4 waits on a Host, not on Factory", func(t *testing.T) {
+	t.Run("I1.4 waits on Factory relaying the Host tail", func(t *testing.T) {
 		// I1.4's four cases name a DeliveryBinding, a HostBinding, the selected
 		// Centrifuge slow-consumer threshold, and the enduring/ephemeral drop
 		// policy. Factory now composes all of that machinery -- the ClientLink
@@ -76,16 +78,21 @@ func TestIntegrationLaneBlockers(t *testing.T) {
 		// What it cannot do is FILL a DeliveryBinding. A session channel's
 		// records come from the Host live tail (routing.Tail, "the Host live
 		// tail's control surface for one session"), which arrives over HostLink
-		// from a running Host. There is no running Host, so there is no stream
-		// to overflow, and I1.4 case 3's own instruction -- "record whether it
+		// from a running Host and must then be relayed by Factory. Until both
+		// halves exist there is no stream to overflow, and I1.4 case 3's own
+		// instruction -- "record whether it
 		// closes a subscription or physical link ... do not encode an assumed
 		// library behavior" -- forbids the only alternative, which is a fake of
 		// both ends.
 		//
-		// So the blocker MOVED rather than lifted: it was Factory's composition
-		// and it is now Host's missing runtime surface, which the rows below
-		// hold. The limits are still validated and still reachable, which is
-		// what this row proves is not the obstacle.
+		// So the blocker MOVED rather than lifted: it was Factory's composition,
+		// then Host's missing runtime surface -- which host v0.2.1 closed -- and
+		// it is now FACTORY again: factory v0.2.0 never subscribes to a session
+		// channel on HostLink and constructs no routing.Relay, so a Host
+		// publication has nowhere to go. That premise is pinned on the wire by
+		// AssertFactorySubscribesToNoHostChannel (factory_reconnect and the
+		// Factory ↔ Host lane test). The limits are still validated and still
+		// reachable, which is what this row proves is not the obstacle.
 		clientLimits := served.Server.ClientLinkLimits()
 		hostLimits := served.Server.HostLinkLimits()
 		if clientLimits.MaxConnections <= 0 || clientLimits.PerConnectionQueueBytes <= 0 {
@@ -96,15 +103,31 @@ func TestIntegrationLaneBlockers(t *testing.T) {
 		}
 	})
 
-	t.Run("I2.3 needs a runnable Host with a drain surface", func(t *testing.T) {
-		// Unchanged by A9.1 stage 2, and deliberately re-asserted rather than
-		// assumed: the Host lane is complete and host v0.1.0 is released, and
-		// neither fact grew an exported composition or drain surface.
-		orchestrationtest.AssertHostExposesNoRuntimeCapability(t)
-		orchestrationtest.AssertHostExposesNoDrainCapability(t)
+	t.Run("I2.3's Host premise has LIFTED: a running Host serves drain", func(t *testing.T) {
+		// This row asserted "no runnable Host, no drain surface" and FIRED on the
+		// host v0.2.1 pin: host now exports Compose, Service and Run, and a
+		// composed Host advertises hostlink.drain and hostlink.drain_status over
+		// HostLink. The row now pins that capability on a RUNNING Host, so the
+		// day it is withdrawn this fails and names I2.3.
+		//
+		// What I2.3 still lacks is a drain CALLER, and that is not Host's:
+		// Factory has none, and the D2.2 ruling (2026-09-18) puts it in
+		// looprig/controller, built from Core's codecs. I2.3's ordering case is
+		// drivable from here with a Core-framed client and is owed as its own
+		// task rather than folded into a premise row.
 		if hostFixture.Host.Placement() != sessionwire.HostPlacementPooled {
 			t.Fatalf("the drain premise was recorded against a non-pooled Host")
 		}
+		running := orchestrationtest.NewComposedHost(t, ctx, store, orchestrationtest.ComposedHostConfig{
+			ID: "orchestrationtest-blocked-running-host", Generation: 2, Agent: blockedAgent,
+			Compatibility: blockedCompatibility, StorageBindingID: "orchestrationtest-blocked-binding",
+		})
+		negotiated := orchestrationtest.ProbeHostCapabilities(t, running)
+		orchestrationtest.AssertHostCapabilities(t, negotiated, orchestrationtest.HostLinkMethodsAtV021())
+		if !negotiated.Supports(sessionwire.HostLinkMethodDrain) || !negotiated.Supports(sessionwire.HostLinkMethodDrainStatus) {
+			t.Fatalf("a running Host does not support drain and drain_status: %v", negotiated.HostLinkMethods())
+		}
+		running.Stop(t)
 	})
 
 	t.Run("I2.3 case 1's durable observable: drain un-ranks target capacity", func(t *testing.T) {

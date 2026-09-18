@@ -246,14 +246,21 @@ func TestOrchestrationTestKit(t *testing.T) {
 		}
 	})
 
-	t.Run("host is composed for real and exposes nothing runnable", func(t *testing.T) {
+	t.Run("host is composed for real, and a composed host RUNS and declares its capabilities", func(t *testing.T) {
 		if hostFixture.Host.Capacity() != PooledHostOptions().Capacity {
 			t.Fatalf("host capacity = %d", hostFixture.Host.Capacity())
 		}
 		if hostFixture.Host.Placement() != sessionwire.HostPlacementPooled {
 			t.Fatalf("host placement = %q", hostFixture.Host.Placement())
 		}
-		AssertHostExposesNoRuntimeCapability(t)
+		// The row that used to assert "nothing runnable" and FIRED on the host
+		// v0.2.1 pin. A running Host is now composed over the same durable
+		// plane and asked, over its own HostLink, what it can do.
+		running := NewComposedHost(t, ctx, store, ComposedHostConfig{
+			ID: "orchestrationtest-host-running", Generation: 3, Agent: kitAgent,
+			Compatibility: kitCompatibility, StorageBindingID: "orchestrationtest-binding",
+		})
+		AssertHostCapabilities(t, ProbeHostCapabilities(t, running), HostLinkMethodsAtV021())
 	})
 
 	t.Run("host refuses an invalid composition", func(t *testing.T) {
@@ -319,9 +326,24 @@ func TestOrchestrationTestKit(t *testing.T) {
 				t.Fatalf("session %q is absent from a two-session page: %s", want, truncate(body))
 			}
 		}
-		calls := factoryFixture.Authorize.Calls()
-		if len(calls) == 0 || calls[len(calls)-1] != "AuthorizeSessionList" {
-			t.Fatalf("authorizer calls = %v, want AuthorizeSessionList last", calls)
+		// The sweeps are EXCLUDED, and that is a race fix rather than a
+		// loosening. factory.Server runs its three sweeps on their own
+		// goroutines from Start, first pass immediately and then on a REAL
+		// time.Timer (serve.go runSweep) -- not on the kit clock -- and each
+		// authorizes AuthorizeServiceSweep. Those calls interleave with this
+		// request's at whatever point the scheduler puts them, and under the
+		// load of the Factory <-> Host lane tests one landed after the list:
+		// [AuthorizeServiceSweep AuthorizeSessionList AuthorizeSessionList
+		// AuthorizeServiceSweep]. The claim is about the REQUEST's
+		// authorization, so it is made over the request's calls.
+		var requestCalls []string
+		for _, call := range factoryFixture.Authorize.Calls() {
+			if call != "AuthorizeServiceSweep" {
+				requestCalls = append(requestCalls, call)
+			}
+		}
+		if len(requestCalls) == 0 || requestCalls[len(requestCalls)-1] != "AuthorizeSessionList" {
+			t.Fatalf("request authorizer calls = %v, want AuthorizeSessionList last", requestCalls)
 		}
 	})
 
@@ -648,44 +670,41 @@ func TestOrchestrationTestKitAssertionsCanFail(t *testing.T) {
 		}
 	})
 
-	t.Run("the host surface wires fire on a runtime capability, whatever carries it", func(t *testing.T) {
-		// The positive control for BOTH widened wires, and it is the row that
-		// makes the widening real rather than argued.
-		//
-		// The narrow wires these replace read *host.Host's method set. This one
-		// stands a verb in on the module's whole exported surface -- the shape a
-		// review proved the old wires blind to: a separate exported type, or a
-		// package-level func. The substitution is at the VOCABULARY, because the
-		// surface itself belongs to another module and this kit must not write
-		// into it.
-		saved := runtimeVerbs
-		// "Capacity" is a real method on *host.Host and "New" is a real
-		// package-level func, so standing them in proves the scan reads both
-		// declaration forms rather than a list that happens to match nothing.
-		runtimeVerbs = []string{"Capacity"}
-		mustFail(t, "no longer blocked", func(tb TB) { AssertHostExposesNoRuntimeCapability(tb) })
-		runtimeVerbs = []string{"New"}
-		mustFail(t, "no longer blocked", func(tb TB) { AssertHostExposesNoRuntimeCapability(tb) })
-		runtimeVerbs = saved
+	t.Run("the host capability wire fires on a gained or a lost method", func(t *testing.T) {
+		// The positive control for AssertHostCapabilities. The subject is a Core
+		// negotiation built with Core's own builder, so the wire is exercised on
+		// the exact type a Host reply decodes into.
+		v021 := sessionwire.VersionNegotiationResponse{Version: sessionwire.CurrentWireVersion}.
+			WithHostLinkMethods(HostLinkMethodsAtV021()...)
+		AssertHostCapabilities(t, v021, HostLinkMethodsAtV021())
 
-		savedDrain := drainVerbs
-		drainVerbs = []string{"Capacity"}
-		defer func() { drainVerbs = savedDrain }()
-		mustFail(t, "no longer blocked", func(tb TB) { AssertHostExposesNoDrainCapability(tb) })
+		withoutAttach := sessionwire.VersionNegotiationResponse{Version: sessionwire.CurrentWireVersion}.
+			WithHostLinkMethods(sessionwire.HostLinkMethodBind, sessionwire.HostLinkMethodUnbind,
+				sessionwire.HostLinkMethodDrain, sessionwire.HostLinkMethodDrainStatus)
+		mustFail(t, "lost [hostlink.attach]", func(tb TB) {
+			AssertHostCapabilities(tb, withoutAttach, HostLinkMethodsAtV021())
+		})
+		grown := sessionwire.VersionNegotiationResponse{Version: sessionwire.CurrentWireVersion}.
+			WithHostLinkMethods(append(HostLinkMethodsAtV021(), "hostlink.future")...)
+		mustFail(t, "gained [hostlink.future]", func(tb TB) {
+			AssertHostCapabilities(tb, grown, HostLinkMethodsAtV021())
+		})
+		// The vacuity guard: a Host advertising nothing is a pre-v0.9.0 Host,
+		// not a Host with an empty set that happens to match an empty want.
+		mustFail(t, "NO HostLink methods", func(tb TB) {
+			AssertHostCapabilities(tb, sessionwire.VersionNegotiationResponse{Version: sessionwire.CurrentWireVersion}, nil)
+		})
 	})
 
-	t.Run("the host surface scan refuses to be vacuous", func(t *testing.T) {
-		// An absence assertion that read no files would report "no runtime
-		// surface" forever. The guard is rowed rather than trusted.
-		surface := hostExportedNames(t)
-		if len(surface) == 0 {
-			t.Fatalf("the host surface scan found no exported names at all")
-		}
-		if _, ok := surface["New"]; !ok {
-			t.Fatalf("the host surface scan missed host.New; it is not reading the module")
-		}
-		if _, ok := surface["NewRigTarget"]; !ok {
-			t.Fatalf("the host surface scan missed department.NewRigTarget; it reads only one package")
-		}
+	t.Run("the factory relay wire fires on a subscribe and refuses to be vacuous", func(t *testing.T) {
+		quiet := &TappedConn{}
+		quiet.messages = []TappedMessage{{Payload: []byte(`{"id":2,"rpc":{"method":"hostlink.bind","data":{}}}`)}}
+		AssertFactorySubscribesToNoHostChannel(t, quiet)
+
+		subscribing := &TappedConn{}
+		subscribing.messages = []TappedMessage{{Payload: []byte(`{"id":2,"rpc":{"method":"hostlink.bind","data":{}}}` + "\n" +
+			`{"id":3,"subscribe":{"channel":"hostlink.v1.a.b"}}`)}}
+		mustFail(t, "no longer blocked", func(tb TB) { AssertFactorySubscribesToNoHostChannel(tb, subscribing) })
+		mustFail(t, "vacuous", func(tb TB) { AssertFactorySubscribesToNoHostChannel(tb, &TappedConn{}) })
 	})
 }

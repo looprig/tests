@@ -1,49 +1,28 @@
 //go:build integration
 
 // This file is runbook 07 I1.1's cases 3 and 4, and it reports them as STILL
-// BLOCKED with a different blocker than before and with the evidence measured
-// rather than inferred.
+// BLOCKED -- on a third blocker, measured on the wire rather than inferred.
 //
-// # What changed
+// # How the blocker has moved
 //
-// Before A9.1 stage 2, `/v1/realtime` was a `pending` route answering 501 and
-// `factory.New` composed no ClientLink handler at all. That is over: the route
-// has left the not-implemented table, and the first row below is the positive
-// that proves it.
+//  1. Before A9.1 stage 2, `/v1/realtime` was a `pending` route answering 501.
+//  2. At factory v0.1.0 the route was served but, in this kit's composition, the
+//     upgrade answered HTTP 500 -- pinned here so it would fail when it changed.
+//     It CHANGED on the factory v0.2.0 pin: the upgrade answers 101, and the
+//     row now asserts that instead.
+//  3. The other half was a HOST PUBLISHER, blocked because host v0.1.0 exposed
+//     nothing runnable. host v0.2.1 closed that (B1): a composed Host relays a
+//     resident runtime's committed tail to a HostLink subscriber of the session
+//     channel, which host's own composed round-trip test drives.
 //
-// # What cases 3 and 4 now wait on -- TWO things, and only one was expected
+// # What cases 3 and 4 wait on now: FACTORY RELAYING THE TAIL
 //
-// 1. A HOST PUBLISHER. Both cases are about DELIVERY: commit three enduring
-//    events and observe all three exactly once and in order after a reconnect
-//    with the old cursor; kill Factory A after it buffered and repair from
-//    journal sequence on B. A session channel's records reach a DeliveryBinding
-//    from the Host live tail -- `routing.Tail` is documented as "the Host live
-//    tail's control surface for one session" -- which arrives over HostLink from
-//    a running Host. `host v0.1.0` exposes `New` plus accessors and nothing
-//    runnable, so no Host can bind and no record is ever published. This is the
-//    blocker the first pass predicted would remain.
-//
-// 2. A WORKING UPGRADE IN THIS COMPOSITION, WHICH I DID NOT GET. A real
-//    `centrifuge-go` client against a real loopback listener fails with
-//    `websocket: bad handshake`, and a raw upgrade probe -- correct
-//    `Connection`, `Upgrade`, `Sec-WebSocket-Version`, `Sec-WebSocket-Key`,
-//    `Origin` and bearer credential -- is answered **HTTP 500 "Internal Server
-//    Error"**, not 101 and not the 503 Factory's own `Start` documentation says
-//    the route answers until the node boots.
-//
-//    I am deliberately NOT calling that a Factory defect. It is equally
-//    consistent with a seam this kit composes wrongly, and the router recovers a
-//    handler panic into an indistinguishable 500 (`recoverPanic`), so the status
-//    alone cannot tell the two apart from outside. What I can say is measured:
-//    in the composition this kit builds, the upgrade does not complete, so no
-//    ClientLink can be driven from here yet. Resolving it needs Factory-side
-//    visibility this module does not have.
-//
-// The row below pins the measured answer so that the day it changes -- to 101,
-// or to the documented 503 -- this file fails and names what to do next. That is
-// the only honest shape available: an unverified absence claim is as wide as an
-// unverified presence claim, and "cases 3 and 4 are blocked" is an absence
-// claim.
+// A publication reaches a browser only if Factory subscribes to the session
+// channel on HostLink and fans what it receives out to its ClientLink viewers.
+// factory v0.2.0 does neither: it never sends a subscribe on HostLink and
+// constructs no routing.Relay (the type exists; nothing calls NewRelay). The
+// last row drives a real Factory against a real, bound Host and pins that on the
+// wire, so it fails the day Factory starts relaying.
 
 package tests
 
@@ -84,6 +63,12 @@ func upgradeProbe(t *testing.T, f *orchestrationtest.FactoryFixture, origin stri
 		return 0, ""
 	}
 	defer func() { _ = resp.Body.Close() }()
+	// A 101's body IS the upgraded connection: reading it waits on the server
+	// until it gives up on the handshake, which cost this row twenty seconds
+	// the day it first answered 101. It is closed unread.
+	if resp.StatusCode == http.StatusSwitchingProtocols {
+		return resp.StatusCode, ""
+	}
 	body, err := io.ReadAll(io.LimitReader(resp.Body, 1<<16))
 	if err != nil {
 		t.Fatalf("reading the upgrade answer: %v", err)
@@ -112,35 +97,20 @@ func TestFactoryClientLinkIsComposedButNotYetDrivable(t *testing.T) {
 		}
 	})
 
-	t.Run("the upgrade does not complete in this composition", func(t *testing.T) {
-		// MEASURED, and pinned so it fails when it changes.
-		//
-		// 101 means the link is drivable and cases 3 and 4 move on to their
-		// real blocker. 503 means the node has not booted, which is what
-		// Factory's Start documentation describes and would point at a
-		// composition or ordering problem with a named cause. 500 is what this
-		// build actually answers and is the least informative of the three,
-		// because the router recovers a handler panic into exactly that.
+	t.Run("the ClientLink upgrade completes", func(t *testing.T) {
+		// This row pinned the 500 factory v0.1.0 answered, with the instruction
+		// "if it is 101 the link is drivable". It is 101 on factory v0.2.0, and
+		// the Factory ↔ Host lane test drives the link for real.
 		status, body := upgradeProbe(t, served, "http://"+served.Listener.Addr().String())
-		if status != http.StatusInternalServerError {
-			t.Fatalf("the ClientLink upgrade answered %d (%s), not the 500 this composition measured. "+
-				"If it is 101 the link is drivable: write I1.1 cases 3 and 4 against it and delete this row. "+
-				"If it is 503 the node did not boot and Start's own documentation names the cause",
-				status, body)
+		if status != http.StatusSwitchingProtocols {
+			t.Fatalf("the ClientLink upgrade answered %d (%s), want 101", status, body)
 		}
 	})
 
-	t.Run("cases 3 and 4 also wait on a Host publisher", func(t *testing.T) {
-		// The second blocker, stated independently of the first so that fixing
-		// the upgrade does not silently look like unblocking the cases.
-		//
-		// The three enduring events are committed for real. The journal holds
-		// them in order, which is the half this module can prove; what nothing
-		// can do today is observe them arriving at a subscriber, because the
-		// only publisher into a session channel is a Host live tail and no Host
-		// can run.
-		orchestrationtest.AssertHostExposesNoRuntimeCapability(t)
-
+	t.Run("the durable half of cases 3 and 4: three enduring events, in order", func(t *testing.T) {
+		// The journal holds them in order, which is the half this module can
+		// prove; what nothing can do yet is observe them arriving at a
+		// subscriber, for the reason the next row pins.
 		for i := 1; i <= 3; i++ {
 			store.AppendPublicEvent(ctx, session,
 				sessionwire.EventID(fmt.Sprintf("event-reconnect-%d", i)),
@@ -170,6 +140,19 @@ func TestFactoryClientLinkIsComposedButNotYetDrivable(t *testing.T) {
 				t.Fatalf("journal event %d is out of sequence order", i)
 			}
 		}
+	})
+
+	t.Run("cases 3 and 4 wait on Factory relaying the Host tail", func(t *testing.T) {
+		// A real Factory bound to a real, resident Host session -- the same
+		// composition the lane test proves end to end -- and the question asked
+		// of the wire is whether Factory ever subscribes to the session channel.
+		lane := orchestrationtest.NewFactoryHostLane(t, ctx)
+		const relaySession = sessionwire.SessionID("session-reconnect-relay")
+		lane.Create(t, ctx, relaySession, "command-reconnect-relay-create")
+		lane.Host.Attach(t, ctx, relaySession, sessionwire.HostLinkAttachModeCreate)
+		viewer := orchestrationtest.ConnectClientLink(t, ctx, lane.Factory)
+		viewer.Watch(t, ctx, lane.Store.Tenant, relaySession)
+		orchestrationtest.AssertFactorySubscribesToNoHostChannel(t, lane.OnlyHostLink(t))
 	})
 
 	orchestrationtest.AssertNoLeaks(t, ctx, orchestrationtest.LeakSources{

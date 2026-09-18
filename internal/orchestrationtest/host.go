@@ -22,18 +22,12 @@ var ErrWrongCredential = errors.New("orchestrationtest: credential rejected")
 
 // HostFixture is a REAL *host.Host composed from the kit's seams.
 //
-// Read what this is NOT. A *host.Host is a validated, immutable configuration
-// value and nothing else: its exported surface is New plus nineteen pure
-// accessors, with no Serve, Start, Run, Attach, Handler, Stop or Close, and
-// package host imports no net/http. Everything that RUNS a Host --
-// internal/compose.Service, internal/realtime/hostlink -- is under internal/
-// and is therefore unreachable from this module by the Go compiler, not merely
-// by policy. Host's own cmd/host/main.go says so in its package doc: "A
-// PRODUCT CANNOT YET SHIP ITS OWN MAIN AGAINST THIS ... So today a product
-// vendors this file, or Host grows an exported composition surface."
-//
-// The kit therefore composes Host's configuration and its Department for real,
-// and refuses to fake a running Host. See AssertHostExposesNoRuntimeSurface.
+// Read what this is NOT: a running Host. A *host.Host is a validated, immutable
+// configuration value and nothing else, and it is what this fixture builds so
+// the kit's option-validation cases can reach host.New directly. Up to host
+// v0.1.0 that was ALL another module could build -- everything that ran a Host
+// was under internal/. host v0.2.1 exported the composition (Compose, Service,
+// Run), and a RUNNING Host is ComposedHost, in composedhost.go.
 type HostFixture struct {
 	Host       *host.Host
 	Department *department.Department
@@ -217,12 +211,7 @@ func (a *FixedCredentialAuth) Calls() int {
 	return a.calls
 }
 
-// The narrow runtime trip-wire lived here and is REPLACED by
-// AssertHostExposesNoRuntimeCapability in hostsurface.go.
-//
-// It reflected over *host.Host's method set. The subject was right -- the
-// dependency rather than this kit's fixture -- but it read ONE syntactic form of
-// it, and a review built the likely alternative: a separate exported Runtime
-// type carrying Serve/Start, plus a package-level func host.Serve. The wire
-// stayed green. host.Host is documented as an immutable configuration value, so
-// that is the shape a runtime surface will probably arrive in.
+// The runtime trip-wire lived here, was widened in hostsurface.go, and FIRED on
+// the host v0.2.1 pin -- exactly in the shape its widening predicted: not a
+// method on *host.Host but a separate exported Service plus package-level
+// Compose and Run. It is deleted; see hostsurface.go for its replacement.

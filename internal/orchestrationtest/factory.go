@@ -136,6 +136,14 @@ type FactorySeams struct {
 
 	// Reconcile bounds the periodic sweeps. Zero takes Factory's defaults.
 	Reconcile factory.ReconcileLimits
+
+	// SessionBindingID and SessionBindingVersion, when set, compose the V1
+	// create plane: WithSessionBinding plus WithPublicCreates over the real
+	// Store. They travel together because factory.New refuses one without the
+	// other (ErrCreatePlaneIncomplete). A create files a DISPOSITION session,
+	// which is the only kind a Host can take residency on.
+	SessionBindingID      string
+	SessionBindingVersion string
 }
 
 // NewFactoryFixtureWithSeams composes a Factory over chosen collaborators.
@@ -229,6 +237,18 @@ func NewFactoryFixtureWithSeams(tb TB, store *StoreFixture, clock *Clock, seams 
 		options = append(options,
 			factory.WithObjectPolicy(seams.ObjectPolicy),
 			factory.WithObjectStoreResolver(seams.ObjectStore))
+	}
+	if seams.SessionBindingID != "" || seams.SessionBindingVersion != "" {
+		options = append(options,
+			factory.WithSessionBinding(seams.SessionBindingID, seams.SessionBindingVersion),
+			factory.WithPublicCreates(store.Store))
+		if seams.ObjectPolicy == nil {
+			// factory.New refuses a binding with no resolver behind it
+			// (ErrSessionBindingWithoutResolver). A case composing only the
+			// create plane serves no objects, so the resolver it gets refuses
+			// every binding rather than inventing a store.
+			options = append(options, factory.WithObjectStoreResolver(refuseObjectStores))
+		}
 	}
 	if seams.Reconcile != (factory.ReconcileLimits{}) {
 		options = append(options, factory.WithReconcileLimits(seams.Reconcile))
@@ -568,4 +588,11 @@ func (d *StoreDirectory) Owner(ctx context.Context, tenant sessionwire.TenantID,
 // Candidates satisfies factory.Directory.
 func (d *StoreDirectory) Candidates(ctx context.Context, req sessionstore.ListCompatibleHostsRequest) (sessionstore.HostTargetPage, error) {
 	return d.Store.ListCompatibleHosts(ctx, req)
+}
+
+// ErrNoObjectStore is what the kit's create-plane resolver answers.
+var ErrNoObjectStore = errors.New("orchestrationtest: this composition serves no object store")
+
+func refuseObjectStores(context.Context, sessionstore.SessionBinding) (factory.ObjectReader, error) {
+	return nil, ErrNoObjectStore
 }

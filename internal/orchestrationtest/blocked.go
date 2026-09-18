@@ -5,8 +5,8 @@ package orchestrationtest
 // This file holds the kit's BLOCKED-LANE TRIP-WIRES.
 //
 // Each one records, in executable form, a premise that a runbook 07 task is
-// blocked on. They exist for the reason AssertHostExposesNoRuntimeSurface and
-// AssertFactoryComposesNoLinkPlane already exist in this kit: a task deferred in
+// blocked on. They exist for the reason the kit's Host and Factory trip-wires
+// always have: a task deferred in
 // prose disappears, and an absence claim nobody can falsify is as wide as an
 // unverified presence claim. Every assertion here FAILS on the day its blocker
 // lifts, and its message names the task it unblocks.
@@ -15,9 +15,13 @@ package orchestrationtest
 // this case needs does not exist yet"; it says nothing about the behaviour the
 // case would assert. Do not read a green here as coverage of I1.3, I1.4 or I2.3.
 
-// The narrow drain trip-wire lived here and is REPLACED by
-// AssertHostExposesNoDrainCapability in hostsurface.go, for the reason given in
-// host.go: it read one syntactic form of the right subject.
+// The narrow drain trip-wire lived here, was widened into
+// AssertHostExposesNoDrainCapability in hostsurface.go, and FIRED on the host
+// v0.2.1 pin together with its runtime twin: host now exports Compose, Service
+// and Run, and advertises hostlink.drain over HostLink. Both are deleted; the
+// Host trip-wire is now AssertHostCapabilities, which pins the capability set a
+// running Host declares on the wire (hostsurface.go says why that and not a
+// name scan).
 //
 // The four trip-wires that used to live below this line are DELETED, not
 // inverted, because each one's blocker lifted in factory A9.1 stage 2 and each
@@ -36,5 +40,7 @@ package orchestrationtest
 // AssertFactoryComposesNoLinkPlane is deleted from here too; it lived in
 // metrics.go and fired on /v1/realtime leaving the 501 table.
 //
-// What remains is the pair above, which is still true: host v0.1.0 exposes no
-// composition surface and no drain surface.
+// Nothing of the old Host pair remains: host v0.2.1 has both a composition
+// surface and a drain surface. The I1.1 cases 3-4 / I1.4 blocker MOVED to
+// Factory, which relays no Host publication; see
+// AssertFactorySubscribesToNoHostChannel.

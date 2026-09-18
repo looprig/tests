@@ -3,176 +3,160 @@
 package orchestrationtest
 
 import (
-	"go/ast"
-	"go/parser"
-	"go/token"
-	"os"
-	"os/exec"
-	"path/filepath"
+	"slices"
 	"sort"
-	"strings"
+	"time"
+
+	sessionwire "github.com/looprig/core/sessionwire/v1"
 )
 
-// This file widens the Host trip-wires from a SPELLING to a CAPABILITY.
+// This file holds the Host trip-wires, and as of host v0.2.1 they read a
+// CAPABILITY THE HOST DECLARES ON THE WIRE rather than any name in its Go API.
 //
-// The earlier wires reflected over `*host.Host`'s method set. That is the right
-// SUBJECT -- the dependency, not this kit's fixture -- and it is the correction
-// this lane already had to make once. But it is one syntactic form of the
-// subject, and a review proved the gap by building the likely shape: a separate
-// exported `Runtime` type carrying Serve/Start/StartDrain/ObserveDrain, plus a
-// package-level `func host.Serve(...)`. Both wires stayed green.
+// # What happened to the old wires
 //
-// That shape is not a corner case, it is the PROBABLE one. `host.Host` is
-// documented as an immutable configuration value, so a runtime surface almost
-// certainly will not arrive as a method on it. A trip-wire that fires only on
-// the unlikely spelling is a trip-wire that will not fire.
+// AssertHostExposesNoRuntimeCapability and AssertHostExposesNoDrainCapability
+// scanned host's whole exported declaration surface for runtime and drain verbs.
+// Both FIRED on the host v0.2.1 pin -- `Attach`, `Handler`, `Run`, `Start` and
+// `Stop` arrived with B1's exported composition -- which is what they were for.
+// They are DELETED rather than inverted, by this kit's standing rule
+// (blocked.go): a trip-wire kept after its blocker lifts becomes a claim about
+// the past that a later reader takes for a claim about now. The runtime they
+// guarded against is now driven for real by ComposedHost.
 //
-// So the scan below reads the module's whole EXPORTED DECLARATION SURFACE --
-// every importable package, every package-level function, every method on every
-// exported type, and every method declared in an exported interface -- and
-// matches on the runtime and drain vocabulary wherever it appears. It does not
-// care which type carries the verb, or whether anything carries it at all.
+// # Why the replacement is not another name scan
+//
+// "Fire on capability, not spelling" had a precise meaning for the old wires --
+// a verb on ANY type, not just *host.Host -- and it has a sharper one now.
+// Host itself publishes its capability set: every HostLink connect reply carries
+// Core's optional hostlink_methods (core v0.9.0), derived from Host's own
+// dispatch table, and Factory gates Bind, Unbind and Attach on it. That set is
+// the contract a Factory acts on, so it is the thing to pin. A renamed Go method
+// changes none of it; a Host that stops dispatching hostlink.attach, or starts
+// dispatching something new, changes it whatever the Go API is called.
+//
+// The drain wire's lane (runbook 07 I2.3) is therefore no longer blocked on
+// Host: hostlink.drain and hostlink.drain_status are in the set. What I2.3
+// still lacks is a DRAIN CALLER -- Factory has none and the D2.2 ruling puts it
+// in looprig/controller -- which is not a Host capability and is not pinned here.
 
-// runtimeVerbs are names whose appearance anywhere on Host's exported surface
-// would mean the module has grown something that RUNS.
-//
-// They are the verbs a caller uses to start, hold or stop a process, plus the
-// two HTTP entry points. Launch vocabulary is deliberately absent: department's
-// Create, Restore, NewSession and RestoreSession are how a runtime is made, not
-// how the Host is run, and every one of them exists today.
-var runtimeVerbs = []string{
-	"Attach", "Close", "Handler", "Listen", "Run", "Serve", "ServeHTTP",
-	"Shutdown", "Start", "Stop",
+// HostLinkMethodsAtV021 is the exact HostLink capability set released host
+// v0.2.1 advertises, spelled in Core's constants.
+func HostLinkMethodsAtV021() []string {
+	return []string{
+		sessionwire.HostLinkMethodBind,
+		sessionwire.HostLinkMethodUnbind,
+		sessionwire.HostLinkMethodAttach,
+		sessionwire.HostLinkMethodDrain,
+		sessionwire.HostLinkMethodDrainStatus,
+	}
 }
 
-// drainVerbs are names whose appearance would mean Host can be drained.
-var drainVerbs = []string{
-	"BeginDrain", "Drain", "DrainHost", "DrainSession", "ObserveDrain",
-	"RequestDrain", "StartDrain",
-}
-
-// hostExportedNames returns every exported declaration name on the host
-// module's importable packages, with the file and kind it was found at.
-//
-// It resolves the module by asking the toolchain rather than guessing a path,
-// so it follows the workspace and would follow a released pin just as well.
-func hostExportedNames(tb TB) map[string]string {
+// DecodeHostCapabilities decodes a Host's connect reply Data with Core's own
+// connect codec -- the one factory v0.2.0 decodes with -- and fails the case if
+// Core refuses it. A reply Core refuses is a Host no Factory can connect to.
+func DecodeHostCapabilities(tb TB, replyData []byte) sessionwire.VersionNegotiationResponse {
 	tb.Helper()
-	out, err := exec.Command("go", "list", "-f", "{{.Dir}}",
-		"github.com/looprig/host", "github.com/looprig/host/department").Output()
+	response, err := sessionwire.DecodeHostLinkConnectReply(replyData)
 	if err != nil {
-		tb.Fatalf("orchestrationtest: locating the host module's packages: %v", err)
-		return nil
+		tb.Fatalf("orchestrationtest: Core refused the Host's connect reply %s: %v", replyData, err)
+		return sessionwire.VersionNegotiationResponse{}
 	}
-	dirs := strings.Fields(strings.TrimSpace(string(out)))
-	if len(dirs) == 0 {
-		tb.Fatalf("orchestrationtest: the host module resolved to no package directories; " +
-			"this scan is vacuous and would report an absence it never looked for")
-		return nil
-	}
-	found := make(map[string]string)
-	scanned := 0
-	for _, dir := range dirs {
-		entries, err := os.ReadDir(dir)
-		if err != nil {
-			tb.Fatalf("orchestrationtest: reading %s: %v", dir, err)
-			return nil
-		}
-		for _, entry := range entries {
-			name := entry.Name()
-			if entry.IsDir() || !strings.HasSuffix(name, ".go") || strings.HasSuffix(name, "_test.go") {
-				continue
-			}
-			path := filepath.Join(dir, name)
-			file, err := parser.ParseFile(token.NewFileSet(), path, nil, parser.SkipObjectResolution)
-			if err != nil {
-				tb.Fatalf("orchestrationtest: parsing %s: %v", path, err)
-				return nil
-			}
-			scanned++
-			collectExported(file, name, found)
-		}
-	}
-	// A scan that read no files would report "no runtime surface" forever. It
-	// is the vacuity guard this kind of absence assertion always needs.
-	if scanned == 0 {
-		tb.Fatalf("orchestrationtest: parsed 0 host source files; the surface scan is vacuous")
-		return nil
-	}
-	return found
+	return response
 }
 
-func collectExported(file *ast.File, where string, found map[string]string) {
-	for _, decl := range file.Decls {
-		switch d := decl.(type) {
-		case *ast.FuncDecl:
-			// Package-level functions AND methods. A method's receiver type is
-			// not consulted: a verb on any exported type is the capability.
-			if d.Name.IsExported() {
-				found[d.Name.Name] = where
-			}
-		case *ast.GenDecl:
-			for _, spec := range d.Specs {
-				typeSpec, ok := spec.(*ast.TypeSpec)
-				if !ok || !typeSpec.Name.IsExported() {
-					continue
-				}
-				iface, ok := typeSpec.Type.(*ast.InterfaceType)
-				if !ok || iface.Methods == nil {
-					continue
-				}
-				for _, method := range iface.Methods.List {
-					for _, name := range method.Names {
-						if name.IsExported() {
-							found[name.Name] = where
-						}
-					}
-				}
-			}
-		}
+// ProbeHostCapabilities connects a raw Core-framed client to a running Host and
+// returns the negotiation it answered. It is a CAPABILITY read: it asks the
+// running process, not its source.
+func ProbeHostCapabilities(tb TB, h *ComposedHost) sessionwire.VersionNegotiationResponse {
+	tb.Helper()
+	request, err := sessionwire.EncodeHostLinkConnectRequest(sessionwire.VersionNegotiationRequest{
+		SupportedVersions: []sessionwire.WireVersion{sessionwire.CurrentWireVersion},
+	})
+	if err != nil {
+		tb.Fatalf("orchestrationtest: encoding Core's connect request: %v", err)
+		return sessionwire.VersionNegotiationResponse{}
 	}
+	result := RawHostLinkConnect(tb, h.Endpoint, KitServiceToken, "centrifuge-json", request, 5*time.Second)
+	if !result.Connected {
+		tb.Fatalf("orchestrationtest: the capability probe did not connect: %+v", result)
+		return sessionwire.VersionNegotiationResponse{}
+	}
+	return DecodeHostCapabilities(tb, result.ReplyData)
 }
 
-func matchedVerbs(surface map[string]string, verbs []string) []string {
-	hits := make([]string, 0, len(verbs))
-	for _, verb := range verbs {
-		if where, ok := surface[verb]; ok {
-			hits = append(hits, verb+" ("+where+")")
-		}
-	}
-	sort.Strings(hits)
-	return hits
-}
-
-// AssertHostExposesNoRuntimeCapability is runbook 07 I1.1 cases 3-4 and I1.4's
-// trip-wire, widened from `*host.Host`'s method set to the module's whole
-// exported surface.
+// AssertHostCapabilities is the Host trip-wire. It fires when the capability set
+// a running Host advertises is not exactly want, in either direction, and says
+// which lane each difference moves.
 //
-// It fires on a runtime verb wherever it appears -- a method on any exported
-// type, a package-level function, or a method declared in an exported interface
-// -- so a `Runtime` type with `Serve`, or a bare `func host.Serve`, trips it
-// just as a method on `Host` would.
-func AssertHostExposesNoRuntimeCapability(tb TB) {
+// The comparison is a SET comparison. Order is the Host's dispatch-table order
+// and carries no meaning Core assigns; duplicates cannot reach here because
+// Core's decoder refuses them.
+func AssertHostCapabilities(tb TB, got sessionwire.VersionNegotiationResponse, want []string) {
 	tb.Helper()
-	hits := matchedVerbs(hostExportedNames(tb), runtimeVerbs)
-	if len(hits) == 0 {
+	if got.Version != sessionwire.CurrentWireVersion {
+		tb.Fatalf("orchestrationtest: the Host negotiated wire version %d, want %d", got.Version, sessionwire.CurrentWireVersion)
 		return
 	}
-	tb.Fatalf("orchestrationtest: the host module now exports %v. Host has grown something that RUNS, "+
-		"so a session channel can have a publisher: runbook 07 I1.1 cases 3-4 and I1.4 are no longer "+
-		"blocked. Drive the live tail for real and delete this trip-wire", hits)
+	methods := got.HostLinkMethods()
+	if len(methods) == 0 {
+		tb.Fatalf("orchestrationtest: the Host advertised NO HostLink methods. A Factory treats that as a Host " +
+			"predating core v0.9.0 and will not bind, unbind or attach to it at all")
+		return
+	}
+	have := slices.Clone(methods)
+	sort.Strings(have)
+	expected := slices.Clone(want)
+	sort.Strings(expected)
+	if slices.Equal(have, expected) {
+		return
+	}
+	var gained, lost []string
+	for _, method := range have {
+		if !slices.Contains(expected, method) {
+			gained = append(gained, method)
+		}
+	}
+	for _, method := range expected {
+		if !slices.Contains(have, method) {
+			lost = append(lost, method)
+		}
+	}
+	tb.Fatalf("orchestrationtest: the Host's HostLink capability set moved: gained %v, lost %v (advertised %v). "+
+		"A LOST method is one a Factory now refuses locally -- losing hostlink.attach takes this Host out of B5 "+
+		"placement, losing hostlink.drain re-blocks runbook 07 I2.3. A GAINED method is new Host behaviour no "+
+		"Factory gates yet: audit Factory's capability gate and the integration lane, then move this pin", gained, lost, methods)
 }
 
-// AssertHostExposesNoDrainCapability is runbook 07 I2.3's trip-wire, widened the
-// same way and kept separate from the runtime wire because the two unblock
-// different tasks and a merged message would mis-attribute whichever fired.
-func AssertHostExposesNoDrainCapability(tb TB) {
+// AssertFactorySubscribesToNoHostChannel is runbook 07 I1.1 cases 3-4 and
+// I1.4's trip-wire, MOVED from Host to Factory.
+//
+// Those cases need a Host publication to reach a browser through Factory. The
+// Host half now exists: host v0.2.1 relays a resident runtime's committed tail
+// to a HostLink subscriber of the session channel (host's own
+// TestAComposedHostRunsTheAttachAndLiveLinkRoundtrip). The Factory half does
+// not: factory v0.2.0 constructs no routing.Relay and never subscribes to a
+// session channel on HostLink, so nothing it receives can be fanned out. The
+// wire is where that is decided, so the wire is what this reads: it fires the
+// first time Factory SENDS a subscribe on a HostLink connection.
+func AssertFactorySubscribesToNoHostChannel(tb TB, conn *TappedConn) {
 	tb.Helper()
-	hits := matchedVerbs(hostExportedNames(tb), drainVerbs)
-	if len(hits) == 0 {
+	commands, err := conn.Commands()
+	if err != nil {
+		tb.Fatalf("orchestrationtest: the tapped HostLink could not be read: %v", err)
 		return
 	}
-	tb.Fatalf("orchestrationtest: the host module now exports %v. Host has grown a drain surface, "+
-		"so runbook 07 I2.3 is no longer blocked: drive drain ordering for real and delete this "+
-		"trip-wire", hits)
+	if len(commands) == 0 {
+		tb.Fatalf("orchestrationtest: the tapped HostLink carried no Factory command at all; " +
+			"an absence of subscribes read off an empty connection is vacuous")
+		return
+	}
+	for _, command := range commands {
+		if command.Subscribe != nil {
+			tb.Fatalf("orchestrationtest: Factory subscribed to %q on HostLink. Factory now relays the Host live "+
+				"tail, so runbook 07 I1.1 cases 3-4 and I1.4 are no longer blocked on it: drive them for real "+
+				"and delete this trip-wire", command.Subscribe.Channel)
+			return
+		}
+	}
 }
