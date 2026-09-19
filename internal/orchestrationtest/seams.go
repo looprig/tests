@@ -42,18 +42,31 @@ const KitControlShards = 4
 
 // StoreCommands adapts the real *sessionstore.Store to factory.Commands.
 //
-// Five of the six methods are the Store's own. ControlShards is NOT: the Store
+// Every method but one is the Store's own. ControlShards is NOT: the Store
 // exposes no such method, and the count is a property of the DEPLOYMENT's fixed
 // shard layout rather than of the store, so a composition root supplies it. It
 // is an adapter with one configured value, not a fake.
+//
+// factory v0.5.0 widened this seam: AdmitCommand/GetCommand were REPLACED by
+// the DISPOSITION set -- AdmitDispositionCommand, GetDispositionCommand,
+// PutCommandPayload, RejectDispositionCommand and ListDueDispositionCommands --
+// because the disposition family is the only one a Host can take residency on.
+// RejectCommand and ListDueCommands survive as the LEGACY deadline sweep, which
+// settles rows a store may already hold and which nothing admits into. Both
+// sweeps run, so this adapter records both due-page streams separately: a case
+// asserting on one must not be satisfied by the other's traffic.
 type StoreCommands struct {
 	Store  *sessionstore.Store
 	Shards int
 
-	mu       sync.Mutex
-	due      []sessionstore.ListDueCommandsRequest
-	claims   []sessionstore.AcquireReconciliationClaimRequest
-	admitted int
+	mu            sync.Mutex
+	due           []sessionstore.ListDueCommandsRequest
+	dispositions  []sessionstore.ListDueDispositionCommandsRequest
+	claims        []sessionstore.AcquireReconciliationClaimRequest
+	admitted      int
+	admittedDisp  int
+	rejectedDisp  []sessionstore.RejectDispositionCommandRequest
+	payloadWrites int
 }
 
 // NewStoreCommands adapts store with the kit's shard count.
@@ -78,25 +91,78 @@ func (c *StoreCommands) Admitted() int {
 	return c.admitted
 }
 
-// AdmitCommand satisfies factory.Commands.
-func (c *StoreCommands) AdmitCommand(ctx context.Context, req sessionstore.AdmitCommandRequest) (sessionstore.InboxEntry, bool, error) {
+// AdmittedDispositions reports how many commands were admitted into the
+// disposition family through this seam.
+func (c *StoreCommands) AdmittedDispositions() int {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.admittedDisp
+}
+
+// DispositionDueRequests reports every DISPOSITION due-page query a sweep made,
+// in order. It is deliberately separate from DueRequests: the legacy sweep and
+// the disposition sweep are two rotations over the same shard space, and a case
+// that pooled them could not tell which one ran.
+func (c *StoreCommands) DispositionDueRequests() []sessionstore.ListDueDispositionCommandsRequest {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return append([]sessionstore.ListDueDispositionCommandsRequest(nil), c.dispositions...)
+}
+
+// RejectedDispositions reports every disposition rejection the deadline sweep
+// wrote, in order.
+func (c *StoreCommands) RejectedDispositions() []sessionstore.RejectDispositionCommandRequest {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return append([]sessionstore.RejectDispositionCommandRequest(nil), c.rejectedDisp...)
+}
+
+// AdmitDispositionCommand satisfies factory.Commands.
+func (c *StoreCommands) AdmitDispositionCommand(ctx context.Context, req sessionstore.AdmitDispositionCommandRequest) (sessionstore.DispositionInboxEntry, bool, error) {
 	c.mu.Lock()
 	c.admitted++
+	c.admittedDisp++
 	c.mu.Unlock()
-	return c.Store.AdmitCommand(ctx, req)
+	return c.Store.AdmitDispositionCommand(ctx, req)
 }
 
-// GetCommand satisfies factory.Commands.
-func (c *StoreCommands) GetCommand(ctx context.Context, req sessionstore.GetCommandRequest) (sessionstore.InboxEntry, error) {
-	return c.Store.GetCommand(ctx, req)
+// GetDispositionCommand satisfies factory.Commands.
+func (c *StoreCommands) GetDispositionCommand(ctx context.Context, req sessionstore.GetDispositionCommandRequest) (sessionstore.DispositionInboxEntry, error) {
+	return c.Store.GetDispositionCommand(ctx, req)
 }
 
-// RejectCommand satisfies factory.Commands.
+// PutCommandPayload satisfies factory.Commands.
+func (c *StoreCommands) PutCommandPayload(ctx context.Context, req sessionstore.PutCommandPayloadRequest) (sessionwire.ObjectMetadata, error) {
+	c.mu.Lock()
+	c.payloadWrites++
+	c.mu.Unlock()
+	return c.Store.PutCommandPayload(ctx, req)
+}
+
+// RejectDispositionCommand satisfies factory.Commands and records the write.
+func (c *StoreCommands) RejectDispositionCommand(ctx context.Context, req sessionstore.RejectDispositionCommandRequest) (sessionstore.DispositionInboxEntry, bool, error) {
+	c.mu.Lock()
+	c.rejectedDisp = append(c.rejectedDisp, req)
+	c.mu.Unlock()
+	return c.Store.RejectDispositionCommand(ctx, req)
+}
+
+// ListDueDispositionCommands satisfies factory.Commands and factory.PendingCommands,
+// and records the query.
+func (c *StoreCommands) ListDueDispositionCommands(ctx context.Context, req sessionstore.ListDueDispositionCommandsRequest) (sessionstore.DispositionDueCommandPage, error) {
+	c.mu.Lock()
+	c.dispositions = append(c.dispositions, req)
+	c.mu.Unlock()
+	return c.Store.ListDueDispositionCommands(ctx, req)
+}
+
+// RejectCommand satisfies factory.Commands (the LEGACY deadline sweep).
 func (c *StoreCommands) RejectCommand(ctx context.Context, req sessionstore.RejectCommandRequest) (sessionstore.InboxEntry, error) {
 	return c.Store.RejectCommand(ctx, req)
 }
 
-// ListDueCommands satisfies factory.Commands and records the query.
+// ListDueCommands satisfies factory.Commands (the LEGACY deadline sweep) and
+// records the query.
 func (c *StoreCommands) ListDueCommands(ctx context.Context, req sessionstore.ListDueCommandsRequest) (sessionstore.DueCommandPage, error) {
 	c.mu.Lock()
 	c.due = append(c.due, req)
