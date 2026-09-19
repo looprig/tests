@@ -37,7 +37,7 @@ const KitActorCredential = "orchestrationtest-actor-credential"
 // its durable read plane is faked: SessionReader and Commands are the real
 // *sessionstore.Store, which satisfies both interfaces exactly.
 //
-// What IS faked, and why: Authorizer, identity.Verifier and PlacementController
+// What IS faked, and why: Authorizer, identity.Verifier and WorkloadController
 // are seams a DEPLOYER supplies -- Factory ships no implementation of any of
 // them -- so a kit implementation is the only possible one, not a substitute
 // for something drivable. Directory is a thin adapter over the real Store,
@@ -49,7 +49,7 @@ type FactoryFixture struct {
 	BaseURL   string
 	Client    *http.Client
 	Authorize *RecordingAuthorizer
-	Placement *RecordingPlacement
+	Placement *RecordingWorkloads
 	Directory *StoreDirectory
 
 	// Commands, Gates and Targets are the composed durable seams the three
@@ -107,10 +107,25 @@ type FactorySeams struct {
 	Reader SessionReaderSeam
 	// Commands is the durable command plane. Nil takes the real Store.
 	Commands factory.Commands
-	// Placement is the placement controller. Nil takes a RecordingPlacement,
-	// which is also what FactoryFixture.Placement reports; a case that
-	// substitutes its own gets a nil there and must not read it.
-	Placement factory.PlacementController
+	// Placement is the DEDICATED workload controller. Nil takes a
+	// RecordingWorkloads, which is also what FactoryFixture.Placement reports;
+	// a case that substitutes its own gets a nil there and must not read it.
+	//
+	// It is factory.WorkloadController and no longer factory.PlacementController.
+	// factory v0.3.0 deprecated the latter and NOTHING READS IT: pooled
+	// placement goes through this module's own HostLink attach and dedicated
+	// placement through the workload seam. A kit that kept composing the dead
+	// option would have gone on asserting "no placement happened" against a
+	// collaborator Factory never calls -- vacuously true for every possible
+	// build. That is the blindness blocked.go records for two earlier wires,
+	// and this is the third instance of it.
+	Placement factory.WorkloadController
+
+	// PendingCommands composes WithPendingCommands, which is what TRIGGERS
+	// pooled placement: without it a replica logs a WARN at Start and places
+	// nothing at all. Nil composes none, which is what every read-only case
+	// wants.
+	PendingCommands factory.PendingCommands
 	// Directory is the observed target directory. Nil takes a StoreDirectory
 	// over the real Store.
 	Directory factory.Directory
@@ -159,12 +174,12 @@ func NewFactoryFixtureWithSeams(tb TB, store *StoreFixture, clock *Clock, seams 
 	if seams.Commands != nil {
 		commands = seams.Commands
 	}
-	var recording *RecordingPlacement
-	var placement factory.PlacementController
+	var recording *RecordingWorkloads
+	var placement factory.WorkloadController
 	if seams.Placement != nil {
 		placement = seams.Placement
 	} else {
-		recording = &RecordingPlacement{}
+		recording = &RecordingWorkloads{}
 		placement = recording
 	}
 	var storeDirectory *StoreDirectory
@@ -216,7 +231,7 @@ func NewFactoryFixtureWithSeams(tb TB, store *StoreFixture, clock *Clock, seams 
 		factory.WithSessionReader(reader),
 		factory.WithCommands(commands),
 		factory.WithDirectory(directory),
-		factory.WithPlacementController(placement),
+		factory.WithWorkloadController(placement),
 		factory.WithCatalog(store.Store),
 		factory.WithGates(gates),
 		factory.WithHostTargets(targets),
@@ -252,6 +267,9 @@ func NewFactoryFixtureWithSeams(tb TB, store *StoreFixture, clock *Clock, seams 
 	}
 	if seams.Reconcile != (factory.ReconcileLimits{}) {
 		options = append(options, factory.WithReconcileLimits(seams.Reconcile))
+	}
+	if seams.PendingCommands != nil {
+		options = append(options, factory.WithPendingCommands(seams.PendingCommands))
 	}
 
 	server, err := factory.New(options...)
@@ -511,43 +529,6 @@ func (a *RecordingAuthorizer) AuthorizeSubscribe(context.Context, identity.Princ
 func (a *RecordingAuthorizer) AuthorizeServiceSweep(context.Context, identity.Principal) error {
 	a.record("AuthorizeServiceSweep")
 	return nil
-}
-
-// RecordingPlacement satisfies factory.PlacementController and records intent.
-type RecordingPlacement struct {
-	mu       sync.Mutex
-	ensured  []sessionstore.DesiredWorkload
-	released int
-}
-
-// EnsurePlacement satisfies factory.PlacementController.
-func (p *RecordingPlacement) EnsurePlacement(_ context.Context, desired sessionstore.DesiredWorkload) error {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	p.ensured = append(p.ensured, desired)
-	return nil
-}
-
-// ReleasePlacement satisfies factory.PlacementController.
-func (p *RecordingPlacement) ReleasePlacement(context.Context, sessionwire.TenantID, sessionwire.SessionID) error {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	p.released++
-	return nil
-}
-
-// Ensured reports every desired workload asked for.
-func (p *RecordingPlacement) Ensured() []sessionstore.DesiredWorkload {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	return append([]sessionstore.DesiredWorkload(nil), p.ensured...)
-}
-
-// Released reports how many placements were released.
-func (p *RecordingPlacement) Released() int {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	return p.released
 }
 
 // StoreDirectory adapts the real Store to factory.Directory.

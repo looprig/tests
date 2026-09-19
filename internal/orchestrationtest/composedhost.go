@@ -13,7 +13,7 @@ import (
 	"time"
 
 	sessionwire "github.com/looprig/core/sessionwire/v1"
-	"github.com/looprig/core/uuid"
+	harnessstore "github.com/looprig/harness/pkg/sessionstore"
 	"github.com/looprig/host"
 	"github.com/looprig/host/department"
 	"github.com/looprig/sessionstore"
@@ -44,8 +44,19 @@ type ComposedHost struct {
 	Tap      *HostLinkTap
 	Auth     *FixedCredentialAuth
 
-	// Endpoint is the tenant's HostLink address, exactly as Host advertises it
-	// in its registration: ws://<loopback>/hostlink/<tenant>.
+	// Base is this Host's advertised HostLink BASE, exactly as it appears in
+	// the registration and the capacity report: ws://<loopback>, with no path.
+	//
+	// host v0.3.0 refuses anything else at composition, and factory v0.5.0
+	// derives each tenant's address from it. The kit advertised
+	// ws://<loopback>/hostlink/<tenant> up to host v0.2.1; that spelling is
+	// now refused with base_names_tenant, which is why this field exists
+	// beside Endpoint rather than replacing its meaning.
+	Base sessionwire.InternalEndpoint
+
+	// Endpoint is the tenant's DERIVED HostLink address --
+	// sessionwire.HostLinkEndpoint(Base, tenant) -- which is what a dial must
+	// use. Host advertises Base, not this.
 	Endpoint   sessionwire.InternalEndpoint
 	ID         sessionwire.HostID
 	Generation uint64
@@ -87,11 +98,17 @@ func NewComposedHost(tb TB, ctx context.Context, store *StoreFixture, cfg Compos
 		tb.Fatalf("orchestrationtest: opening the host listener: %v", err)
 		return nil
 	}
-	endpoint := sessionwire.InternalEndpoint("ws://" + listener.Addr().String() + host.HostLinkPathPrefix + string(store.Tenant))
+	base := sessionwire.InternalEndpoint("ws://" + listener.Addr().String())
+	endpoint, err := sessionwire.HostLinkEndpoint(base, store.Tenant)
+	if err != nil {
+		_ = listener.Close()
+		tb.Fatalf("orchestrationtest: deriving the tenant HostLink endpoint from %q: %v", base, err)
+		return nil
+	}
 
 	runtime := NewFakeRuntime(kitRuntimeUUID)
 	rig := &FakeRig{Session: runtime}
-	evidence := &GatedEvidence{Runtime: runtime}
+	evidence := &GatedEvidence{Store: store.Journal, Runtime: runtime}
 	// The trivial tenant verifier the owner direction (2026-09-18) asks for:
 	// auth is the application's job, so the fixture accepts exactly one
 	// credential for exactly one tenant and adds nothing else.
@@ -101,7 +118,7 @@ func NewComposedHost(tb TB, ctx context.Context, store *StoreFixture, cfg Compos
 	blueprint := host.Composition{
 		Options: host.Options{
 			HostID:            cfg.ID,
-			InternalEndpoint:  endpoint,
+			InternalEndpoint:  base,
 			IsolationClass:    sessionwire.HostIsolationClassTenantExclusive,
 			Placement:         sessionwire.HostPlacementPooled,
 			Capacity:          4,
@@ -143,9 +160,12 @@ func NewComposedHost(tb TB, ctx context.Context, store *StoreFixture, cfg Compos
 			NamespaceLayout: func(tenant sessionwire.TenantID, session sessionwire.SessionID) string {
 				return string(tenant) + "/" + string(session)
 			},
-			RigSessionIDs: func(context.Context, sessionwire.TenantID, sessionwire.SessionID) (uuid.UUID, error) {
-				return kitRuntimeUUID, nil
-			},
+			// RigSessionIDs is deliberately NOT supplied. host v0.3.0
+			// deprecated it and consults it only for an UNBOUND (legacy)
+			// record, and a create over a legacy record is now refused
+			// outright -- so a kit that still supplied it would be describing
+			// a path no shipped Factory produces. The runtime identity comes
+			// from the binding's RuntimeSessionID instead; see KitBinding.
 		},
 	}
 	service, err := host.Compose(ctx, blueprint)
@@ -177,6 +197,7 @@ func NewComposedHost(tb TB, ctx context.Context, store *StoreFixture, cfg Compos
 		Evidence:   evidence,
 		Tap:        tap,
 		Auth:       auth,
+		Base:       base,
 		Endpoint:   endpoint,
 		ID:         cfg.ID,
 		Generation: cfg.Generation,
@@ -249,8 +270,15 @@ func (w *TempWorkspaces) ReleaseWorkspace(context.Context, sessionwire.TenantID,
 // ErrEvidenceNotYetReadable is what GatedEvidence answers while its gate is shut.
 var ErrEvidenceNotYetReadable = errors.New("orchestrationtest: the runtime's disposition is not yet readable")
 
-// GatedEvidence is the kit's settlement evidence reader: the deployer seam that
-// stands where the runtime's journal would.
+// GatedEvidence is the kit's settlement evidence reader.
+//
+// It EMBEDS a real *harness sessionstore.Store, and that embedding is load
+// bearing rather than decorative. As of host v0.3.0 this seam is two things at
+// once: the settlement evidence reader (which this type overrides) AND the
+// runtime journal an attach reads to decide whether a conversation already
+// exists (which the embedded store answers). host.Compose REFUSES a reader that
+// is not a harness store, so the kit's previous stand-alone fake made every
+// create fail at composition. Do not "simplify" the embedding away.
 //
 // It answers from what the kit's runtime ACTUALLY RECORDED. An applied
 // disposition is reported only for an attempt FakeRuntime was handed, so a
@@ -263,6 +291,7 @@ var ErrEvidenceNotYetReadable = errors.New("orchestrationtest: the runtime's dis
 // Open is called the NEXT pass can settle. Which event drives that next pass is
 // what the case measures.
 type GatedEvidence struct {
+	*harnessstore.Store
 	Runtime *FakeRuntime
 
 	mu    sync.Mutex

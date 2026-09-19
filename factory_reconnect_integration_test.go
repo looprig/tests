@@ -142,18 +142,10 @@ func TestFactoryClientLinkIsComposedButNotYetDrivable(t *testing.T) {
 		}
 	})
 
-	t.Run("cases 3 and 4 wait on Factory relaying the Host tail", func(t *testing.T) {
-		// A real Factory bound to a real, resident Host session -- the same
-		// composition the lane test proves end to end -- and the question asked
-		// of the wire is whether Factory ever subscribes to the session channel.
-		lane := orchestrationtest.NewFactoryHostLane(t, ctx)
-		const relaySession = sessionwire.SessionID("session-reconnect-relay")
-		lane.Create(t, ctx, relaySession, "command-reconnect-relay-create")
-		lane.Host.Attach(t, ctx, relaySession, sessionwire.HostLinkAttachModeCreate)
-		viewer := orchestrationtest.ConnectClientLink(t, ctx, lane.Factory)
-		viewer.Watch(t, ctx, lane.Store.Tenant, relaySession)
-		orchestrationtest.AssertFactorySubscribesToNoHostChannel(t, lane.OnlyHostLink(t))
-	})
+	// The trip-wire that used to stand here -- "cases 3 and 4 wait on Factory
+	// relaying the Host tail" -- FIRED on the factory v0.5.0 pin and is
+	// deleted. Cases 3 and 4 are now driven end to end against a real Host in
+	// TestFactoryRepairsAReconnectedBrowserAcrossReplicas below.
 
 	orchestrationtest.AssertNoLeaks(t, ctx, orchestrationtest.LeakSources{
 		Store:              store,

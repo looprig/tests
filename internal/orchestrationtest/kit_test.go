@@ -97,7 +97,7 @@ func mustFail(t *testing.T, want string, body func(tb TB)) {
 // about, so the case's own refusal is the only thing under test.
 func fillHostSeams(options *host.Options, store *StoreFixture, from *HostFixture) {
 	options.HostID = "orchestrationtest-host-seam"
-	options.InternalEndpoint = "wss://seam.internal.test/hostlink"
+	options.InternalEndpoint = "wss://seam.internal.test"
 	options.Department = from.Department
 	options.SessionStore = &CatalogSessionStore{Store: store.Store}
 	options.Workspaces = from.Workspaces
@@ -178,7 +178,7 @@ func TestOrchestrationTestKit(t *testing.T) {
 	})
 
 	hostFixture := NewHostFixture(t, store, "orchestrationtest-host-1",
-		"wss://orchestrationtest-host-1.internal.test:8443/hostlink", kitAgent, kitCompatibility)
+		"wss://orchestrationtest-host-1.internal.test:8443", kitAgent, kitCompatibility)
 
 	t.Run("the department is real and its capability discovery discovers", func(t *testing.T) {
 		if hostFixture.Department.Len() != 1 {
@@ -223,7 +223,7 @@ func TestOrchestrationTestKit(t *testing.T) {
 	t.Run("a dedicated host is a different structural branch", func(t *testing.T) {
 		pinned := store.SeedSession(ctx, kitAgent, string(kitCompatibility))
 		dedicated := NewDedicatedHostFixture(t, store, "orchestrationtest-host-2",
-			"wss://orchestrationtest-host-2.internal.test:8443/hostlink", kitAgent, kitCompatibility, pinned)
+			"wss://orchestrationtest-host-2.internal.test:8443", kitAgent, kitCompatibility, pinned)
 		if dedicated.Host.Placement() != sessionwire.HostPlacementDedicated {
 			t.Fatalf("placement = %q", dedicated.Host.Placement())
 		}
@@ -260,13 +260,13 @@ func TestOrchestrationTestKit(t *testing.T) {
 			ID: "orchestrationtest-host-running", Generation: 3, Agent: kitAgent,
 			Compatibility: kitCompatibility, StorageBindingID: "orchestrationtest-binding",
 		})
-		AssertHostCapabilities(t, ProbeHostCapabilities(t, running), HostLinkMethodsAtV021())
+		AssertHostCapabilities(t, ProbeHostCapabilities(t, running), HostLinkSurfaceAtV040())
 	})
 
 	t.Run("host refuses an invalid composition", func(t *testing.T) {
 		options := PooledHostOptions()
 		options.HostID = "orchestrationtest-host-bad"
-		options.InternalEndpoint = "wss://x.test/hostlink"
+		options.InternalEndpoint = "wss://x.test"
 		options.Department = hostFixture.Department
 		options.SessionStore = &CatalogSessionStore{Store: store.Store}
 		options.Workspaces = hostFixture.Workspaces
@@ -481,21 +481,35 @@ func TestOrchestrationTestKit(t *testing.T) {
 			t.Fatalf("no host advertised capacity, yet %d candidates came back", len(page.Hosts))
 		}
 
-		if err := factoryFixture.Placement.EnsurePlacement(ctx, sessionstore.DesiredWorkload{
-			PayloadVersion: "orchestrationtest/v1",
-			Payload:        []byte(`{"replicas":1}`),
-		}); err != nil {
-			t.Fatalf("RecordingPlacement.EnsurePlacement: %v", err)
+		// The recorder's own control: Touched() must count a call of EVERY
+		// kind, not only an ensure. An absence assertion that counted ensures
+		// alone would miss an observe, a drain or a delete.
+		intent := sessionstore.PlacementIntent{
+			TenantID:  store.Tenant,
+			SessionID: seamSession,
+			Workload:  sessionstore.DesiredWorkload{PayloadVersion: "orchestrationtest/v1", Payload: []byte(`{"replicas":1}`)},
+		}
+		if err := factoryFixture.Placement.EnsureWorkload(ctx, intent); err != nil {
+			t.Fatalf("RecordingWorkloads.EnsureWorkload: %v", err)
 		}
 		ensured := factoryFixture.Placement.Ensured()
-		if len(ensured) != 1 || ensured[0].PayloadVersion != "orchestrationtest/v1" {
+		if len(ensured) != 1 || ensured[0].Workload.PayloadVersion != "orchestrationtest/v1" {
 			t.Fatalf("Ensured() = %+v", ensured)
 		}
-		if err := factoryFixture.Placement.ReleasePlacement(ctx, store.Tenant, seamSession); err != nil {
-			t.Fatalf("RecordingPlacement.ReleasePlacement: %v", err)
+		if _, found, err := factoryFixture.Placement.ObserveWorkload(ctx, intent); err != nil || found {
+			t.Fatalf("ObserveWorkload = found %v err %v, want no observation", found, err)
 		}
-		if factoryFixture.Placement.Released() != 1 {
-			t.Fatalf("Released() = %d, want 1", factoryFixture.Placement.Released())
+		if _, err := factoryFixture.Placement.RequestDrain(ctx, intent); err != nil {
+			t.Fatalf("RecordingWorkloads.RequestDrain: %v", err)
+		}
+		if err := factoryFixture.Placement.DeleteWorkload(ctx, intent); err != nil {
+			t.Fatalf("RecordingWorkloads.DeleteWorkload: %v", err)
+		}
+		if deleted := factoryFixture.Placement.Deleted(); len(deleted) != 1 {
+			t.Fatalf("Deleted() = %+v, want one", deleted)
+		}
+		if touched := factoryFixture.Placement.Touched(); touched != 4 {
+			t.Fatalf("Touched() = %d after one call of each kind, want 4", touched)
 		}
 	})
 
@@ -675,19 +689,20 @@ func TestOrchestrationTestKitAssertionsCanFail(t *testing.T) {
 		// negotiation built with Core's own builder, so the wire is exercised on
 		// the exact type a Host reply decodes into.
 		v021 := sessionwire.VersionNegotiationResponse{Version: sessionwire.CurrentWireVersion}.
-			WithHostLinkMethods(HostLinkMethodsAtV021()...)
-		AssertHostCapabilities(t, v021, HostLinkMethodsAtV021())
+			WithHostLinkMethods(HostLinkSurfaceAtV040()...)
+		AssertHostCapabilities(t, v021, HostLinkSurfaceAtV040())
 
 		withoutAttach := sessionwire.VersionNegotiationResponse{Version: sessionwire.CurrentWireVersion}.
 			WithHostLinkMethods(sessionwire.HostLinkMethodBind, sessionwire.HostLinkMethodUnbind,
-				sessionwire.HostLinkMethodDrain, sessionwire.HostLinkMethodDrainStatus)
+				sessionwire.HostLinkMethodDrain, sessionwire.HostLinkMethodDrainStatus,
+				sessionwire.HostLinkCapabilityGateResponse)
 		mustFail(t, "lost [hostlink.attach]", func(tb TB) {
-			AssertHostCapabilities(tb, withoutAttach, HostLinkMethodsAtV021())
+			AssertHostCapabilities(tb, withoutAttach, HostLinkSurfaceAtV040())
 		})
 		grown := sessionwire.VersionNegotiationResponse{Version: sessionwire.CurrentWireVersion}.
-			WithHostLinkMethods(append(HostLinkMethodsAtV021(), "hostlink.future")...)
+			WithHostLinkMethods(append(HostLinkSurfaceAtV040(), "hostlink.future")...)
 		mustFail(t, "gained [hostlink.future]", func(tb TB) {
-			AssertHostCapabilities(tb, grown, HostLinkMethodsAtV021())
+			AssertHostCapabilities(tb, grown, HostLinkSurfaceAtV040())
 		})
 		// The vacuity guard: a Host advertising nothing is a pre-v0.9.0 Host,
 		// not a Host with an empty set that happens to match an empty want.
@@ -696,15 +711,18 @@ func TestOrchestrationTestKitAssertionsCanFail(t *testing.T) {
 		})
 	})
 
-	t.Run("the factory relay wire fires on a subscribe and refuses to be vacuous", func(t *testing.T) {
-		quiet := &TappedConn{}
-		quiet.messages = []TappedMessage{{Payload: []byte(`{"id":2,"rpc":{"method":"hostlink.bind","data":{}}}`)}}
-		AssertFactorySubscribesToNoHostChannel(t, quiet)
-
-		subscribing := &TappedConn{}
-		subscribing.messages = []TappedMessage{{Payload: []byte(`{"id":2,"rpc":{"method":"hostlink.bind","data":{}}}` + "\n" +
-			`{"id":3,"subscribe":{"channel":"hostlink.v1.a.b"}}`)}}
-		mustFail(t, "no longer blocked", func(tb TB) { AssertFactorySubscribesToNoHostChannel(tb, subscribing) })
-		mustFail(t, "vacuous", func(tb TB) { AssertFactorySubscribesToNoHostChannel(tb, &TappedConn{}) })
+	t.Run("Factory DOES subscribe to the Host session channel", func(t *testing.T) {
+		// The positive replacement for the deleted relay trip-wire. It is not
+		// an inversion of it: the wire asked the tap whether a subscribe had
+		// ever been sent, and this asks the same tap the same question with the
+		// opposite expectation, over a real lane. A tap carrying no Factory
+		// command at all would be vacuous, so that is refused first.
+		lane := NewFactoryHostLane(t, ctx)
+		const relayed = sessionwire.SessionID("session-kit-relay")
+		lane.Create(t, ctx, relayed, "command-kit-relay-create")
+		lane.Host.Attach(t, ctx, relayed, sessionwire.HostLinkAttachModeCreate)
+		viewer := ConnectClientLink(t, ctx, lane.Factory)
+		viewer.Watch(t, ctx, lane.Store.Tenant, relayed)
+		AssertFactorySubscribesToTheSessionChannel(t, ctx, lane, relayed)
 	})
 }

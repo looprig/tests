@@ -42,7 +42,14 @@ type FakeRig struct {
 	restores []department.RigRestoreRequest
 }
 
-// NewSession satisfies department.Rig.
+// NewSession satisfies department.Rig, LAUNCHING UNDER THE REQUESTED IDENTITY.
+//
+// The identity is host v0.3.0's obligation N8 and it is not cosmetic.
+// department refuses a launch whose session ID() is not the RigSessionID it
+// asked for and releases it again (ErrRigSessionIdentity), so a rig that always
+// answered one constant id -- which this one used to -- makes every binding
+// naming another id fail. Honouring it here is what a product's own
+// department.Rig must do.
 func (r *FakeRig) NewSession(_ context.Context, req department.RigCreateRequest) (department.RigSession, error) {
 	r.mu.Lock()
 	r.creates = append(r.creates, req)
@@ -50,18 +57,31 @@ func (r *FakeRig) NewSession(_ context.Context, req department.RigCreateRequest)
 	if r.CreateErr != nil {
 		return nil, r.CreateErr
 	}
-	return r.Session, nil
+	return r.launchAs(req.RigSessionID), nil
 }
 
-// RestoreSession satisfies department.Rig.
-func (r *FakeRig) RestoreSession(_ context.Context, _ uuid.UUID, req department.RigRestoreRequest) (department.RigSession, error) {
+// RestoreSession satisfies department.Rig, launching under the restored id.
+func (r *FakeRig) RestoreSession(_ context.Context, id uuid.UUID, req department.RigRestoreRequest) (department.RigSession, error) {
 	r.mu.Lock()
 	r.restores = append(r.restores, req)
 	r.mu.Unlock()
 	if r.RestoreErr != nil {
 		return nil, r.RestoreErr
 	}
-	return r.Session, nil
+	return r.launchAs(id), nil
+}
+
+// launchAs adopts the requested identity on the configured session.
+//
+// A FakeRuntime carries whatever identity it is launched under; anything else
+// (BareRuntime, and every deliberately-incapable stand-in) is returned as it
+// is, because those types exist to be REFUSED and rewriting their id would
+// change which refusal a case observes.
+func (r *FakeRig) launchAs(id uuid.UUID) department.RigSession {
+	if runtime, ok := r.Session.(*FakeRuntime); ok && !id.IsZero() {
+		runtime.adopt(id)
+	}
+	return r.Session
 }
 
 // Creates reports every create the rig was asked for.
@@ -105,7 +125,18 @@ func NewFakeRuntime(id uuid.UUID) *FakeRuntime {
 }
 
 // ID satisfies department.RigSession.
-func (r *FakeRuntime) ID() uuid.UUID { return r.id }
+func (r *FakeRuntime) ID() uuid.UUID {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.id
+}
+
+// adopt takes the identity a launch was asked for. See FakeRig.NewSession.
+func (r *FakeRuntime) adopt(id uuid.UUID) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.id = id
+}
 
 // WaitIdle satisfies department.IdleWaiter.
 func (r *FakeRuntime) WaitIdle(ctx context.Context) error { return ctx.Err() }

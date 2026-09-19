@@ -44,7 +44,7 @@ func TestFactoryServesRetainedObjectsWithEveryHostStopped(t *testing.T) {
 	clock := orchestrationtest.NewClock(time.Unix(coldReadEpoch, 0))
 	store := orchestrationtest.NewStoreFixture(t, ctx, clock)
 	hostFixture := orchestrationtest.NewHostFixture(t, store, "orchestrationtest-object-host",
-		"wss://object.internal.test/hostlink", coldReadAgent, coldReadCompatibility)
+		"wss://object.internal.test", coldReadAgent, coldReadCompatibility)
 
 	// TWO sessions, because the object route BRANCHES on the session's binding:
 	// a zero (legacy) binding reads through the composed SessionReader and never
@@ -66,9 +66,9 @@ func TestFactoryServesRetainedObjectsWithEveryHostStopped(t *testing.T) {
 	// stopped. Without this the file asserts that objects are readable for
 	// sessions that never ran, which is not the criterion.
 	store.RegisterHost(ctx, legacy, "orchestrationtest-object-host",
-		"wss://object.internal.test/hostlink", coldReadAgent, string(coldReadCompatibility), objectLeaseEpoch)
+		"wss://object.internal.test", coldReadAgent, string(coldReadCompatibility), objectLeaseEpoch)
 	store.RegisterHost(ctx, bound, "orchestrationtest-object-host",
-		"wss://object.internal.test/hostlink", coldReadAgent, string(coldReadCompatibility), objectLeaseEpoch)
+		"wss://object.internal.test", coldReadAgent, string(coldReadCompatibility), objectLeaseEpoch)
 
 	policy := orchestrationtest.NewAllowListObjectPolicy()
 	reader := &orchestrationtest.StoreObjectReader{Store: store.Store}
@@ -185,8 +185,8 @@ func TestFactoryServesRetainedObjectsWithEveryHostStopped(t *testing.T) {
 		if ensured := hostFixture.Workspaces.Ensured(); ensured != 0 {
 			t.Fatalf("an object read materialized %d workspaces", ensured)
 		}
-		if placed := served.Placement.Ensured(); len(placed) != 0 {
-			t.Fatalf("an object read asked for %d placements", len(placed))
+		if touched := served.Placement.Touched(); touched != 0 {
+			t.Fatalf("an object read made %d workload-controller calls: %+v", touched, served.Placement.Ensured())
 		}
 		// And the read really happened, so the four zeros above are not the
 		// zeros of a request that never arrived.

@@ -620,17 +620,11 @@ func (s *foreignloopScenarioLLM) finishStep() {
 	s.mu.Unlock()
 }
 
-func (s *foreignloopScenarioLLM) callCount() int {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	return s.next
-}
-
 // waitCalls blocks until want model steps have completed, then returns the total
 // number of calls entered — so want is a floor for the wait and the caller's
-// equality check still fails on an unscripted extra call. A case that reads
-// callCount directly after a child's
-// terminal event reads a partial count: every backgrounded delegate request
+// equality check still fails on an unscripted extra call. A case that read
+// the raw counter directly after a child's
+// terminal event would read a partial count: every backgrounded delegate request
 // produces one further machine-originated parent turn, and those hand-backs are
 // dispatched asynchronously by harness (internal/sessionruntime/delegation.go
 // handBackRequest starts a session-lifetime goroutine per request). Waiting on

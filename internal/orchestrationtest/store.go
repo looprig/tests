@@ -10,6 +10,7 @@ import (
 	"time"
 
 	sessionwire "github.com/looprig/core/sessionwire/v1"
+	harnessstore "github.com/looprig/harness/pkg/sessionstore"
 	"github.com/looprig/sessionstore"
 	"github.com/looprig/storage"
 	"github.com/looprig/storage/memstore"
@@ -35,6 +36,23 @@ type StoreFixture struct {
 	Store   *sessionstore.Store
 	Tenant  sessionwire.TenantID
 	Clock   *Clock
+
+	// Journal is the REAL harness session store every composed Host in this
+	// case registers as its runtime journal reader.
+	//
+	// It is not an option. host v0.3.0 decides create-against-restore by
+	// READING the runtime journal under the binding's RuntimeSessionID, and
+	// host.Compose REFUSES a JournalStores reader that is not a
+	// *harness sessionstore.Store or a value embedding one -- the kit's old
+	// fake evidence reader is exactly the refused case. It is on the FIXTURE
+	// rather than on each ComposedHost because two Hosts in one case must read
+	// the same journal, which is the whole of "a re-placed session is restored,
+	// not restarted".
+	//
+	// Its backend is a SEPARATE memstore from Backend: the harness journal and
+	// the SessionStore durable plane are two different keyspaces, and a real
+	// deployment does not co-locate them.
+	Journal *harnessstore.Store
 
 	tb TB
 }
@@ -66,6 +84,12 @@ func NewStoreFixture(tb TB, ctx context.Context, clock *Clock) *StoreFixture {
 		Clock:   clock,
 		tb:      tb,
 	}
+	journal, err := harnessstore.Open(memstore.New(), harnessstore.WithTenant(fixture.Tenant))
+	if err != nil {
+		tb.Fatalf("orchestrationtest: opening the harness journal store: %v", err)
+		return nil
+	}
+	fixture.Journal = journal
 	fixture.open(ctx)
 	tb.Cleanup(func() {
 		if fixture.Store == nil {

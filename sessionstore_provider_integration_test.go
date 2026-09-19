@@ -1182,7 +1182,7 @@ func TestSessionStoreHostTargetExpiryIsProviderNeutral(t *testing.T) {
 					HostGeneration: generation,
 					ObservedAt:     clock.Now(),
 					Advertisement: sessionstore.HostAdvertisement{
-						InternalEndpoint:  sessionwire.InternalEndpoint("wss://" + string(host) + ".internal:443/hostlink"),
+						InternalEndpoint:  sessionwire.InternalEndpoint("wss://" + string(host) + ".internal:443"),
 						IsolationClass:    sessionwire.HostIsolationClassTenantExclusive,
 						Accepting:         true,
 						AvailableCapacity: capacity,
@@ -1277,7 +1277,7 @@ func TestSessionStoreHostTargetExpiryIsProviderNeutral(t *testing.T) {
 				HostGeneration: 2,
 				ObservedAt:     clock.Now(),
 				Advertisement: sessionstore.HostAdvertisement{
-					InternalEndpoint:  sessionwire.InternalEndpoint("wss://" + string(lapsing) + ".internal:443/hostlink"),
+					InternalEndpoint:  sessionwire.InternalEndpoint("wss://" + string(lapsing) + ".internal:443"),
 					IsolationClass:    sessionwire.HostIsolationClassTenantExclusive,
 					Accepting:         true,
 					AvailableCapacity: 1,
@@ -1360,7 +1360,7 @@ func TestSessionStoreRegistryTombstoneIsProviderNeutral(t *testing.T) {
 				AgentID:                "agent-a",
 				RuntimeCompatibilityID: "runtime-v1",
 				Placement:              sessionwire.HostPlacementDedicated,
-				InternalEndpoint:       "wss://host-a.internal:443/hostlink",
+				InternalEndpoint:       "wss://host-a.internal:443",
 				Residency:              sessionwire.SessionResidencyResident,
 				Accepting:              true,
 			}
@@ -1723,7 +1723,7 @@ func TestSessionStoreOpaqueKeysAreProviderNeutral(t *testing.T) {
 					AgentID:                "agent-a",
 					RuntimeCompatibilityID: "runtime-v1",
 					Placement:              sessionwire.HostPlacementDedicated,
-					InternalEndpoint:       "wss://host-a.internal:443/hostlink",
+					InternalEndpoint:       "wss://host-a.internal:443",
 					Residency:              sessionwire.SessionResidencyResident,
 					Accepting:              true,
 				},
@@ -2270,7 +2270,7 @@ func TestSessionStorePagesAreBoundedByQueryWork(t *testing.T) {
 					HostGeneration: 1,
 					ObservedAt:     clock.Now(),
 					Advertisement: sessionstore.HostAdvertisement{
-						InternalEndpoint:  sessionwire.InternalEndpoint("wss://host-" + strconv.Itoa(i) + ".internal:443/hostlink"),
+						InternalEndpoint:  sessionwire.InternalEndpoint("wss://host-" + strconv.Itoa(i) + ".internal:443"),
 						IsolationClass:    sessionwire.HostIsolationClassTenantExclusive,
 						Accepting:         true,
 						AvailableCapacity: uint64(i + 1),

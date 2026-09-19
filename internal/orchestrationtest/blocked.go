@@ -42,5 +42,12 @@ package orchestrationtest
 //
 // Nothing of the old Host pair remains: host v0.2.1 has both a composition
 // surface and a drain surface. The I1.1 cases 3-4 / I1.4 blocker MOVED to
-// Factory, which relays no Host publication; see
-// AssertFactorySubscribesToNoHostChannel.
+// Factory, and on the factory v0.5.0 pin it LIFTED TOO: Factory relays the
+// Host's committed tail to its ClientLink subscribers, so
+// AssertFactorySubscribesToNoHostChannel fired and is deleted. Both lanes are
+// now driven for real.
+//
+// NOTHING IS BLOCKED IN THIS FILE ANY MORE. Every trip-wire the kit ever held
+// has fired and been deleted. Keep it empty rather than deleting the file: the
+// rule it records -- fire on the day the blocker lifts, then delete -- is what
+// the next one must be written to.

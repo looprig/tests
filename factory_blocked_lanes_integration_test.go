@@ -65,7 +65,7 @@ func TestIntegrationLaneBlockers(t *testing.T) {
 	clock := orchestrationtest.NewClock(time.Unix(coldReadEpoch, 0))
 	store := orchestrationtest.NewStoreFixture(t, ctx, clock)
 	hostFixture := orchestrationtest.NewHostFixture(t, store, "orchestrationtest-blocked-host",
-		"wss://blocked.internal.test/hostlink", blockedAgent, blockedCompatibility)
+		"wss://blocked.internal.test", blockedAgent, blockedCompatibility)
 	served := orchestrationtest.NewFactoryFixture(t, store, clock)
 	session := store.SeedSession(ctx, blockedAgent, string(blockedCompatibility))
 
@@ -123,7 +123,7 @@ func TestIntegrationLaneBlockers(t *testing.T) {
 			Compatibility: blockedCompatibility, StorageBindingID: "orchestrationtest-blocked-binding",
 		})
 		negotiated := orchestrationtest.ProbeHostCapabilities(t, running)
-		orchestrationtest.AssertHostCapabilities(t, negotiated, orchestrationtest.HostLinkMethodsAtV021())
+		orchestrationtest.AssertHostCapabilities(t, negotiated, orchestrationtest.HostLinkSurfaceAtV040())
 		if !negotiated.Supports(sessionwire.HostLinkMethodDrain) || !negotiated.Supports(sessionwire.HostLinkMethodDrainStatus) {
 			t.Fatalf("a running Host does not support drain and drain_status: %v", negotiated.HostLinkMethods())
 		}
@@ -145,8 +145,8 @@ func TestIntegrationLaneBlockers(t *testing.T) {
 		}
 		const draining = sessionwire.HostID("orchestrationtest-draining-host")
 		const staying = sessionwire.HostID("orchestrationtest-staying-host")
-		store.PublishTarget(ctx, key, draining, "wss://draining.internal.test/hostlink", 4)
-		store.PublishTarget(ctx, key, staying, "wss://staying.internal.test/hostlink", 2)
+		store.PublishTarget(ctx, key, draining, "wss://draining.internal.test", 4)
+		store.PublishTarget(ctx, key, staying, "wss://staying.internal.test", 2)
 
 		before := candidateHosts(t, ctx, served.Directory, key)
 		if !before[draining] || !before[staying] {
@@ -166,7 +166,7 @@ func TestIntegrationLaneBlockers(t *testing.T) {
 		}
 		// Un-ranking capacity is not releasing a session. A drain that also
 		// cleared the registration would be a different, and wrong, operation.
-		store.RegisterHost(ctx, session, draining, "wss://draining.internal.test/hostlink",
+		store.RegisterHost(ctx, session, draining, "wss://draining.internal.test",
 			blockedAgent, string(blockedCompatibility), 3)
 		store.DrainTarget(ctx, key, draining)
 		if _, found := store.HostRouteFor(ctx, served.Directory, session); !found {

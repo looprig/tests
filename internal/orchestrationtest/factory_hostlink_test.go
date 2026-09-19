@@ -39,6 +39,7 @@ import (
 	"time"
 
 	sessionwire "github.com/looprig/core/sessionwire/v1"
+	"github.com/looprig/host/department"
 	"github.com/looprig/sessionstore"
 )
 
@@ -182,10 +183,17 @@ func TestFactoryHostLinkDialsAReleasedHost(t *testing.T) {
 		t.Fatalf("the create was claimed under %+v, want the attach's residency epoch %d", afterAttach.Record.Claim, residency.LeaseEpoch)
 	}
 
-	// Open the runtime's journal. From here the NEXT consumer pass settles the
-	// create; what drives that pass is what the rest of the case measures.
-	lane.Host.Evidence.Open()
-
+	// The runtime's journal stays SHUT here, and that placement is load
+	// bearing as of host v0.4.0. Up to host v0.2.1 an attach ran exactly ONE
+	// consumer pass, so opening the journal straight after the attach left the
+	// create `applying` until something drove the next pass. v0.4.0's attach
+	// pass reports More and consumer.Run takes its `continue` arm, so a SECOND
+	// pass follows within milliseconds -- and it raced the Open, settled the
+	// create, and made "the delivery drove the settlement" unprovable.
+	//
+	// So the journal is opened below, after the link is up and both attach
+	// passes have been observed to stop. See "a bind alone does not wake
+	// Host's consumer".
 	// ---- Factory dials, negotiates and binds ------------------------------
 	viewer := ConnectClientLink(t, boundedContext(t, ctx, 10*time.Second), lane.Factory)
 	viewer.Watch(t, boundedContext(t, ctx, 10*time.Second), lane.Store.Tenant, session)
@@ -241,7 +249,7 @@ func TestFactoryHostLinkDialsAReleasedHost(t *testing.T) {
 		negotiated := DecodeHostCapabilities(t, reply.Connect.Data)
 		// EXACTLY the set, in either direction -- the capability wire, applied
 		// to the reply Factory itself received on its own connection.
-		AssertHostCapabilities(t, negotiated, HostLinkMethodsAtV021())
+		AssertHostCapabilities(t, negotiated, HostLinkSurfaceAtV040())
 		if !negotiated.Supports(sessionwire.HostLinkMethodAttach) {
 			t.Fatalf("Supports(hostlink.attach) = false on the negotiation Factory received")
 		}
@@ -265,14 +273,48 @@ func TestFactoryHostLinkDialsAReleasedHost(t *testing.T) {
 		requireAccepted(t, binds[0], "bind")
 	})
 
+	// attachPassReads is how many settlement evidence reads the ATTACH alone
+	// produces, measured against host v0.4.0.
+	//
+	// It is TWO, and it was ONE up to host v0.2.1. The attach pass claims the
+	// create, dispatches it and tries to settle it (read 1); Reconcile reports
+	// More, so consumer.Run takes the `continue` arm and runs a SECOND pass
+	// immediately, which finds the command still `applying` and tries to settle
+	// it again through settleOrRecover (read 2). Both passes are the attach's
+	// own work -- neither is driven by a hint, a timer (an hour away) or a
+	// delivery -- and the count is stable, which the control below asserts
+	// rather than assumes.
+	const attachPassReads = 2
+
 	t.Run("a bind alone does not wake Host's consumer", func(t *testing.T) {
 		// The control that makes the delivery assertion below mean something.
-		// The gate is open, the route is live, and the consumer timer is an
-		// hour away: if anything but a delivery could drive a pass, it would
-		// settle the create here.
+		// The evidence gate is shut, the route is live, and the consumer timer
+		// is an hour away: if anything but a delivery could drive a further
+		// pass, it would settle the create here.
+		//
+		// What the control has to exclude is an UNBOUNDED consumer, so it
+		// samples twice: a pass count that is still attachPassReads after a
+		// second interval is a consumer that stopped, not one that is spinning
+		// slowly enough to look stopped once.
 		time.Sleep(750 * time.Millisecond)
-		if reads := len(lane.Host.Evidence.Reads()); reads != 1 {
-			t.Fatalf("Host's consumer ran %d evidence reads before any delivery, want 1 (the attach pass)", reads)
+		reads := len(lane.Host.Evidence.Reads())
+		if reads != attachPassReads {
+			t.Fatalf("Host's consumer ran %d evidence reads before any delivery, want %d (the attach pass and its immediate More follow-up)", reads, attachPassReads)
+		}
+		time.Sleep(750 * time.Millisecond)
+		if again := len(lane.Host.Evidence.Reads()); again != attachPassReads {
+			t.Fatalf("Host's consumer ran %d evidence reads and then %d with nothing delivered: it is still passing", reads, again)
+		}
+
+		// NOW open the runtime's journal, with the link up and both attach
+		// passes finished. Opening it drives nothing by itself: a consumer pass
+		// needs a hint, the timer (an hour away) or a More from a pass that
+		// already ran. So the create must still be `applying` afterwards, and
+		// the next pass is the one the delivery drives.
+		lane.Host.Evidence.Open()
+		time.Sleep(750 * time.Millisecond)
+		if opened := len(lane.Host.Evidence.Reads()); opened != attachPassReads {
+			t.Fatalf("Host's consumer ran %d evidence reads after the journal opened with nothing delivered, want %d", opened, attachPassReads)
 		}
 		if state := lane.Command(t, ctx, session, create).Record.State; state != sessionstore.InboxStateApplying {
 			t.Fatalf("the create moved to %q before any delivery", state)
@@ -324,8 +366,8 @@ func TestFactoryHostLinkDialsAReleasedHost(t *testing.T) {
 		if uint64(outcome.SettlingResidencyEpoch) != residency.LeaseEpoch {
 			t.Fatalf("settled by residency %d, want the attach's %d", outcome.SettlingResidencyEpoch, residency.LeaseEpoch)
 		}
-		if reads := len(lane.Host.Evidence.Reads()); reads != 2 {
-			t.Fatalf("Host's consumer made %d evidence reads, want 2: the attach pass and the delivered one", reads)
+		if reads := len(lane.Host.Evidence.Reads()); reads != attachPassReads+1 {
+			t.Fatalf("Host's consumer made %d evidence reads, want %d: the attach's two passes and the delivered one", reads, attachPassReads+1)
 		}
 		cursor, err := lane.Store.Store.LoadDispositionCommandCursor(ctx, sessionstore.LoadDispositionCommandCursorRequest{
 			TenantID: lane.Store.Tenant, SessionID: session,
@@ -342,9 +384,9 @@ func TestFactoryHostLinkDialsAReleasedHost(t *testing.T) {
 		}
 	})
 
-	t.Run("Factory still holds a single link and relays no Host channel", func(t *testing.T) {
+	t.Run("Factory holds a single link and relays the Host's session channel", func(t *testing.T) {
 		lane.OnlyHostLink(t)
-		AssertFactorySubscribesToNoHostChannel(t, link)
+		AssertFactorySubscribesToTheSessionChannel(t, boundedContext(t, ctx, 10*time.Second), lane, session)
 	})
 }
 
@@ -372,8 +414,12 @@ func TestFactoryHostLinkBindToANonResidentSessionIsARefusal(t *testing.T) {
 	if err != nil || !found {
 		t.Fatalf("reading the resident session's registration: found=%v err=%v", found, err)
 	}
-	if real.LeaseEpoch != residency.LeaseEpoch || real.InternalEndpoint != lane.Host.Endpoint {
-		t.Fatalf("the registration names epoch %d at %q, want %d at %q", real.LeaseEpoch, real.InternalEndpoint, residency.LeaseEpoch, lane.Host.Endpoint)
+	// The registration names the Host's advertised BASE, not the derived
+	// per-tenant address: as of host v0.3.0 a Host advertises a bare base and
+	// the deriving Factory computes sessionwire.HostLinkEndpoint(base, tenant)
+	// itself. Asserting on Endpoint here would pin the v0.2.1 spelling.
+	if real.LeaseEpoch != residency.LeaseEpoch || real.InternalEndpoint != lane.Host.Base {
+		t.Fatalf("the registration names epoch %d at %q, want %d at %q", real.LeaseEpoch, real.InternalEndpoint, residency.LeaseEpoch, lane.Host.Base)
 	}
 	stale := real
 	stale.SessionID = nonResident
@@ -477,22 +523,31 @@ func TestHostLinkB8RegressionControls(t *testing.T) {
 		if !control.Connected {
 			t.Fatalf("Host refused Core's bare request too (%+v); the 4501 above proves nothing", control)
 		}
-		AssertHostCapabilities(t, DecodeHostCapabilities(t, control.ReplyData), HostLinkMethodsAtV021())
+		AssertHostCapabilities(t, DecodeHostCapabilities(t, control.ReplyData), HostLinkSurfaceAtV040())
 	})
 }
 
-// TestFactoryCannotAdmitInputToAHostResidentSession is a GAP MARKER, found by
-// this lane and not previously recorded: factory v0.2.0 cannot deliver an input
-// to any session a Host holds.
+// TestFactoryDeliversAnInputToAHostResidentSession is what replaced this
+// lane's longest-standing gap marker.
 //
-// Every control Factory admits except create -- input, interrupt, restore, gate
-// response -- goes through sessionstore.AdmitCommand, the LEGACY inbox, which
-// binds the session's protocol mode legacy. A Host takes residency only through
-// AcquireResidency, which requires DISPOSITION. So on every Host-resident
-// session the admission is refused by the store before anything is delivered,
-// and Factory answers 500. This case fails the day Factory admits controls in
-// the disposition family; delete it then and deliver an input for real.
-func TestFactoryCannotAdmitInputToAHostResidentSession(t *testing.T) {
+// The marker said: factory v0.2.0 cannot deliver an input to any session a Host
+// holds, because every control except create went through
+// sessionstore.AdmitCommand -- the LEGACY inbox, which binds the session's
+// protocol mode legacy -- while a Host takes residency only through
+// AcquireResidency, which requires DISPOSITION. The store refused the admission
+// and Factory answered 500.
+//
+// factory v0.5.0 admits EVERY kind through the disposition family, so the
+// marker fired. It is deleted, and the behaviour it stood in for is driven:
+// the input is admitted 200, delivered over the session channel Core names,
+// dispatched to the Host's runtime and settled applied.
+//
+// The refusal the marker proved is kept as the LOWER HALF of this case. A
+// legacy admission against the same disposition session must still be refused
+// `catalog conflict (binding.protocol_mode)`: that is what makes "Factory
+// admits into the disposition family" a claim about which family it chose, and
+// not merely a claim that a POST returned 200.
+func TestFactoryDeliversAnInputToAHostResidentSession(t *testing.T) {
 	ctx := laneContext(t)
 	lane := NewFactoryHostLane(t, ctx)
 	const (
@@ -502,6 +557,7 @@ func TestFactoryCannotAdmitInputToAHostResidentSession(t *testing.T) {
 	)
 	lane.Create(t, ctx, session, create)
 	lane.Host.Attach(t, ctx, session, sessionwire.HostLinkAttachModeCreate)
+	lane.Host.Evidence.Open()
 	viewer := ConnectClientLink(t, boundedContext(t, ctx, 10*time.Second), lane.Factory)
 	viewer.Watch(t, boundedContext(t, ctx, 10*time.Second), lane.Store.Tenant, session)
 	link := lane.OnlyHostLink(t)
@@ -509,30 +565,60 @@ func TestFactoryCannotAdmitInputToAHostResidentSession(t *testing.T) {
 	if len(binds) != 1 {
 		t.Fatalf("the premise is a live route; Factory sent %d binds", len(binds))
 	}
-	requireAccepted(t, binds[0], "bind this marker's premise needs")
+	requireAccepted(t, binds[0], "bind this case's premise needs")
 
 	body := []byte(`{"version":1,"command_id":"` + string(input) + `","session_id":"` + string(session) +
 		`","blocks":[{"type":"text","text":"hello"}]}`)
 	status, answer := lane.Factory.Post(t, ctx, "/v1/sessions/"+string(session)+"/input", body)
-	if status != http.StatusInternalServerError {
-		t.Fatalf("Factory answered an input to a Host-resident session %d (%s). If it is 200 the gap is "+
-			"closed: deliver an input through the lane for real and delete this marker", status, answer)
+	if status != http.StatusOK {
+		t.Fatalf("Factory answered an input to a Host-resident session %d (%s), want 200", status, answer)
 	}
-	// The cause, read from the store Factory admits through, so the 500 cannot
-	// be some other fault wearing the same status.
-	_, _, err := lane.Store.Store.AdmitCommand(ctx, sessionstore.AdmitCommandRequest{
-		TenantID: lane.Store.Tenant, SessionID: session, CommandID: input,
-		Kind: sessionstore.CommandKind("input"), AcceptedAt: lane.Clock.Now(), ApplyDeadline: lane.Clock.Now().Add(time.Minute),
-		ProposedRuntimeCommandID: sessionstore.RuntimeCommandID(kitRuntimeUUID.String()),
-		Payload:                  body,
+
+	t.Run("the input is admitted into the DISPOSITION family", func(t *testing.T) {
+		// Read from the disposition inbox, which is the only family a Host can
+		// consume. A read that succeeds here is the family assertion.
+		entry := lane.Command(t, ctx, session, input)
+		if entry.Record.Descriptor.RuntimeCommandID == "" {
+			t.Fatalf("the admitted input carries no runtime command id: %+v", entry.Record)
+		}
 	})
-	var catalogErr *sessionstore.CatalogError
-	if !errors.As(err, &catalogErr) || catalogErr.Code != sessionstore.CatalogErrorConflict || catalogErr.Field != "binding.protocol_mode" {
-		t.Fatalf("the legacy admission on a disposition session = %v, want catalog conflict (binding.protocol_mode)", err)
-	}
-	if deliveries := rpcsFor(t, link, sessionwire.HostLinkChannel(lane.Store.Tenant, session)); len(deliveries) != 0 {
-		t.Fatalf("Factory delivered %d commands for a refused admission", len(deliveries))
-	}
+
+	t.Run("it reaches the Host and settles applied", func(t *testing.T) {
+		settled := lane.AwaitCommandState(t, boundedContext(t, ctx, 20*time.Second), session, input, sessionstore.InboxStateApplied)
+		outcome := settled.Record.Outcome
+		if outcome == nil || outcome.Kind != sessionstore.DispositionApplied {
+			t.Fatalf("the input settled with outcome %+v, want applied", outcome)
+		}
+		var applied *department.RuntimeCommand
+		for _, cmd := range lane.Host.Runtime.Applied() {
+			if cmd.CommandID == input {
+				applied = &cmd
+				break
+			}
+		}
+		if applied == nil {
+			t.Fatalf("the Host's runtime was never dispatched %q; it saw %+v", input, lane.Host.Runtime.Applied())
+		}
+		if applied.RuntimeCommandID.IsZero() {
+			t.Fatalf("the input reached the runtime unframed: %+v", applied)
+		}
+	})
+
+	t.Run("a LEGACY admission of the same session is still refused", func(t *testing.T) {
+		// The half the deleted marker proved, kept. Without it "Factory admits
+		// into the disposition family" would be indistinguishable from "the
+		// store stopped caring which family a command is in".
+		_, _, err := lane.Store.Store.AdmitCommand(ctx, sessionstore.AdmitCommandRequest{
+			TenantID: lane.Store.Tenant, SessionID: session, CommandID: "command-lane-input-legacy",
+			Kind: sessionstore.CommandKind("input"), AcceptedAt: lane.Clock.Now(), ApplyDeadline: lane.Clock.Now().Add(time.Minute),
+			ProposedRuntimeCommandID: sessionstore.RuntimeCommandID(kitRuntimeUUID.String()),
+			Payload:                  body,
+		})
+		var catalogErr *sessionstore.CatalogError
+		if !errors.As(err, &catalogErr) || catalogErr.Code != sessionstore.CatalogErrorConflict || catalogErr.Field != "binding.protocol_mode" {
+			t.Fatalf("the legacy admission on a disposition session = %v, want catalog conflict (binding.protocol_mode)", err)
+		}
+	})
 }
 
 // TestFactoryHostLaneAssertionsCanFail is the positive control for every

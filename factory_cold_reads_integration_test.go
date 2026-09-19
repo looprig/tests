@@ -70,7 +70,7 @@ func TestFactoryColdReadsWithEveryHostStopped(t *testing.T) {
 	// its workspace provider counts materialized workspaces, so "no restore, no
 	// runtime" is read off objects that would have recorded one.
 	hostFixture := orchestrationtest.NewHostFixture(t, store, "orchestrationtest-cold-host",
-		"wss://cold.internal.test/hostlink", coldReadAgent, coldReadCompatibility)
+		"wss://cold.internal.test", coldReadAgent, coldReadCompatibility)
 
 	// Two sessions with DIFFERENT durable histories, because "the Host is gone"
 	// and "no Host was ever here" are different states and a case that only had
@@ -86,7 +86,7 @@ func TestFactoryColdReadsWithEveryHostStopped(t *testing.T) {
 	// The resident session really was resident: a live route is published and
 	// then released, which is what a graceful Host shutdown leaves behind.
 	store.RegisterHost(ctx, resident, "orchestrationtest-cold-host",
-		"wss://cold.internal.test/hostlink", coldReadAgent, string(coldReadCompatibility), residentLeaseEpoch)
+		"wss://cold.internal.test", coldReadAgent, string(coldReadCompatibility), residentLeaseEpoch)
 
 	observerA := orchestrationtest.NewObservedReader(store.Store)
 	observerB := orchestrationtest.NewObservedReader(store.Store)
@@ -220,7 +220,7 @@ func TestFactoryColdReadsWithEveryHostStopped(t *testing.T) {
 			t.Fatalf("a template with no advertised capacity is listed while every host is stopped: %s", cold)
 		}
 
-		store.PublishTarget(ctx, key, "orchestrationtest-live-host", "wss://live.internal.test/hostlink", 3)
+		store.PublishTarget(ctx, key, "orchestrationtest-live-host", "wss://live.internal.test", 3)
 		statusLive, live := advertised.Get(t, ctx, "/v1/agents")
 		if statusLive != http.StatusOK {
 			t.Fatalf("GET /v1/agents with a live target = %d: %s", statusLive, live)
@@ -288,12 +288,13 @@ func TestFactoryColdReadsWithEveryHostStopped(t *testing.T) {
 		if ensured := hostFixture.Workspaces.Ensured(); ensured != 0 {
 			t.Fatalf("a detail view materialized %d workspaces", ensured)
 		}
-		// No placement. The recorder would have named the desired workload.
-		if ensuredPlacements := probed.Placement.Ensured(); len(ensuredPlacements) != 0 {
-			t.Fatalf("a detail view asked for %d placements: %+v", len(ensuredPlacements), ensuredPlacements)
-		}
-		if released := probed.Placement.Released(); released != 0 {
-			t.Fatalf("a detail view released %d placements", released)
+		// No placement. This reads the WORKLOAD controller, which Factory
+		// really calls, and counts every call on it rather than only the
+		// ensures: an absence assertion over the deprecated
+		// PlacementController -- which nothing reads -- would have been true
+		// for every possible build.
+		if touched := probed.Placement.Touched(); touched != 0 {
+			t.Fatalf("a detail view made %d workload-controller calls: ensured %+v", touched, probed.Placement.Ensured())
 		}
 		// And the read plane was the ONLY plane touched. Without this the three
 		// counters above could all be zero because the request never reached

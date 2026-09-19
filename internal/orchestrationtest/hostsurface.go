@@ -3,6 +3,7 @@
 package orchestrationtest
 
 import (
+	"context"
 	"slices"
 	"sort"
 	"time"
@@ -40,15 +41,31 @@ import (
 // still lacks is a DRAIN CALLER -- Factory has none and the D2.2 ruling puts it
 // in looprig/controller -- which is not a Host capability and is not pinned here.
 
-// HostLinkMethodsAtV021 is the exact HostLink capability set released host
-// v0.2.1 advertises, spelled in Core's constants.
-func HostLinkMethodsAtV021() []string {
+// HostLinkSurfaceAtV040 is the exact hostlink_methods set released host v0.4.0
+// advertises, spelled in Core's constants.
+//
+// It is SIX entries, not five, and the sixth is not a method. host v0.4.0
+// advertises Core's capability TOKEN hostlink.command.gate_response in the same
+// reply member, after the five reserved methods, and only when its composition
+// wires both gate seams (host.Compose always does). Nothing dispatches it: it
+// is the signal factory v0.5.0's GateResponseCapable reads to decide whether to
+// admit a gate response at all, and a Factory that does not see it answers
+// 409 gate_not_resumable. The two kinds share one member because Core's
+// negotiation reply is the only HostLink record with a TOLERANT decoder -- a
+// new field on the capacity report or the registry observation would be refused
+// by every existing Factory.
+//
+// The pin moved from five to six on the host v0.2.1 -> v0.4.0 bump, and the
+// move was made by auditing Factory's gate rather than by accepting whatever
+// the Host said: factory v0.5.0 gates on exactly this token.
+func HostLinkSurfaceAtV040() []string {
 	return []string{
 		sessionwire.HostLinkMethodBind,
 		sessionwire.HostLinkMethodUnbind,
 		sessionwire.HostLinkMethodAttach,
 		sessionwire.HostLinkMethodDrain,
 		sessionwire.HostLinkMethodDrainStatus,
+		sessionwire.HostLinkCapabilityGateResponse,
 	}
 }
 
@@ -128,35 +145,66 @@ func AssertHostCapabilities(tb TB, got sessionwire.VersionNegotiationResponse, w
 		"Factory gates yet: audit Factory's capability gate and the integration lane, then move this pin", gained, lost, methods)
 }
 
-// AssertFactorySubscribesToNoHostChannel is runbook 07 I1.1 cases 3-4 and
-// I1.4's trip-wire, MOVED from Host to Factory.
+// AssertFactorySubscribesToNoHostChannel was I1.1 cases 3-4 and I1.4's
+// trip-wire and is DELETED.
 //
-// Those cases need a Host publication to reach a browser through Factory. The
-// Host half now exists: host v0.2.1 relays a resident runtime's committed tail
-// to a HostLink subscriber of the session channel (host's own
-// TestAComposedHostRunsTheAttachAndLiveLinkRoundtrip). The Factory half does
-// not: factory v0.2.0 constructs no routing.Relay and never subscribes to a
-// session channel on HostLink, so nothing it receives can be fanned out. The
-// wire is where that is decided, so the wire is what this reads: it fires the
-// first time Factory SENDS a subscribe on a HostLink connection.
-func AssertFactorySubscribesToNoHostChannel(tb TB, conn *TappedConn) {
+// It FIRED on the factory v0.5.0 / host v0.4.0 pin, which is what it was for:
+// Factory now constructs a routing.Relay, subscribes to the session channel on
+// HostLink and fans the Host's committed tail out to its ClientLink
+// subscribers. The kit's standing rule is that a trip-wire kept after its
+// blocker lifts becomes a claim about the past a later reader takes for a claim
+// about now, so it is deleted rather than inverted. The behaviour it guarded is
+// now driven for real -- see factory_reconnect_integration_test.go (I1.1 cases
+// 3-4) and factory_link_backpressure_integration_test.go (I1.4).
+
+// AssertFactorySubscribesToTheSessionChannel is the POSITIVE reader that
+// replaced the deleted relay trip-wire.
+//
+// It asks the same tap the same question -- did Factory send a subscribe on
+// this HostLink? -- with the opposite expectation, and it names the channel
+// Core derives rather than any spelling of this module's own, so a Factory that
+// subscribed to something else fails here rather than passing on a prefix.
+//
+// It POLLS. The subscribe is sent by Factory's relay after the bind is
+// answered, so a single sample right after Watch returns is a race; the wait is
+// bounded by ctx and fails by assertion.
+func AssertFactorySubscribesToTheSessionChannel(tb TB, ctx context.Context, lane *FactoryHostLane, session sessionwire.SessionID) {
 	tb.Helper()
-	commands, err := conn.Commands()
-	if err != nil {
-		tb.Fatalf("orchestrationtest: the tapped HostLink could not be read: %v", err)
-		return
-	}
-	if len(commands) == 0 {
-		tb.Fatalf("orchestrationtest: the tapped HostLink carried no Factory command at all; " +
-			"an absence of subscribes read off an empty connection is vacuous")
-		return
-	}
-	for _, command := range commands {
-		if command.Subscribe != nil {
-			tb.Fatalf("orchestrationtest: Factory subscribed to %q on HostLink. Factory now relays the Host live "+
-				"tail, so runbook 07 I1.1 cases 3-4 and I1.4 are no longer blocked on it: drive them for real "+
-				"and delete this trip-wire", command.Subscribe.Channel)
+	want := sessionwire.HostLinkChannel(lane.Store.Tenant, session)
+	var seen []string
+	for {
+		seen = nil
+		vacuous := true
+		for _, conn := range lane.HostLinks() {
+			commands, err := conn.Commands()
+			if err != nil {
+				tb.Fatalf("orchestrationtest: the tapped HostLink could not be read: %v", err)
+				return
+			}
+			if len(commands) > 0 {
+				vacuous = false
+			}
+			for _, command := range commands {
+				if command.Subscribe == nil {
+					continue
+				}
+				if command.Subscribe.Channel == want {
+					return
+				}
+				seen = append(seen, command.Subscribe.Channel)
+			}
+		}
+		select {
+		case <-ctx.Done():
+			if vacuous {
+				tb.Fatalf("orchestrationtest: no Factory command reached the Host at all, so the absence of "+
+					"a subscribe to %q proves nothing", want)
+				return
+			}
+			tb.Fatalf("orchestrationtest: Factory never subscribed to %q on HostLink (it subscribed to %v). "+
+				"Without that subscribe nothing the Host publishes can reach a ClientLink viewer", want, seen)
 			return
+		case <-time.After(20 * time.Millisecond):
 		}
 	}
 }

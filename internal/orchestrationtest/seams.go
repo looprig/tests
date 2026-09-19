@@ -398,9 +398,21 @@ func (r *StoreObjectReader) GetObject(ctx context.Context, req sessionstore.GetO
 }
 
 // RecordingWorkloads satisfies factory.WorkloadController and records intent.
+//
+// It is the seam a DEDICATED session's platform adapter plugs into -- the
+// controller module's Kubernetes adapter in production -- and Factory ships no
+// implementation, so a kit one is the only possible one.
+//
+// It is ALSO what the kit's "no placement happened" assertions now read. They
+// used to read RecordingPlacement, over the factory.PlacementController seam
+// that v0.3.0 deprecated and NOTHING READS; an absence assertion against a
+// collaborator that is never called is true for every build.
 type RecordingWorkloads struct {
-	mu      sync.Mutex
-	ensured []sessionstore.PlacementIntent
+	mu       sync.Mutex
+	ensured  []sessionstore.PlacementIntent
+	observed []sessionstore.PlacementIntent
+	drained  []sessionstore.PlacementIntent
+	deleted  []sessionstore.PlacementIntent
 }
 
 // Ensured reports every workload intent, in order.
@@ -410,11 +422,53 @@ func (w *RecordingWorkloads) Ensured() []sessionstore.PlacementIntent {
 	return append([]sessionstore.PlacementIntent(nil), w.ensured...)
 }
 
+// Deleted reports every workload deletion, in order.
+func (w *RecordingWorkloads) Deleted() []sessionstore.PlacementIntent {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return append([]sessionstore.PlacementIntent(nil), w.deleted...)
+}
+
+// Touched reports how many calls of any kind this controller received. It is
+// what an "and nothing placed anything" assertion should read: a case that
+// counted only Ensured would miss an observe or a drain.
+func (w *RecordingWorkloads) Touched() int {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return len(w.ensured) + len(w.observed) + len(w.drained) + len(w.deleted)
+}
+
 // EnsureWorkload satisfies factory.WorkloadController.
 func (w *RecordingWorkloads) EnsureWorkload(_ context.Context, intent sessionstore.PlacementIntent) error {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 	w.ensured = append(w.ensured, intent)
+	return nil
+}
+
+// ObserveWorkload satisfies factory.WorkloadController. It reports no
+// observation, which is what a platform answers for a workload it has not
+// started.
+func (w *RecordingWorkloads) ObserveWorkload(_ context.Context, intent sessionstore.PlacementIntent) (sessionwire.HostLinkRegistryObservation, bool, error) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	w.observed = append(w.observed, intent)
+	return sessionwire.HostLinkRegistryObservation{}, false, nil
+}
+
+// RequestDrain satisfies factory.WorkloadController.
+func (w *RecordingWorkloads) RequestDrain(_ context.Context, intent sessionstore.PlacementIntent) (sessionwire.HostLinkDrainObservation, error) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	w.drained = append(w.drained, intent)
+	return sessionwire.HostLinkDrainObservation{}, nil
+}
+
+// DeleteWorkload satisfies factory.WorkloadController.
+func (w *RecordingWorkloads) DeleteWorkload(_ context.Context, intent sessionstore.PlacementIntent) error {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	w.deleted = append(w.deleted, intent)
 	return nil
 }
 
@@ -547,7 +601,17 @@ func (r *RecordingObjectStoreResolver) Resolve(_ context.Context, binding sessio
 }
 
 // AdvanceCatalogJournal moves a session's catalog record up to a journal
-// sequence, which is the precondition for opening a gate against it.
+// sequence, which is the precondition for opening a LEGACY gate against it.
+//
+// IT MUST NOT BE USED ON A DISPOSITION SESSION, and that is a rule rather than
+// a preference. On a disposition record CatalogRecord.LeaseEpoch holds a
+// RESIDENCY epoch issued by the store's own provider (sessionstore v0.12.0),
+// the mark a Host's gate writes ratchet; this helper asserts a caller-chosen
+// epoch into it. Writing one here would either be refused or would move a mark
+// no caller is entitled to move, and a Host publishing a gate afterwards would
+// be fenced out of its own session. Disposition gates are published by a Host
+// under a store-issued *ResidencyGrant and read back with ReadGates -- see the
+// gate case in factory_gate_integration_test.go, which never calls this.
 //
 // OpenGate refuses a gate naming a sequence above the catalog's LastJournalSeq
 // -- "the gate must name an event the journal has durably committed" -- and
