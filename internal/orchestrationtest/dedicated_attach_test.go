@@ -1,8 +1,5 @@
 //go:build integration
 
-// Checkpoint proof for Factory v0.6.0: until that release is on the remote,
-// run with an ephemeral go.work selecting the local Factory candidate.
-
 package orchestrationtest
 
 import (
