@@ -38,6 +38,7 @@
 package tests
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -61,7 +62,20 @@ const (
 	createWordA = "ALPHINE"
 	createWordB = "BERGAMOT"
 	createWordC = "CARDAMOM"
+
+	// createImageIndex is where the non-text block sits. It is INSIDE the
+	// message rather than at either end, so a decoder that reordered blocks
+	// while keeping the texts in sequence is caught.
+	createImageIndex = 2
 )
+
+// createTexts is the message by POSITION, with the image's slot left empty.
+// Asserting against it is what binds order rather than mere presence.
+var createTexts = map[int]string{0: createWordA, 1: createWordB, 3: createWordC}
+
+// createImageBytes is the image's payload, compared BYTE FOR BYTE at the model.
+// A PNG magic number, so a substitution is obvious in a failure message.
+var createImageBytes = []byte{0x89, 0x50, 0x4e, 0x47}
 
 // createFirstMessage is the multi-block, multimodal first message a create
 // carries. It is built with Core's own encoder, so it is the shape Factory
@@ -69,15 +83,15 @@ const (
 func createFirstMessage(t *testing.T) json.RawMessage {
 	t.Helper()
 	blocks := []content.Block{
-		&content.TextBlock{Text: createWordA},
-		&content.TextBlock{Text: createWordB},
+		&content.TextBlock{Text: createTexts[0]},
+		&content.TextBlock{Text: createTexts[1]},
 		// THE NON-TEXT BLOCK. A text-only decoder drops it and every substring
 		// assertion still passes.
 		&content.ImageBlock{
 			MediaType: content.MediaTypeImagePNG,
-			Source:    content.ImageSource{Data: []byte{0x89, 0x50, 0x4e, 0x47}},
+			Source:    content.ImageSource{Data: createImageBytes},
 		},
-		&content.TextBlock{Text: createWordC},
+		&content.TextBlock{Text: createTexts[3]},
 	}
 	encoded, err := content.MarshalBlocks(blocks)
 	if err != nil {
@@ -166,34 +180,40 @@ func TestACreatesMultiBlockFirstMessageReachesTheModelAndSettlesApplied(t *testi
 		if len(blocks) != 4 {
 			t.Fatalf("the model saw %d blocks, want the 4 the create carried: %s", len(blocks), mustEncodeBlocks(t, blocks))
 		}
-		var texts []string
-		images := 0
-		for _, block := range blocks {
-			switch typed := block.(type) {
-			case *content.TextBlock:
-				texts = append(texts, typed.Text)
-			case *content.ImageBlock:
-				images++
-				if typed.MediaType != content.MediaTypeImagePNG {
-					t.Fatalf("the image block arrived as %q, want %q", typed.MediaType, content.MediaTypeImagePNG)
+		// EVERY BLOCK IS PINNED BY POSITION, including the non-text one.
+		//
+		// An earlier version of this row collected the texts in encounter order
+		// and merely COUNTED the images, which left two mutants alive: moving
+		// the image to index 0 with the texts untouched, and replacing its
+		// bytes. Both are exactly host F3's axis -- that repository asserts a
+		// single text block, and this lane exists to be the place a non-text
+		// block is bound -- so both are now assertion kills.
+		for i, block := range blocks {
+			if i == createImageIndex {
+				image, ok := block.(*content.ImageBlock)
+				if !ok {
+					t.Fatalf("block %d is %T, want the image block at that position: the order is the message", i, block)
 				}
-				if len(typed.Source.Data) == 0 {
-					t.Fatalf("the image block arrived with no data: %+v", typed.Source)
+				if image.MediaType != content.MediaTypeImagePNG {
+					t.Fatalf("the image block arrived as %q, want %q", image.MediaType, content.MediaTypeImagePNG)
 				}
-			default:
-				t.Fatalf("an unexpected block type reached the model: %T", block)
+				// THE BYTES, not their length. A decoder that re-encoded or
+				// substituted the payload would keep the length and lose the
+				// image.
+				if !bytes.Equal(image.Source.Data, createImageBytes) {
+					t.Fatalf("the image block arrived carrying %v, want the %v the create sent", image.Source.Data, createImageBytes)
+				}
+				if image.Source.URL != "" {
+					t.Fatalf("the image block arrived as a URL reference %q; it was sent inline", image.Source.URL)
+				}
+				continue
 			}
-		}
-		if images != 1 {
-			t.Fatalf("the model saw %d image blocks, want 1: a text-only decoder drops it and every substring check still passes", images)
-		}
-		want := []string{createWordA, createWordB, createWordC}
-		if len(texts) != len(want) {
-			t.Fatalf("the model saw texts %v, want %v each in its own block", texts, want)
-		}
-		for i, text := range want {
-			if texts[i] != text {
-				t.Fatalf("block %d carried %q, want %q: the order is the message", i, texts[i], text)
+			text, ok := block.(*content.TextBlock)
+			if !ok {
+				t.Fatalf("block %d is %T, want a text block", i, block)
+			}
+			if want := createTexts[i]; text.Text != want {
+				t.Fatalf("block %d carried %q, want %q: the order is the message", i, text.Text, want)
 			}
 		}
 	})
@@ -268,6 +288,22 @@ func TestARestoreSettlesApplied(t *testing.T) {
 	}
 	orchestrationtest.PooledWait(t, "the create settled", 90*time.Second, func() bool {
 		return world.CommandState(ctx, orchestrationtest.PooledTenantA, session, create) == sessionstore.InboxStateApplied
+	})
+	// THE CREATE'S SETTLEMENT IS NOT THE END OF THE CREATE'S TURN, and taking
+	// the baseline here without waiting is a real flake -- it failed 1 run in 5,
+	// `make check` among them.
+	//
+	// harness writes the disposition frame BEFORE the effect: that ordering is
+	// the crash-safety property (a redelivery that finds a prefix knows the
+	// command was applied), so `applied` means "durably recorded", not
+	// "finished". The create's turn is still in flight, and a baseline sampled
+	// at the settlement attributes that turn to the restore --
+	// `the restore drove 1 further model requests, want 0`.
+	//
+	// So the wait is on the TURN, which is what the headline case already does.
+	runtimeID := world.RuntimeSessionID(t, ctx, orchestrationtest.PooledTenantA, session)
+	orchestrationtest.PooledWait(t, "the create's own turn finished", 60*time.Second, func() bool {
+		return orchestrationtest.CountJournalEvents[event.TurnDone](t, world, orchestrationtest.PooledTenantA, runtimeID) >= 1
 	})
 	requestsBefore := len(world.LLM.Requests())
 
