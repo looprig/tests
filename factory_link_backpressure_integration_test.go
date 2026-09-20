@@ -10,29 +10,46 @@
 // The runbook asks for four things. Two are drivable from outside Factory and
 // are driven here; two are not, and are recorded rather than faked.
 //
-//	case 1  a client sharing a HostBinding with a failed one continues without
-//	        loss. DRIVEN, with the failure APPROXIMATED as a client that dies
-//	        abruptly: a DeliveryBinding's egress overflow is internal to
-//	        Factory and nothing outside it can fill that buffer on purpose
-//	        without also being a test of this module's timing.
-//	case 2  a HostBinding failure repairs every local DeliveryBinding
-//	        independently. DRIVEN by severing the HostLink at TCP -- the one
-//	        HostBinding failure a peer CAN inflict -- with two tenants and two
-//	        viewers each, so "independently" has more than one subject.
-//	        The second half of case 2, "while a session on another Host
-//	        continues", is NOT MEASURED: pooled placement chooses the Host, and
-//	        this module cannot pin one session to host-a and another to host-b
-//	        without reaching inside Factory's placement. Owed.
+//	case 1  "the slow client receives reset/closes and REPAIRS; the peer
+//	        continues without loss." BOTH HALVES DRIVEN, with the failure
+//	        APPROXIMATED as a client that dies abruptly rather than one that
+//	        overflows: a DeliveryBinding's egress buffer is internal to Factory
+//	        and nothing outside it can fill that buffer on purpose without also
+//	        being a test of this module's timing. The repair half reconnects the
+//	        dead client and holds it to the same rule every reconnect in this
+//	        lane is held to.
+//	case 2  "a HostBinding failure repairs every local DeliveryBinding
+//	        independently WHILE A SESSION ON ANOTHER HOST CONTINUES."
+//	        FIRST HALF DRIVEN by severing the HostLink at TCP -- the one
+//	        HostBinding failure a peer CAN inflict, and a TRANSPORT failure
+//	        rather than a queue failure, which is worth saying -- with two
+//	        tenants and three live viewers, so "independently" has more than one
+//	        subject.
+//	        SECOND HALF OWED, AND REACHABLE: it is not blocked on anything.
+//	        Pooled placement keys candidates on (AgentID, RuntimeCompatibilityID,
+//	        Placement), so two Hosts registering DISJOINT compatibilities under
+//	        two agents put two sessions on two Hosts with no Factory seam and no
+//	        placement override. What it costs is a per-Host agent and
+//	        compatibility in the pooled kit, which StartPooledHost does not carry
+//	        yet. Not done here; do not read its absence as impossible.
 //	case 3  the SELECTED Centrifuge slow-consumer threshold, and whether it
 //	        closes a subscription or the physical link. NOT MEASURED. It needs
 //	        the buffer to actually overflow, which is case 1's unreachable
 //	        window, and the runbook is explicit that an assumed library
 //	        behaviour must not be encoded. Owed, and deliberately not guessed.
-//	case 4  enduring frames are never oldest-dropped. DRIVEN, and it is the
-//	        same rule every case in this lane rests on: a dropped enduring
-//	        frame is a SILENT GAP, and PooledCoveredThrough refuses one. A
-//	        session.reset is not a drop -- it is how a client is TOLD to
-//	        re-read -- so the rule counts coverage, not records.
+//	case 4  "enduring frames are never oldest-dropped AND ephemeral coalescing
+//	        remains bounded."
+//	        FIRST CLAUSE DRIVEN, and it is the rule every case in this lane
+//	        rests on: a dropped enduring frame is a SILENT GAP, and
+//	        PooledCoveredThrough refuses one. A session.reset is not a drop --
+//	        it is how a client is TOLD to re-read -- so the rule counts
+//	        coverage, not records.
+//	        SECOND CLAUSE OWED, and not measured anywhere in this module. The
+//	        kit's product runtime commits only ENDURING publications: it has no
+//	        ephemeral stream at all, so there is nothing here for coalescing to
+//	        bound. Measuring it needs an ephemeral producer in the pooled
+//	        runtime (token deltas and tool lifecycle are harness's ephemeral
+//	        class) and an assertion on what survives the coalescer. Owed.
 
 package tests
 
@@ -117,7 +134,7 @@ func TestRealtimeFailureBlastRadiusIsBoundedByTheSession(t *testing.T) {
 		})
 	}
 
-	t.Run("case 1: a client that dies takes none of its peer's stream with it", func(t *testing.T) {
+	t.Run("case 1: a client that dies takes none of its peer's stream with it, and repairs", func(t *testing.T) {
 		// THE APPROXIMATION, again stated where it is made: a DeliveryBinding
 		// that overflows and one whose socket dies are two different failures,
 		// and only the second can be caused from outside. What both share, and
@@ -151,6 +168,41 @@ func TestRealtimeFailureBlastRadiusIsBoundedByTheSession(t *testing.T) {
 		if strays := survivor.Strays(); len(strays) != 0 {
 			t.Fatalf("the peer received records naming another session: %v", strays)
 		}
+
+		// THE OTHER HALF OF THE ROW: "the slow client ... repairs". The client
+		// that died comes back, learns where it is from the journal -- a
+		// subscribe to a quiet session delivers nothing, see
+		// reconnectCapturedTip -- and its live tail continues from there, held
+		// to the same rule.
+		reborn := orchestrationtest.ConnectPooledViewer(t, ctx, served, orchestrationtest.PooledTenantA)
+		if err := reborn.Watch(t, ctx, orchestrationtest.PooledTenantA, sessions[orchestrationtest.PooledTenantA]); err != nil {
+			t.Fatalf("the repaired client's subscribe was refused: %v", err)
+		}
+		resumed := reconnectCapturedTip(t, ctx, served, sessions[orchestrationtest.PooledTenantA])
+		if resumed < 2*perInput {
+			t.Fatalf("the repaired client resumed at tip %d, want at least %d", resumed, 2*perInput)
+		}
+		input(t, orchestrationtest.PooledTenantA, "command-backpressure-repaired")
+		orchestrationtest.PooledWait(t, "the repaired client received the continued stream", 60*time.Second, func() bool {
+			covered, err := orchestrationtest.PooledCoveredThroughFrom(reborn.Records(), resumed)
+			return err == nil && covered >= 3*perInput
+		})
+		t.Logf("case 1: the repaired client resumed at %d and received %v", resumed, reborn.Records())
+		covered, err = orchestrationtest.PooledCoveredThroughFrom(reborn.Records(), resumed)
+		if err != nil || covered < 3*perInput {
+			t.Fatalf("the repaired client's stream %v covers through %d (%v) from %d, want %d with no silent gap",
+				reborn.Records(), covered, err, resumed, 3*perInput)
+		}
+		if strays := reborn.Strays(); len(strays) != 0 {
+			t.Fatalf("the repaired client received records naming another session: %v", strays)
+		}
+		// THE REPAIRED CLIENT IS NOT CARRIED INTO CASE 2, and the reason is the
+		// fixture rather than the product: ConnectPooledViewer registers its
+		// close on the `t` it was given, so this connection is closed when this
+		// subtest returns. Carrying it further would assert about a socket the
+		// harness had already shut -- measured, as a viewer that received
+		// [E7 E8 E9] and then nothing across the sever while its peer on the
+		// same session repaired normally.
 	})
 
 	t.Run("case 2: a HostBinding failure repairs every binding independently", func(t *testing.T) {
@@ -163,8 +215,10 @@ func TestRealtimeFailureBlastRadiusIsBoundedByTheSession(t *testing.T) {
 		}
 		t.Logf("case 2: severed %d TCP connections to the Host", pooled.Sever())
 
+		// tenant-a has had three inputs by now (the create, case 1's peer input
+		// and case 1's repair input); tenant-b has had one.
 		want := map[sessionwire.TenantID]uint64{
-			orchestrationtest.PooledTenantA: 3 * perInput,
+			orchestrationtest.PooledTenantA: 4 * perInput,
 			orchestrationtest.PooledTenantB: 2 * perInput,
 		}
 		for _, tenant := range tenants {

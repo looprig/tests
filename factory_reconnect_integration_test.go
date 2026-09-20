@@ -226,6 +226,22 @@ func reconnectInput(t *testing.T, ctx context.Context, world *orchestrationtest.
 // learns where it is by reading the journal, and the live tail continues from
 // there. A case that waited on the socket alone would wait forever, which is
 // what the first draft of this file did.
+//
+// # THE LIMITATION THIS PUTS ON I1.1 CASE 3, STATED
+//
+// The acceptance row asks the reconnected browser to "observe ALL THREE
+// exactly once and in order". THIS FIXTURE CANNOT SHOW IT THE THREE. It can
+// only show it a NUMBER, and the reason is structural rather than lazy:
+// PooledTails is the PRODUCT's committed stream and SessionStore's journal
+// holds none of it, so orchestrationtest.pooledTipReader reports the product's
+// tip and CLEARS page.Events whenever that tip is above the store's. A
+// reconnecting browser here therefore learns `CapturedTip` and nothing else.
+//
+// So case 3 proves two things and not the third: that the tip the missed events
+// left is reachable THROUGH THE OTHER REPLICA, and that the live tail then
+// continues exactly once and in order from it. That the three missed events
+// themselves can be read back is NOT proven here, and needs a fixture whose
+// product events are in SessionStore's own journal.
 func reconnectCapturedTip(t *testing.T, ctx context.Context, f *orchestrationtest.PooledFactory, session sessionwire.SessionID) uint64 {
 	t.Helper()
 	status, body := f.Get(t, ctx, orchestrationtest.PooledTenantA, "/v1/sessions/"+string(session)+"/journal")
@@ -274,6 +290,11 @@ func assertLiveTailIsExactlyOnceInOrder(t *testing.T, viewer *orchestrationtest.
 // is away, and it reconnects TO THE OTHER REPLICA. It must learn the tip those
 // three left behind, and its live tail must then continue exactly once and in
 // order -- with nothing shared between the replicas but the durable plane.
+//
+// IT IS WEAKER THAN THE ACCEPTANCE ROW, which asks the browser to observe the
+// three missed events themselves. That is not reachable in this fixture, for a
+// structural reason stated in full at reconnectCapturedTip. Read the limitation
+// there before treating this case as covering the row.
 func TestFactoryRepairsAReconnectedBrowserAcrossReplicas(t *testing.T) {
 	ctx, world, replicaA, replicaB, session := reconnectWorld(t)
 	const perInput = orchestrationtest.PooledPublicationsPerInput

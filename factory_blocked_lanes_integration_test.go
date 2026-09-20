@@ -2,7 +2,11 @@
 
 // This file records, in executable form, the integration-lane cases that still
 // cannot be driven against the composed services, and it is much smaller than it
-// was.
+// was -- and as of the factory v0.5.0 / host v0.4.0 pin it records NONE.
+//
+// Every premise it ever held has lifted. What remains are rows that assert the
+// LIFTED state, each naming the task it unblocked, so the day one is withdrawn
+// the failure says which lane it takes with it.
 //
 // # What A9.1 stage 2 removed from it
 //
@@ -69,30 +73,26 @@ func TestIntegrationLaneBlockers(t *testing.T) {
 	served := orchestrationtest.NewFactoryFixture(t, store, clock)
 	session := store.SeedSession(ctx, blockedAgent, string(blockedCompatibility))
 
-	t.Run("I1.4 waits on Factory relaying the Host tail", func(t *testing.T) {
-		// I1.4's four cases name a DeliveryBinding, a HostBinding, the selected
-		// Centrifuge slow-consumer threshold, and the enduring/ephemeral drop
-		// policy. Factory now composes all of that machinery -- the ClientLink
-		// node, the HostLink pool and the routing table.
+	t.Run("I1.4's premise has LIFTED: the composed limits are the ones a driven lane uses", func(t *testing.T) {
+		// THIS ROW USED TO SAY I1.4 WAS BLOCKED. It named factory v0.2.0, which
+		// subscribed to no session channel on HostLink and constructed no
+		// routing.Relay, and it cited AssertFactorySubscribesToNoHostChannel as
+		// the wire pin for that premise.
 		//
-		// What it cannot do is FILL a DeliveryBinding. A session channel's
-		// records come from the Host live tail (routing.Tail, "the Host live
-		// tail's control surface for one session"), which arrives over HostLink
-		// from a running Host and must then be relayed by Factory. Until both
-		// halves exist there is no stream to overflow, and I1.4 case 3's own
-		// instruction -- "record whether it
-		// closes a subscription or physical link ... do not encode an assumed
-		// library behavior" -- forbids the only alternative, which is a fake of
-		// both ends.
+		// BOTH ARE GONE. factory v0.5.0 relays the Host's committed tail, the
+		// trip-wire FIRED on that pin and was deleted, and I1.4 is driven for
+		// real in factory_link_backpressure_integration_test.go -- which also
+		// records, at the reader, which of the runbook's four cases it can
+		// measure and which are owed. Leaving the old text here would have made
+		// the repository say I1.4 was blocked and driven at once, which is
+		// exactly the failure mode this file's own header warns about: a
+		// trip-wire kept past its blocker becomes a claim about the past that a
+		// later reader takes for a claim about now.
 		//
-		// So the blocker MOVED rather than lifted: it was Factory's composition,
-		// then Host's missing runtime surface -- which host v0.2.1 closed -- and
-		// it is now FACTORY again: factory v0.2.0 never subscribes to a session
-		// channel on HostLink and constructs no routing.Relay, so a Host
-		// publication has nowhere to go. That premise is pinned on the wire by
-		// AssertFactorySubscribesToNoHostChannel (factory_reconnect and the
-		// Factory ↔ Host lane test). The limits are still validated and still
-		// reachable, which is what this row proves is not the obstacle.
+		// What survives is the part that was never a blocker and is still worth
+		// asserting: the limits I1.4 reasons about are COMPOSED and non-zero, so
+		// a backpressure case that saw no overflow saw none because of
+		// behaviour rather than because the bounds were never configured.
 		clientLimits := served.Server.ClientLinkLimits()
 		hostLimits := served.Server.HostLinkLimits()
 		if clientLimits.MaxConnections <= 0 || clientLimits.PerConnectionQueueBytes <= 0 {
