@@ -200,6 +200,37 @@ func (l *PooledLLM) Requests() []inference.Request {
 	return append([]inference.Request(nil), l.requests...)
 }
 
+// UserBlocksContaining returns the BLOCKS of the first user message, in any
+// model request at or after from, that carries needle.
+//
+// IT IS BLOCK-LEVEL ON PURPOSE. "The first message reached the model" is not a
+// substring question: a product that concatenated three paragraphs into one
+// text block, or dropped an image and kept the caption, satisfies every
+// substring check while losing exactly what a multimodal first message is for.
+// Returning the blocks lets a case assert their COUNT and their TYPES, which is
+// the gap host's own gate recorded as F3 -- every create fixture in that repo
+// carries one text block, so the "byte-identical to the input Factory would
+// have admitted" claim was asserted over a single example.
+func (l *PooledLLM) UserBlocksContaining(from int, needle string) []content.Block {
+	for i, request := range l.Requests() {
+		if i < from {
+			continue
+		}
+		for _, message := range request.Messages {
+			user, ok := message.(*content.UserMessage)
+			if !ok {
+				continue
+			}
+			encoded, err := json.Marshal(user.Blocks)
+			if err != nil || !strings.Contains(string(encoded), needle) {
+				continue
+			}
+			return append([]content.Block(nil), user.Blocks...)
+		}
+	}
+	return nil
+}
+
 // SawInRequest reports whether any model request after index from carried
 // needle anywhere in its messages.
 func (l *PooledLLM) SawInRequest(from int, needle string) bool {
