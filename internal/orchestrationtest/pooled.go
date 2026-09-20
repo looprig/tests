@@ -537,10 +537,20 @@ type PooledDispatch struct {
 	AttemptID string
 }
 
+// pooledRecorder records what the product runtime was DISPATCHED. It is an
+// observation for a case to read; it is not, and must never again become, the
+// source a settlement is vouched from. See PooledEvidence.
 type pooledRecorder struct {
 	mu        sync.Mutex
 	dispatch  []PooledDispatch
 	commanded []department.RuntimeCommand
+}
+
+// Dispatched reports every command the product runtime accepted, in order.
+func (r *pooledRecorder) Dispatched() []PooledDispatch {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return append([]PooledDispatch(nil), r.dispatch...)
 }
 
 func (r *pooledRecorder) add(cmd department.RuntimeCommand) {
@@ -548,17 +558,6 @@ func (r *pooledRecorder) add(cmd department.RuntimeCommand) {
 	defer r.mu.Unlock()
 	r.dispatch = append(r.dispatch, PooledDispatch{CommandID: cmd.CommandID, AttemptID: cmd.AttemptID})
 	r.commanded = append(r.commanded, cmd)
-}
-
-func (r *pooledRecorder) found(command sessionwire.CommandID, attempt string) bool {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	for _, seen := range r.dispatch {
-		if seen.CommandID == command && seen.AttemptID == attempt {
-			return true
-		}
-	}
-	return false
 }
 
 // PooledRig is the PRODUCT's department.Rig: one real harness *rig.Rig per
@@ -633,6 +632,10 @@ func (p *PooledRig) Creates() []PooledLaunch {
 	defer p.mu.Unlock()
 	return append([]PooledLaunch(nil), p.creates...)
 }
+
+// Dispatched reports every command this Host's runtime accepted, in order. It
+// is an observation, never evidence: see PooledEvidence.
+func (p *PooledRig) Dispatched() []PooledDispatch { return p.recorder.Dispatched() }
 
 // Restores reports every restore, in order.
 func (p *PooledRig) Restores() []PooledLaunch {
@@ -723,20 +726,40 @@ func (s *pooledSession) SubscribeCommitted(context.Context, sessionwire.EventID)
 }
 
 // ApplyCommand satisfies department.CommandApplier, through HARNESS'S OWN
-// runtime-command seam.
+// runtime-command seam, FOR ALL FIVE ADMITTED KINDS.
 //
-// It used to call Submit for anything carrying text and record the dispatch,
-// and a recorder-backed evidence reader then vouched that the command had
-// applied. That was a fake LOOSER than the dependency, and it was measured
-// doing exactly the damage that implies: a gate response arrived here, matched
-// no text, was recorded as dispatched, and SETTLED APPLIED while the agent's
-// gate stayed open and the user's answer never reached it. A green test said
-// the whole chain worked.
+// # The two fakes that used to live here, and why neither may come back
 //
-// So every command now goes through runtimecommand.Applier, which writes the
-// durable application prefix and the kind's disposition frame BEFORE the
-// effect -- and PooledEvidence reads those frames rather than this module's
-// opinion. A command harness refuses is a command that does not settle.
+// It first called Submit for anything carrying text and let a recorder-backed
+// evidence reader vouch that the command had applied. That was LOOSER than the
+// dependency and was measured doing exactly the damage that implies: a gate
+// response arrived here, matched no text, was recorded as dispatched, and
+// SETTLED APPLIED while the agent's gate stayed open and the user's answer
+// never reached it. A green test said the whole chain worked.
+//
+// The vouching then survived for `create` and `restore` alone, because
+// harness's runtimecommand.Kind named only three kinds and those two had no
+// path to a disposition frame at all. harness v0.36.0 added KindCreate and
+// KindRestore and host v0.5.0 decodes a create's body, so THE EXCEPTION IS
+// GONE: every kind is applied through runtimecommand.Applier, which writes the
+// durable prefix and the kind's disposition frame before the effect, and the
+// embedded harness store is the ONLY evidence reader. A command harness refuses
+// is a command that does not settle.
+//
+// # The decode is BY KIND and by Core's own records
+//
+// A create's stored body is a Core CreateRequest and an input's is an
+// InputRequest -- Factory canonically encodes the whole request, so the two are
+// different shapes carrying the same blocks. host v0.5.0's own adapter
+// re-presents a create's blocks in the input-shaped body its BlockDecoder
+// reads; this product reaches the same place by decoding each record with
+// Core's decoder and handing the blocks to content.UnmarshalBlocks.
+//
+// It replaced a walk that scraped every "text" member out of any JSON. That
+// walk was shape-blind in both directions: it accepted a body of the wrong kind
+// without noticing, and it could carry nothing but text -- so a multi-block or
+// multimodal first message arrived at the model as one concatenated string, or
+// not at all. Host's own gate recorded that as F3.
 //
 // It REFUSES an unframed command for the reason FakeRuntime does: Host mints a
 // runtime UUID for every command it applies, and a zero one means the case
@@ -760,22 +783,22 @@ func (s *pooledSession) ApplyCommand(ctx context.Context, cmd department.Runtime
 		AttemptID:        runtimecommand.AttemptID(cmd.AttemptID),
 	}
 	switch cmd.Kind {
-	case PooledKindCreate, PooledKindRestore:
-		// HARNESS NAMES NEITHER KIND, and runtimecommand.Admitted refuses a kind
-		// outside its closed set, so neither can be applied through the seam.
-		// The product's effect for a create is to submit its blocks; the
-		// session itself was launched by the attach that preceded this. See
-		// PooledEvidence.ReadDispositionEvidence.
-		if texts := pooledTexts(cmd.Payload); len(texts) > 0 {
-			if _, err := s.controller.Submit(ctx, []content.Block{&content.TextBlock{Text: strings.Join(texts, "\n")}}); err != nil {
-				return err
-			}
-			if !s.bridged {
-				s.tails.Emit(s.key, PooledPublicationsPerInput)
-			}
+	case PooledKindCreate:
+		blocks, err := PooledCreateBlocks(cmd.Payload)
+		if err != nil {
+			return err
 		}
-		s.recorder.add(cmd)
-		return nil
+		// A BARE create -- one carrying no first message -- crosses with no
+		// blocks and drives no turn. harness makes Blocks OPTIONAL for this
+		// kind precisely so an idle create can still settle; refusing one here
+		// would wedge every session created without an opening message.
+		admitted.Kind, admitted.Blocks = runtimecommand.KindCreate, blocks
+	case PooledKindRestore:
+		// A restore carries NOTHING. Core's RestoreRequest has no blocks member
+		// and Admitted.Validate refuses a restore that carries any, so a
+		// product that forwarded a stray payload here would be refused after
+		// the attempt was already durable.
+		admitted.Kind = runtimecommand.KindRestore
 	case PooledKindGateResponse:
 		answer, err := pooledGateAnswer(cmd)
 		if err != nil {
@@ -785,32 +808,39 @@ func (s *pooledSession) ApplyCommand(ctx context.Context, cmd department.Runtime
 		admitted.GateResponse = answer
 	case PooledKindInterrupt:
 		admitted.Kind = runtimecommand.KindInterrupt
-	default:
-		// input, and any kind a newer Factory admits that this product treats
-		// as one. A command carrying no blocks has nothing to apply; it is
-		// recorded and acknowledged rather than sent as an empty input, which
-		// harness refuses.
-		texts := pooledTexts(cmd.Payload)
-		if len(texts) == 0 {
-			s.recorder.add(cmd)
-			return nil
+	case PooledKindInput:
+		blocks, err := PooledInputBlocks(cmd.Payload)
+		if err != nil {
+			return err
 		}
-		admitted.Kind = runtimecommand.KindInput
-		admitted.Blocks = []content.Block{&content.TextBlock{Text: strings.Join(texts, "\n")}}
+		// Unlike a create, harness REQUIRES blocks for an input and refuses one
+		// carrying none, so this arm cannot fail open the way the create arm
+		// structurally can.
+		admitted.Kind, admitted.Blocks = runtimecommand.KindInput, blocks
+	default:
+		// A kind a newer Factory admits and this product does not know. It is
+		// REFUSED rather than guessed at: guessing is what silently dropped a
+		// create's first message for a whole release, and a refusal before any
+		// durable write leaves the record for a Host that understands it.
+		return fmt.Errorf("%w: %q", ErrUnknownCommandKind, cmd.Kind)
 	}
 	if _, err := applier.ApplyRuntimeCommand(ctx, admitted); err != nil {
 		return err
 	}
-	if !s.bridged && admitted.Kind == runtimecommand.KindInput {
+	if !s.bridged && len(admitted.Blocks) > 0 {
 		s.tails.Emit(s.key, PooledPublicationsPerInput)
 	}
 	s.recorder.add(cmd)
 	return nil
 }
 
-// The admitted command kinds Factory files, restated because Factory exports
-// none of them. A drift fails loudly: an unknown kind takes the input arm and
-// harness refuses a body it cannot read as blocks.
+// The five admitted command kinds Factory files, restated because Factory
+// exports none of them.
+//
+// THEY ARE FIVE, NOT THREE. Any fixture in this kit that enumerates the
+// runtime-command vocabulary must name all five as of harness v0.36.0, and
+// nothing here may use "restore" as an example of an unknown kind: harness
+// accepts it now, and a row built on that would go green while saying nothing.
 const (
 	PooledKindCreate       = "create"
 	PooledKindRestore      = "restore"
@@ -819,12 +849,75 @@ const (
 	PooledKindGateResponse = "gate_response"
 )
 
-// ErrRuntimeCannotApply and ErrRuntimeHoldsNoLease are the two refusals this
-// product runtime makes on its own behalf.
+// PooledKinds is the vocabulary as one value, so a case can iterate it rather
+// than restate it.
+func PooledKinds() []string {
+	return []string{PooledKindCreate, PooledKindRestore, PooledKindInput, PooledKindInterrupt, PooledKindGateResponse}
+}
+
+// PooledUnknownKind is a kind string NEITHER vocabulary has ever held.
+//
+// It exists because the obvious choices keep being overtaken: "gate_response"
+// was an unknown kind until harness v0.35.0 named it, and "restore" until
+// v0.36.0 did. A fixture that used either went green the day the vocabulary
+// widened, while whatever it was guarding was live.
+const PooledUnknownKind = "orchestrationtest_no_such_kind"
+
+// The three refusals this product runtime makes on its own behalf.
 var (
 	ErrRuntimeCannotApply  = errors.New("orchestrationtest: the harness session cannot apply an admitted runtime command")
 	ErrRuntimeHoldsNoLease = errors.New("orchestrationtest: the harness session reports no held journal lease")
+	ErrUnknownCommandKind  = errors.New("orchestrationtest: this product runtime does not apply this command kind")
 )
+
+// PooledCreateBlocks reads a create's stored body -- Core's CreateRequest --
+// and returns its first message as content blocks.
+//
+// An EMPTY payload is a bare create and yields no blocks and no error. Anything
+// else Core refuses is an error, because a body this product cannot read is one
+// it must not silently apply as an empty turn: that is the exact shape of the
+// defect host v0.5.0 exists to close.
+func PooledCreateBlocks(payload []byte) ([]content.Block, error) {
+	if len(payload) == 0 {
+		return nil, nil
+	}
+	var request sessionwire.CreateRequest
+	if err := json.Unmarshal(payload, &request); err != nil {
+		return nil, fmt.Errorf("orchestrationtest: the create body is not a Core CreateRequest: %w", err)
+	}
+	return pooledBlocks(request.Blocks)
+}
+
+// PooledInputBlocks reads an input's stored body -- Core's InputRequest -- and
+// returns its blocks.
+func PooledInputBlocks(payload []byte) ([]content.Block, error) {
+	if len(payload) == 0 {
+		return nil, fmt.Errorf("orchestrationtest: the input body is empty")
+	}
+	var request sessionwire.InputRequest
+	if err := json.Unmarshal(payload, &request); err != nil {
+		return nil, fmt.Errorf("orchestrationtest: the input body is not a Core InputRequest: %w", err)
+	}
+	return pooledBlocks(request.Blocks)
+}
+
+// pooledBlocks decodes a Core request's blocks member with CORE'S OWN decoder.
+//
+// content.UnmarshalBlocks is what a composition's BlockDecoder is written
+// around, and using it here is what makes a MULTI-BLOCK and a NON-TEXT first
+// message cross faithfully. A decoder that read only text would drop an image
+// and concatenate three paragraphs into one, and neither loss is visible at the
+// store.
+func pooledBlocks(raw json.RawMessage) ([]content.Block, error) {
+	if len(raw) == 0 {
+		return nil, nil
+	}
+	blocks, err := content.UnmarshalBlocks(raw)
+	if err != nil {
+		return nil, fmt.Errorf("orchestrationtest: the body's blocks are not Core content blocks: %w", err)
+	}
+	return blocks, nil
+}
 
 // pooledGateAnswer reads Core's gate-response record out of an admitted
 // command's body and builds harness's answer from it.
@@ -856,86 +949,31 @@ func pooledGateAnswer(cmd department.RuntimeCommand) (*gate.GateResponse, error)
 	}, nil
 }
 
-// pooledTexts pulls every "text" member out of a command payload, whatever its
-// nesting. The payload shape is Core's and this harness does not restate it.
-func pooledTexts(payload []byte) []string {
-	var decoded any
-	if json.Unmarshal(payload, &decoded) != nil {
-		return nil
-	}
-	var texts []string
-	var walk func(any)
-	walk = func(value any) {
-		switch typed := value.(type) {
-		case map[string]any:
-			for key, member := range typed {
-				if text, ok := member.(string); ok && key == "text" {
-					texts = append(texts, text)
-				} else {
-					walk(member)
-				}
-			}
-		case []any:
-			for _, member := range typed {
-				walk(member)
-			}
-		}
-	}
-	walk(decoded)
-	return texts
-}
-
 // PooledEvidence is the settlement evidence reader AND Host's runtime-journal
 // reader: one value doing both jobs, which is what host v0.3.0 made this seam.
 //
-// FOR THREE OF THE FIVE ADMITTED KINDS IT OVERRIDES NOTHING: the embedded
-// *harness sessionstore.Store already implements
-// sessionstore.DispositionEvidenceReader and answers from the runtime's OWN
-// durable disposition frame. An earlier version of this type answered every
-// kind from a recorder of dispatches this module made, and that fake was looser
-// than the dependency in the way that costs most: a gate response the runtime
-// never applied settled APPLIED, because "we handed it over" is not "it took
-// effect". See ReadDispositionEvidence for the two kinds that still have to be
-// vouched for, and why.
+// IT OVERRIDES NOTHING, FOR ANY KIND. The embedded *harness sessionstore.Store
+// implements sessionstore.DispositionEvidenceReader, and its answer is the
+// runtime's OWN durable disposition frame.
+//
+// # The standing rule, and it now has no exception
+//
+// DO NOT REINTRODUCE A RECORDER-BACKED EVIDENCE READER FOR ANY OF THE FIVE
+// KINDS. It has hidden a broken chain twice. The first time, every kind was
+// vouched for and a gate response settled `applied` while the gate stayed open
+// and the user's answer never reached the agent. The second time only `create`
+// and `restore` were vouched for -- they had no path to a harness disposition
+// frame at all, because runtimecommand.Kind named three kinds -- and that
+// exception hid the defect host v0.5.0 exists to close: a create crossing with
+// no blocks, driving no turn, and settling `applied` with the user's first
+// message dropped in silence.
+//
+// harness v0.36.0 names all five kinds and host v0.5.0 decodes a create's body,
+// so there is nothing left to vouch for. A kind this product cannot apply is
+// REFUSED at ApplyCommand, before any durable write, and the command does not
+// settle -- which is the honest outcome and the one a reader can act on.
 type PooledEvidence struct {
 	*harnessstore.Store
-	recorder *pooledRecorder
-}
-
-// ReadDispositionEvidence answers for the two kinds HARNESS CANNOT SETTLE and
-// delegates every other kind to the embedded harness store.
-//
-// THE SPLIT IS A FINDING, not a convenience. sessionstore settles a command
-// only from evidence whose Kind EQUALS the inbox record's, and
-// runtimecommand.Kind is a closed set of three: input, interrupt and
-// gate_response. Factory admits five: those three plus create and restore. Host
-// documents create and restore as "still DRIVEN INTO THE RUNTIME like every
-// other kind -- because what settles a command is a correlated durable effect,
-// and residency is not one", and its own harness adapter then REFUSES both
-// (H6). So a create admitted into the disposition family has no path to a
-// harness disposition frame at all, and settles from nothing.
-//
-// This reader therefore vouches for exactly those two, from the product's own
-// record of what it submitted -- which is the product's claim about its own
-// effect and nothing more -- and hands input, interrupt and gate_response to
-// the runtime's real durable frames. That division is what makes the gate case
-// meaningful: an answer the runtime did not apply does not settle here.
-func (e PooledEvidence) ReadDispositionEvidence(ctx context.Context, req sessionstore.DispositionEvidenceRequest) (sessionstore.DispositionEvidence, error) {
-	if req.Kind != PooledKindCreate && req.Kind != PooledKindRestore {
-		return e.Store.ReadDispositionEvidence(ctx, req)
-	}
-	if !e.recorder.found(req.CommandID, string(req.Attempt.AttemptID)) {
-		return sessionstore.DispositionEvidence{}, fmt.Errorf(
-			"%w: the runtime recorded no dispatch of %s under attempt %s",
-			ErrEvidenceNotYetReadable, req.CommandID, req.Attempt.AttemptID)
-	}
-	return sessionstore.DispositionEvidence{
-		AttemptID:           req.Attempt.AttemptID,
-		Kind:                sessionstore.DispositionApplied,
-		AttemptJournalEpoch: req.Attempt.JournalEpoch,
-		AuthorJournalEpoch:  req.Attempt.JournalEpoch,
-		DispositionSeq:      1,
-	}, nil
 }
 
 // ---- the world -------------------------------------------------------------
@@ -1157,7 +1195,7 @@ func startHost(tb TB, ctx context.Context, world *PooledWorld, id sessionwire.Ho
 	for _, tenant := range world.tenants {
 		rigs[tenant] = world.defineRig(tb, tenant)
 		journals[host.EvidenceKey{TenantID: tenant, StorageBindingID: PooledBinding}] =
-			PooledEvidence{Store: world.Journals[tenant], recorder: recorder}
+			PooledEvidence{Store: world.Journals[tenant]}
 	}
 	product := &PooledRig{rigs: rigs, recorder: recorder, tails: world.Tails, bridge: world.gated}
 
