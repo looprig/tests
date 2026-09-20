@@ -10,21 +10,34 @@
 // are two different released stores reading one producer, and harness cannot
 // test the second without taking a dependency it does not want.
 //
-// This lane is the only place where BOTH are the released ones: the kit opens
-// sessionstore v0.12.0 for the catalog, the inbox, the claims, the attempts and
-// the settlement, and the evidence reader behind it is a real harness session
-// store built against v0.9.0. Every settlement in the whole suite therefore
-// crosses that boundary already; what this file adds is the case that SAYS SO,
-// for every one of the five kinds, so a regression names the boundary instead
-// of looking like a timeout somewhere else.
+// THIS LANE COMPILES HARNESS'S WRITER AGAINST v0.12.0, which is the stronger
+// claim and the accurate one. MVS selects ONE sessionstore for the whole
+// binary, and here it is v0.12.0 -- so the harness code whose own suite only
+// ever proves its frames against v0.9.0 is, in this module, built and run
+// against the version a deployed Host settles through. (An earlier version of
+// this comment said "a harness session store built against v0.9.0", which is a
+// build that cannot exist.)
 //
-// # And the falsifier for "nothing vouches"
+// Every settlement in the whole suite therefore crosses that boundary already;
+// what this file adds is the case that SAYS SO, for every one of the five
+// kinds, so a regression names the boundary instead of looking like a timeout
+// somewhere else.
 //
-// The other half of the v0.10.0 round is that the kit's last vouching arm is
-// gone. That is an absence, and an absence is only worth something if its
-// opposite is observable: so this file also drives a command the product
-// runtime REFUSES and proves it never settles. If anything were still vouching,
-// it would settle anyway.
+// # Where the falsifier for "nothing vouches" actually lives
+//
+// NOT HERE. The other half of the v0.10.0 round is that the kit's last vouching
+// arm is gone, and an absence is worth nothing unless its opposite is
+// observable -- but the case at the bottom of this file CANNOT observe it, and
+// that was measured: with PooledEvidence restored to answering `applied`
+// unconditionally for all five kinds, it still passes, because Host never
+// claims an unknown kind and so no evidence read ever happens.
+//
+// THE FALSIFIER IS TestASuccessorClosesAStrandedCreateAndTheStreamUnblocks, in
+// factory_create_first_message_integration_test.go. Restore any recorder-backed
+// evidence reader and it fails by assertion:
+// `the create closed "applied"/"applied", want not_applied`. A vouching reader
+// settles the stranded create as though the predecessor's refused dispatch had
+// worked, which is the whole failure mode in one line.
 
 package tests
 
@@ -189,13 +202,20 @@ func TestTheKitsCommandVocabularyIsTheReleasedOne(t *testing.T) {
 	}
 }
 
-// TestACommandTheRuntimeRefusesNeverSettles is the falsifier for "nothing
-// vouches any more".
+// TestACommandNothingAppliedDoesNotSettleFromTheRuntime drives a command no
+// runtime applies and shows the store settling nothing from it.
 //
-// The v0.10.0 round's headline is an ABSENCE: the kit's last recorder-backed
-// evidence arm is gone, so a command the product runtime did not really apply
-// cannot settle. An absence is worth nothing unless its opposite is
-// observable, so this drives one.
+// IT IS NOT THE FALSIFIER FOR "NOTHING VOUCHES", and an earlier version of this
+// file claimed it was. Measured: with PooledEvidence restored to answering
+// `applied` unconditionally, this case still passes. It cannot detect vouching,
+// because the command never reaches an evidence read at all -- see below. The
+// falsifier is the migration case, named in the file header.
+//
+// AND "NEVER" WOULD BE WRONG. An UNATTEMPTED command is bounded: Factory's
+// deadline sweep settles it `rejected`/`runtime_unavailable` at its apply
+// deadline. What this case shows is that nothing the RUNTIME did settles it in
+// the meantime -- which is the property worth holding, and the one host's
+// tolerance for an unknown kind depends on.
 //
 // The command is admitted into the disposition inbox directly, carrying a kind
 // NEITHER vocabulary has ever held. That is deliberate: Factory admits only the
@@ -220,7 +240,7 @@ func TestTheKitsCommandVocabularyIsTheReleasedOne(t *testing.T) {
 // refusal before any durable write, leaving the record for a Host that knows
 // the kind. What this case does prove is the property the round is about: a
 // command nothing applied does not settle.
-func TestACommandTheRuntimeRefusesNeverSettles(t *testing.T) {
+func TestACommandNothingAppliedDoesNotSettleFromTheRuntime(t *testing.T) {
 	ctx, world, _, served := createWorld(t, "orchestrationtest-refusal-host")
 	const (
 		session = sessionwire.SessionID("session-refusal")

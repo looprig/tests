@@ -577,12 +577,12 @@ type pooledRecorder struct {
 	commanded []department.RuntimeCommand
 }
 
-// Dispatched reports every command the product runtime accepted, in order.
-func (r *pooledRecorder) Dispatched() []PooledDispatch {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	return append([]PooledDispatch(nil), r.dispatch...)
-}
+// THERE IS DELIBERATELY NO EXPORTED READER FOR THIS. An accessor on PooledRig
+// existed for one release with zero callers, and staticcheck cannot see an
+// unused EXPORTED name, so nothing would have reported it. It is also the one
+// affordance that makes re-vouching a two-line change: a reader that answered
+// from this list is exactly the fake the rule above forbids. A case that wants
+// to know what was dispatched should assert on the durable record instead.
 
 func (r *pooledRecorder) add(cmd department.RuntimeCommand) {
 	r.mu.Lock()
@@ -690,10 +690,6 @@ func (p *PooledRig) Creates() []PooledLaunch {
 	defer p.mu.Unlock()
 	return append([]PooledLaunch(nil), p.creates...)
 }
-
-// Dispatched reports every command this Host's runtime accepted, in order. It
-// is an observation, never evidence: see PooledEvidence.
-func (p *PooledRig) Dispatched() []PooledDispatch { return p.recorder.Dispatched() }
 
 // Restores reports every restore, in order.
 func (p *PooledRig) Restores() []PooledLaunch {
@@ -835,6 +831,15 @@ func (s *pooledSession) SubscribeCommitted(context.Context, sessionwire.EventID)
 // without noticing, and it could carry nothing but text -- so a multi-block or
 // multimodal first message arrived at the model as one concatenated string, or
 // not at all. Host's own gate recorded that as F3.
+//
+// AND IT KEYED ON THE WRONG NAME. The walk looked for the JSON member "text";
+// Core's content.MarshalBlocks emits "Text". It worked in the old suite only
+// because those fixtures were hand-written lowercase literals and Go's
+// json.Unmarshal matches field names case-insensitively -- so it could never
+// have read a block array CORE ITSELF produced. Measured by the v0.10.0 gate,
+// which had to repair the mutant before it would even reproduce the
+// concatenation. That is the case for decoding with the producer's own records
+// rather than pattern-matching its output.
 //
 // It REFUSES an unframed command for the reason FakeRuntime does: Host mints a
 // runtime UUID for every command it applies, and a zero one means the case
@@ -1091,17 +1096,30 @@ func pooledGateAnswer(cmd department.RuntimeCommand) (*gate.GateResponse, error)
 // implements sessionstore.DispositionEvidenceReader, and its answer is the
 // runtime's OWN durable disposition frame.
 //
-// # The standing rule, and it now has no exception
+// # The standing rule, and exactly where it applies
 //
 // DO NOT REINTRODUCE A RECORDER-BACKED EVIDENCE READER FOR ANY OF THE FIVE
-// KINDS. It has hidden a broken chain twice. The first time, every kind was
-// vouched for and a gate response settled `applied` while the gate stayed open
-// and the user's answer never reached the agent. The second time only `create`
-// and `restore` were vouched for -- they had no path to a harness disposition
-// frame at all, because runtimecommand.Kind named three kinds -- and that
-// exception hid the defect host v0.5.0 exists to close: a create crossing with
-// no blocks, driving no turn, and settling `applied` with the user's first
-// message dropped in silence.
+// KINDS IN THIS POOLED KIT. It has hidden a broken chain twice. The first time,
+// every kind was vouched for and a gate response settled `applied` while the
+// gate stayed open and the user's answer never reached the agent. The second
+// time only `create` and `restore` were vouched for -- they had no path to a
+// harness disposition frame at all, because runtimecommand.Kind named three
+// kinds -- and that exception hid the defect host v0.5.0 exists to close: a
+// create crossing with no blocks, driving no turn, and settling `applied` with
+// the user's first message dropped in silence.
+//
+// THE RULE IS SCOPED, and a reader who greps will find a counter-example, so
+// here is why it is not one. GatedEvidence (composedhost.go) DOES vouch, from
+// FakeRuntime.Applied(). That is legitimate where it lives: the composed-host
+// transport lane runs no harness runtime and has no harness journal at all, so
+// there is no durable frame to read -- it exists to drive Host's HostLink
+// framing, its attach path and its durable consumer, and its cases assert
+// Runtime.Applied() separately rather than inferring it from a settlement.
+//
+// What makes the difference is what the lane CLAIMS. A lane claiming "the agent
+// received this" must settle from the runtime's own evidence; a lane claiming
+// "Host delivered this over the wire" may vouch, because delivery is what it
+// observed. Do not move a claim of the first kind onto a fixture of the second.
 //
 // harness v0.36.0 names all five kinds and host v0.5.0 decodes a create's body,
 // so there is nothing left to vouch for. A kind this product cannot apply is
