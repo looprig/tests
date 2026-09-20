@@ -1096,9 +1096,28 @@ func (l *pooledTrackingListener) Sever() int {
 	return len(conns)
 }
 
-// StartPooledHost composes, starts and serves one Host over the world's shared
-// backend, with one real harness rig per tenant.
+// StartPooledHost composes, starts and serves one POOLED Host over the world's
+// shared backend, with one real harness rig per tenant.
 func StartPooledHost(tb TB, ctx context.Context, world *PooledWorld, id sessionwire.HostID, generation uint64) *PooledHost {
+	tb.Helper()
+	return startHost(tb, ctx, world, id, generation, "")
+}
+
+// StartDedicatedHost composes, starts and serves one DEDICATED Host pinned to
+// one session for its lifetime.
+//
+// The pinning is what a controller-placed Host is, and it is what the drain
+// scope names: Core's drain request carries a (tenant, session) scope that
+// "identifies the fixed session of a dedicated Host", and a POOLED Host that
+// does not hold the session refuses it `runtime_unavailable` -- measured, and
+// the reason this constructor exists rather than a placement field on the
+// pooled one.
+func StartDedicatedHost(tb TB, ctx context.Context, world *PooledWorld, id sessionwire.HostID, generation uint64, fixed sessionwire.SessionID) *PooledHost {
+	tb.Helper()
+	return startHost(tb, ctx, world, id, generation, fixed)
+}
+
+func startHost(tb TB, ctx context.Context, world *PooledWorld, id sessionwire.HostID, generation uint64, fixed sessionwire.SessionID) *PooledHost {
 	tb.Helper()
 	raw, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
@@ -1108,6 +1127,13 @@ func StartPooledHost(tb TB, ctx context.Context, world *PooledWorld, id sessionw
 	listener := &pooledTrackingListener{Listener: raw}
 	base := sessionwire.InternalEndpoint("ws://" + listener.Addr().String())
 
+	// A dedicated Host is pinned to one session and must have capacity
+	// exactly one; a pooled one REFUSES a fixed session id. Host validates
+	// both, so the two arms travel different composition branches.
+	placement, capacity := sessionwire.HostPlacementPooled, uint64(8)
+	if fixed != "" {
+		placement, capacity = sessionwire.HostPlacementDedicated, 1
+	}
 	recorder := &pooledRecorder{}
 	rigs := map[sessionwire.TenantID]*rig.Rig{}
 	journals := map[host.EvidenceKey]sessionstore.DispositionEvidenceReader{}
@@ -1126,8 +1152,9 @@ func StartPooledHost(tb TB, ctx context.Context, world *PooledWorld, id sessionw
 			// advertisement that lets Factory place two tenants on one Host,
 			// which is the whole of the pooled multi-tenancy case.
 			IsolationClass:    sessionwire.HostIsolationClassCrossTenantIsolated,
-			Placement:         sessionwire.HostPlacementPooled,
-			Capacity:          8,
+			Placement:         placement,
+			Capacity:          capacity,
+			FixedSessionID:    fixed,
 			WarmTTL:           90 * time.Second,
 			RegistryHeartbeat: 2 * time.Second,
 			RegistryExpiry:    10 * time.Second,
@@ -1177,7 +1204,13 @@ func StartPooledHost(tb TB, ctx context.Context, world *PooledWorld, id sessionw
 	handler := http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
 		if request.Header.Get("Upgrade") != "" {
 			pooled.mu.Lock()
-			pooled.paths = append(pooled.paths, request.URL.Path)
+			// THE ESCAPED PATH, which is what was on the wire. url.URL.Path is
+			// the DECODED form, so a tenant needing escaping would compare
+			// equal to a concatenating derivation that never escaped anything
+			// -- the exact HM5 mutant this lane is supposed to kill. Host's own
+			// router reads the decoded Path; what is recorded here is the
+			// request, not Host's reading of it.
+			pooled.paths = append(pooled.paths, request.URL.EscapedPath())
 			pooled.mu.Unlock()
 		}
 		routes.ServeHTTP(writer, request)
@@ -1207,6 +1240,47 @@ func StartPooledHost(tb TB, ctx context.Context, world *PooledWorld, id sessionw
 
 // Stop drains this Host and closes its listener. It is idempotent.
 func (h *PooledHost) Stop() { h.stop() }
+
+// Attach makes a session resident through Host's exported in-process attach --
+// the same entry point the hostlink.attach RPC reaches.
+func (h *PooledHost) Attach(tb TB, ctx context.Context, tenant sessionwire.TenantID, s sessionwire.SessionID) host.Residency {
+	tb.Helper()
+	residency, err := h.Service.Attach(ctx, host.AttachRequest{
+		TenantID:               tenant,
+		SessionID:              s,
+		AgentID:                PooledAgent,
+		Mode:                   sessionwire.HostLinkAttachModeCreate,
+		RuntimeCompatibilityID: string(PooledCompatibility),
+		ActorID:                "orchestrationtest-attacher",
+	})
+	if err != nil {
+		tb.Fatalf("orchestrationtest: attaching %s/%s on %s: %v", tenant, s, h.ID, err)
+		return host.Residency{}
+	}
+	return residency
+}
+
+// PooledDispositionBinding is the immutable binding a Host-held session carries.
+//
+// The runtime session id is a FRESH UUID per call: host v0.3.0 reads the
+// runtime identity out of the binding and refuses a non-UUID or the zero UUID
+// before any launch, and two sessions sharing one id would share a
+// conversation. The protocol mode is DISPOSITION because that is the only
+// family a Host can take residency on.
+func PooledDispositionBinding(tb TB) sessionstore.SessionBinding {
+	tb.Helper()
+	id, err := uuid.New()
+	if err != nil {
+		tb.Fatalf("orchestrationtest: minting a runtime session id: %v", err)
+		return sessionstore.SessionBinding{}
+	}
+	return sessionstore.SessionBinding{
+		StorageBindingID: PooledBinding,
+		BindingVersion:   PooledBindingVersion,
+		RuntimeSessionID: id.String(),
+		ProtocolMode:     sessionstore.ProtocolModeDisposition,
+	}
+}
 
 // Sever closes every TCP connection the Host has accepted and reports how many.
 func (h *PooledHost) Sever() int { return h.tracker.Sever() }
