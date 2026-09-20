@@ -306,3 +306,170 @@ func mustEncodeBlocks(t *testing.T, blocks []content.Block) string {
 	}
 	return string(encoded)
 }
+
+// TestASuccessorClosesAStrandedCreateAndTheStreamUnblocks is the CROSS-MODULE
+// migration case: what an operator's upgrade from host v0.4.0 actually looks
+// like.
+//
+// # What a v0.4.0 Host left behind
+//
+// It refused a create from inside its runtime adapter, which Host reaches only
+// AFTER BeginAttempt has durably authorized the dispatch. So the record sits
+// `applying` with an attempt and no disposition frame: the store has nothing to
+// settle from, the deadline sweep skips attempt-bearing records so it never
+// expires, and every later command on that session is blocked behind it,
+// because the consumer will not advance its cursor past a non-terminal record.
+// The session existed, the agent was resident, and nobody could talk to it.
+//
+// host v0.5.0's claim is that this needs NO operator action: the next Host to
+// take the session closes the attempt `not_applied` under its own strictly
+// later journal grant, and the stream continues. Host proves that against its
+// own applier; this drives it through a real Factory and two real Hosts, which
+// is the shape an upgrade has.
+//
+// # The claim that is easiest to get wrong
+//
+// The create's first message is NOT recovered. It was never delivered, and the
+// only honest outcome is that those words never reach the model -- a successor
+// that "helpfully" replayed them would be inventing a turn the user did not
+// see accepted. The case asserts that absence as hard as it asserts the
+// recovery.
+func TestASuccessorClosesAStrandedCreateAndTheStreamUnblocks(t *testing.T) {
+	ctx := placementContext(t)
+	world := orchestrationtest.NewPooledWorld(t, ctx, orchestrationtest.PooledWorldOptions{
+		Tenants: []sessionwire.TenantID{orchestrationtest.PooledTenantA},
+	})
+	// THE PREDECESSOR: a Host whose runtime refuses a create after the attempt
+	// is durable, which is host v0.4.0's shape exactly.
+	predecessor := orchestrationtest.StartPooledHost(t, ctx, world, "orchestrationtest-stranding-host", 4)
+	predecessor.Rig.RefuseCreates(true)
+	orchestrationtest.AwaitAdvertised(t, world, predecessor.ID)
+	served := orchestrationtest.StartPooledFactory(t, ctx, world, "orchestrationtest-migration-replica", nil)
+
+	const (
+		session      = sessionwire.SessionID("session-stranded-create")
+		create       = sessionwire.CommandID("command-stranded-create")
+		input        = sessionwire.CommandID("command-behind-the-strand")
+		strandedWord = "DAMSON"
+		behindWord   = "ELDERFLOWER"
+	)
+
+	status, body := served.Post(t, ctx, orchestrationtest.PooledTenantA, "/v1/sessions", sessionwire.CreateRequest{
+		CommandEnvelope: orchestrationtest.PooledEnvelope(string(create)),
+		SessionID:       session,
+		AgentID:         orchestrationtest.PooledAgent,
+		Blocks:          json.RawMessage(`[{"type":"text","text":"` + strandedWord + `"}]`),
+	})
+	if status != http.StatusCreated {
+		t.Fatalf("the create answered %d: %s", status, body)
+	}
+
+	var attemptID sessionstore.DispositionAttemptID
+	t.Run("the create strands: applying, with an attempt, bounded by nothing", func(t *testing.T) {
+		orchestrationtest.PooledWait(t, "the create reached applying with an attempt", 90*time.Second, func() bool {
+			entry, err := world.Store.GetDispositionCommand(ctx, sessionstore.GetDispositionCommandRequest{
+				TenantID: orchestrationtest.PooledTenantA, SessionID: session, CommandID: create,
+			})
+			return err == nil && entry.Record.State == sessionstore.InboxStateApplying && entry.Record.Attempt != nil
+		})
+		entry, err := world.Store.GetDispositionCommand(ctx, sessionstore.GetDispositionCommandRequest{
+			TenantID: orchestrationtest.PooledTenantA, SessionID: session, CommandID: create,
+		})
+		if err != nil {
+			t.Fatalf("reading the stranded create: %v", err)
+		}
+		attemptID = entry.Record.Attempt.AttemptID
+		t.Logf("the create is stranded: state=%q attempt=%s outcome=%+v", entry.Record.State, attemptID, entry.Record.Outcome)
+		if entry.Record.Outcome != nil {
+			t.Fatalf("the stranded create already has an outcome %+v; the premise is false", entry.Record.Outcome)
+		}
+		if attemptID == "" {
+			t.Fatalf("the stranded create carries no attempt; a refusal BEFORE the attempt is a different and bounded failure")
+		}
+	})
+
+	t.Run("and everything behind it is blocked", func(t *testing.T) {
+		status, body := served.Post(t, ctx, orchestrationtest.PooledTenantA, "/v1/sessions/"+string(session)+"/input",
+			sessionwire.InputRequest{
+				CommandEnvelope: orchestrationtest.PooledEnvelope(string(input)),
+				SessionID:       session,
+				Blocks:          json.RawMessage(`[{"type":"text","text":"` + behindWord + `"}]`),
+			})
+		if status != http.StatusOK {
+			t.Fatalf("the input behind the strand answered %d: %s", status, body)
+		}
+		// AN ABSENCE, so it is sampled rather than polled for: the consumer
+		// will not advance its cursor past a non-terminal record, so the input
+		// must stay unapplied for as long as the create is stranded.
+		time.Sleep(3 * time.Second)
+		if state := world.CommandState(ctx, orchestrationtest.PooledTenantA, session, input); state == sessionstore.InboxStateApplied {
+			t.Fatalf("the input behind a stranded create settled %q; the premise that the stream is blocked is false", state)
+		}
+		if world.LLM.SawInRequest(0, behindWord) {
+			t.Fatalf("the input behind a stranded create reached the model; the stream is not blocked")
+		}
+	})
+
+	t.Run("a successor closes the attempt not_applied and the stream continues", func(t *testing.T) {
+		predecessor.Stop()
+		orchestrationtest.PooledWait(t, "the registry stops reporting a live owner", 60*time.Second, func() bool {
+			owner, found, _ := served.Directory.Owner(ctx, orchestrationtest.PooledTenantA, session)
+			return !found || owner.Residency != sessionwire.SessionResidencyResident ||
+				!owner.Accepting || !owner.ExpiresAt.After(time.Now())
+		})
+		successor := orchestrationtest.StartPooledHost(t, ctx, world, "orchestrationtest-successor-host", 7)
+		orchestrationtest.AwaitAdvertised(t, world, successor.ID)
+
+		// THE CREATE IS CLOSED, and the OUTCOME is asserted rather than the
+		// state. `rejected` is reachable several ways -- a pre-attempt
+		// rejection, a deadline sweep -- and only one of them is this claim:
+		// the successor found the predecessor's attempt with no effect behind
+		// it and closed it.
+		orchestrationtest.PooledWait(t, "the successor closed the stranded create", 120*time.Second, func() bool {
+			state := world.CommandState(ctx, orchestrationtest.PooledTenantA, session, create)
+			return state == sessionstore.InboxStateRejected || state == sessionstore.InboxStateApplied
+		})
+		entry, err := world.Store.GetDispositionCommand(ctx, sessionstore.GetDispositionCommandRequest{
+			TenantID: orchestrationtest.PooledTenantA, SessionID: session, CommandID: create,
+		})
+		if err != nil {
+			t.Fatalf("reading the closed create: %v", err)
+		}
+		t.Logf("the stranded create closed: state=%q outcome=%+v", entry.Record.State, entry.Record.Outcome)
+		if entry.Record.Outcome == nil {
+			t.Fatalf("the create closed with no outcome: %+v", entry.Record)
+		}
+		if entry.Record.Outcome.Kind != sessionstore.DispositionNotApplied {
+			t.Fatalf("the create closed %q/%q, want not_applied: nothing ever applied it",
+				entry.Record.State, entry.Record.Outcome.Kind)
+		}
+		if entry.Record.Outcome.AttemptID != attemptID {
+			t.Fatalf("the closure names attempt %s, want the predecessor's %s",
+				entry.Record.Outcome.AttemptID, attemptID)
+		}
+		// A STRICTLY LATER JOURNAL GRANT is what makes the closure safe: it is
+		// how the successor can say the predecessor's attempt produced nothing
+		// without racing a predecessor that is still running.
+		if entry.Record.Outcome.AuthorJournalEpoch <= entry.Record.Outcome.AttemptJournalEpoch {
+			t.Fatalf("the closure was authored at journal epoch %d against an attempt at %d, want strictly later",
+				entry.Record.Outcome.AuthorJournalEpoch, entry.Record.Outcome.AttemptJournalEpoch)
+		}
+
+		// THE STREAM CONTINUES: the input behind it settles and reaches the
+		// model.
+		orchestrationtest.PooledWait(t, "the input behind the strand settled", 120*time.Second, func() bool {
+			return world.CommandState(ctx, orchestrationtest.PooledTenantA, session, input) == sessionstore.InboxStateApplied
+		})
+		orchestrationtest.PooledWait(t, "the input behind the strand reached the model", 60*time.Second, func() bool {
+			return world.LLM.SawInRequest(0, behindWord)
+		})
+
+		// AND THE CREATE'S OWN WORDS NEVER DO. They were never delivered; a
+		// successor that replayed them would be inventing a turn the user never
+		// saw accepted. This is the half an over-helpful recovery gets wrong.
+		if world.LLM.SawInRequest(0, strandedWord) {
+			t.Fatalf("the stranded create's first message %q reached the model; it was never delivered and must not be invented",
+				strandedWord)
+		}
+	})
+}

@@ -606,9 +606,36 @@ type PooledRig struct {
 	// the product's tail as hints. See PooledTails.Hint.
 	bridge bool
 
-	mu       sync.Mutex
-	creates  []PooledLaunch
-	restores []PooledLaunch
+	mu            sync.Mutex
+	creates       []PooledLaunch
+	restores      []PooledLaunch
+	refuseCreates bool
+}
+
+// RefuseCreates makes this Host's runtime refuse every create AFTER Host has
+// durably begun its dispatch attempt.
+//
+// IT REPRODUCES THE host v0.4.0 SHAPE EXACTLY, which is the only reason it
+// exists. Under v0.4.0 the adapter's kind gate refused a create -- a kind
+// runtimecommand.Kind did not name -- and it did so from inside ApplyCommand,
+// which Host reaches only after BeginAttempt has authorized the dispatch. So
+// the record is left `applying` WITH an attempt: no disposition frame, nothing
+// for the store to settle from, a deadline sweep that skips attempt-bearing
+// records, and every later command on that session blocked behind it.
+//
+// A refusal raised anywhere earlier would be a different and far less
+// interesting failure, because an unattempted command is bounded by Factory's
+// deadline sweep.
+func (p *PooledRig) RefuseCreates(refuse bool) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.refuseCreates = refuse
+}
+
+func (p *PooledRig) refusingCreates() bool {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.refuseCreates
 }
 
 // NewSession satisfies department.Rig.
@@ -650,7 +677,7 @@ func (p *PooledRig) RestoreSession(ctx context.Context, id uuid.UUID, req depart
 // adapt wraps one launched harness session as Host's department.RigSession,
 // starting the committed-event bridge when this world needs one.
 func (p *PooledRig) adapt(controller session.SessionController, key pooledTailKey) department.RigSession {
-	adapted := &pooledSession{controller: controller, recorder: p.recorder, tails: p.tails, key: key, bridged: p.bridge}
+	adapted := &pooledSession{controller: controller, recorder: p.recorder, tails: p.tails, key: key, rig: p, bridged: p.bridge}
 	if p.bridge {
 		adapted.startBridge()
 	}
@@ -683,6 +710,7 @@ type pooledSession struct {
 	recorder   *pooledRecorder
 	tails      *PooledTails
 	key        pooledTailKey
+	rig        *PooledRig
 
 	// bridged reports which of the two tail disciplines this session runs
 	// under. They are exclusive, and mixing them would interleave two
@@ -815,6 +843,10 @@ func (s *pooledSession) ApplyCommand(ctx context.Context, cmd department.Runtime
 	}
 	switch cmd.Kind {
 	case PooledKindCreate:
+		if s.rig != nil && s.rig.refusingCreates() {
+			return fmt.Errorf("%w: this runtime refuses %q, after the attempt is durable",
+				ErrUnknownCommandKind, cmd.Kind)
+		}
 		blocks, err := PooledCreateBlocks(cmd.Payload)
 		if err != nil {
 			return err
@@ -865,6 +897,61 @@ func (s *pooledSession) ApplyCommand(ctx context.Context, cmd department.Runtime
 	return nil
 }
 
+// CloseAttempt satisfies department.AttemptCloser, which is the capability a
+// SUCCESSOR needs to free a session a predecessor stranded.
+//
+// # Why a product runtime must offer it, and what happens if it does not
+//
+// A predecessor that dies (or, in host v0.4.0's case, refuses a kind it could
+// not name) leaves a record `applying` with a durable attempt and no
+// disposition frame. The store has nothing to settle from; the deadline sweep
+// SKIPS an attempt-bearing record, so it never expires; and the consumer will
+// not advance its cursor past a non-terminal record, so every later command on
+// that session is blocked behind it. The only exit is a successor writing the
+// recovery closure -- and Host asks the RUNTIME for it, because only the
+// runtime's journal can say whether the attempt left an effect.
+//
+// A runtime that omits this method is refused `department.ErrNoAttemptCloser`
+// and the session stays wedged FOREVER. That was measured here before this
+// method existed: the successor took the session, the create stayed `applying`
+// for the whole two-minute bound, and the input behind it never settled. It is
+// a consumer obligation host v0.5.0's own §9 does not list.
+//
+// Nothing is decided here. The author grant is deliberately NOT a parameter --
+// harness stamps it from the live lease the successor holds -- and harness
+// refuses the closure outright if its grant is not strictly later than the
+// attempt's, or if the journal holds ANY enduring event caused by that runtime
+// command, because a tombstone over a committed effect is the one error this
+// protocol cannot recover from.
+func (s *pooledSession) CloseAttempt(
+	ctx context.Context,
+	command sessionwire.CommandID,
+	runtimeCommand uuid.UUID,
+	kind string,
+	attempt string,
+	attemptJournalEpoch uint64,
+) error {
+	closer, ok := s.controller.(runtimecommand.AttemptCloser)
+	if !ok {
+		return ErrRuntimeCannotClose
+	}
+	closure := runtimecommand.Closure{
+		CommandID:           runtimecommand.CommandID(command),
+		RuntimeCommandID:    runtimeCommand,
+		Kind:                runtimecommand.Kind(kind),
+		AttemptID:           runtimecommand.AttemptID(attempt),
+		AttemptJournalEpoch: attemptJournalEpoch,
+	}
+	// VALIDATED ON THE RELEASED TYPE'S OWN RULE rather than a restatement of
+	// it: a closure that cannot name an attempt is one that could tombstone the
+	// wrong command.
+	if err := closure.Validate(); err != nil {
+		return err
+	}
+	_, err := closer.CloseAttempt(ctx, closure)
+	return err
+}
+
 // The five admitted command kinds Factory files, restated because Factory
 // exports none of them.
 //
@@ -899,6 +986,7 @@ var (
 	ErrRuntimeCannotApply  = errors.New("orchestrationtest: the harness session cannot apply an admitted runtime command")
 	ErrRuntimeHoldsNoLease = errors.New("orchestrationtest: the harness session reports no held journal lease")
 	ErrUnknownCommandKind  = errors.New("orchestrationtest: this product runtime does not apply this command kind")
+	ErrRuntimeCannotClose  = errors.New("orchestrationtest: the harness session offers no recovery closure")
 )
 
 // PooledCreateBlocks reads a create's stored body -- Core's CreateRequest --
