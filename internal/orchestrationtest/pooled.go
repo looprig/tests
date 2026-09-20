@@ -1320,12 +1320,12 @@ func StartPooledHost(tb TB, ctx context.Context, world *PooledWorld, id sessionw
 // does not hold the session refuses it `runtime_unavailable` -- measured, and
 // the reason this constructor exists rather than a placement field on the
 // pooled one.
-func StartDedicatedHost(tb TB, ctx context.Context, world *PooledWorld, id sessionwire.HostID, generation uint64, fixed sessionwire.SessionID) *PooledHost {
+func StartDedicatedHost(tb TB, ctx context.Context, world *PooledWorld, id sessionwire.HostID, generation uint64, fixed sessionwire.SessionID, tap ...*HostLinkTap) *PooledHost {
 	tb.Helper()
-	return startHost(tb, ctx, world, id, generation, fixed)
+	return startHost(tb, ctx, world, id, generation, fixed, tap...)
 }
 
-func startHost(tb TB, ctx context.Context, world *PooledWorld, id sessionwire.HostID, generation uint64, fixed sessionwire.SessionID) *PooledHost {
+func startHost(tb TB, ctx context.Context, world *PooledWorld, id sessionwire.HostID, generation uint64, fixed sessionwire.SessionID, taps ...*HostLinkTap) *PooledHost {
 	tb.Helper()
 	raw, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
@@ -1423,8 +1423,12 @@ func startHost(tb TB, ctx context.Context, world *PooledWorld, id sessionwire.Ho
 		}
 		routes.ServeHTTP(writer, request)
 	})
+	var served http.Handler = handler
+	if len(taps) > 0 && taps[0] != nil {
+		served = taps[0].Wrap(served)
+	}
 	server := &httptest.Server{Listener: listener, Config: &http.Server{
-		Handler:           handler,
+		Handler:           served,
 		ReadHeaderTimeout: 10 * time.Second,
 	}}
 	server.Start()
@@ -1610,6 +1614,16 @@ func (r pooledTipReader) ReadPublicJournal(ctx context.Context, req sessionstore
 // StartPooledFactory composes, starts and serves a real Factory over the
 // world's store, with placement (WithPendingCommands) enabled.
 func StartPooledFactory(tb TB, ctx context.Context, world *PooledWorld, replica string, logs io.Writer) *PooledFactory {
+	return startPooledFactory(tb, ctx, world, replica, logs, sessionwire.HostPlacementPooled, nil)
+}
+
+// StartDedicatedFactory composes the same real Factory lanes with a dedicated
+// launch template and the supplied platform controller.
+func StartDedicatedFactory(tb TB, ctx context.Context, world *PooledWorld, replica string, logs io.Writer, workloads factory.WorkloadController) *PooledFactory {
+	return startPooledFactory(tb, ctx, world, replica, logs, sessionwire.HostPlacementDedicated, workloads)
+}
+
+func startPooledFactory(tb TB, ctx context.Context, world *PooledWorld, replica string, logs io.Writer, placement sessionwire.HostPlacement, workloads factory.WorkloadController) *PooledFactory {
 	tb.Helper()
 	directory, err := factory.NewStoreDirectory(world.Store, factory.DefaultDirectoryLimits())
 	if err != nil {
@@ -1637,7 +1651,13 @@ func StartPooledFactory(tb TB, ctx context.Context, world *PooledWorld, replica 
 	if logs == nil {
 		logs = io.Discard
 	}
-	server, err := factory.New(
+	template := factory.LaunchTemplate{Key: sessionstore.HostTargetKey{
+		AgentID: PooledAgent, RuntimeCompatibilityID: string(PooledCompatibility), Placement: placement,
+	}}
+	if placement == sessionwire.HostPlacementDedicated {
+		template.Workload = sessionstore.DesiredWorkload{PayloadVersion: "orchestrationtest/v1", Payload: []byte(`{"replicas":1}`)}
+	}
+	opts := []factory.Option{
 		factory.WithCredentialVerifier(pooledVerifier{}),
 		factory.WithAuthorizer(pooledAuthorizer{}),
 		factory.WithSessionReader(pooledTipReader{Store: world.Store, tails: world.Tails}),
@@ -1656,11 +1676,7 @@ func StartPooledFactory(tb TB, ctx context.Context, world *PooledWorld, replica 
 		}),
 		factory.WithReconcileLimits(reconcile),
 		factory.WithClientLinkLimits(clientLink),
-		factory.WithDepartment(factory.LaunchTemplate{Key: sessionstore.HostTargetKey{
-			AgentID:                PooledAgent,
-			RuntimeCompatibilityID: string(PooledCompatibility),
-			Placement:              sessionwire.HostPlacementPooled,
-		}}),
+		factory.WithDepartment(template),
 		factory.WithSessionBinding(PooledBinding, PooledBindingVersion),
 		factory.WithPublicCreates(world.Store),
 		factory.WithObjectStoreResolver(func(context.Context, sessionstore.SessionBinding) (factory.ObjectReader, error) {
@@ -1671,7 +1687,11 @@ func StartPooledFactory(tb TB, ctx context.Context, world *PooledWorld, replica 
 		// Start and every session waits forever with no other symptom.
 		factory.WithPendingCommands(world.Store),
 		factory.WithLogger(slog.New(slog.NewJSONHandler(logs, nil))),
-	)
+	}
+	if workloads != nil {
+		opts = append(opts, factory.WithWorkloadController(workloads))
+	}
+	server, err := factory.New(opts...)
 	if err != nil {
 		_ = listener.Close()
 		tb.Fatalf("orchestrationtest: composing the pooled factory: %v", err)
