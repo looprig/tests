@@ -226,6 +226,23 @@ const PooledAskToolName = "orchestrationtest_ask"
 // PooledAskTool raises a real ask_user gate from inside a tool call and returns
 // the answer as its tool result.
 //
+// # KNOWN HAZARD: A PARKED AGENT HAS NO BOUND OF ITS OWN HERE
+//
+// A tool sitting inside loop.RequestUserInput is not idle, so a Host drain's
+// ReleaseResidency waits on harness's WaitIdle and blocks. Observed in a
+// release gate against a host v0.3.0 control: the test binary sat at 0% CPU for
+// TWENTY-THREE MINUTES, parked in
+// lifecycle.(*Drainer).release -> pooledSession.ReleaseResidency ->
+// Session.WaitIdle -> hub.WaitIdle, with the agent still in the tool. It does
+// not reproduce at this pin -- the incapable-Host case deliberately leaves a
+// gate unanswered and stops cleanly -- so it is control-specific. But THE ONLY
+// BOUND THIS LANE HAS AGAINST IT IS `go test -timeout`, which reports a
+// timeout rather than the wait that caused it.
+//
+// If a gated case ever hangs, look here first. The fix, when one is wanted, is
+// a bound inside the fixture's own release path rather than a shorter global
+// timeout.
+//
 // That return value is the whole point. An answered gate whose answer never
 // reaches the agent is indistinguishable from an abandoned one at the store, so
 // the case asserts the agent CONTINUED by looking for the answer text in the

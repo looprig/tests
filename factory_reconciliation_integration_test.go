@@ -29,7 +29,6 @@ package tests
 import (
 	"context"
 	"fmt"
-	"strings"
 	"testing"
 	"time"
 
@@ -382,14 +381,19 @@ func TestFactoryReconciliationSweeps(t *testing.T) {
 		// "<replica>/commands" -- rather than under the bare replica id. That
 		// is a widening, not a drift: the commands sweep and the gates sweep
 		// are two rotations over one shard space, and one holder string for
-		// both would let either suppress the other's work. What the row must
-		// keep discriminating is the property the id exists for, so it asserts
-		// the replica's OWN identity is what distinguishes the string, not the
-		// literal spelling of the suffix.
+		// both would let either suppress the other's work.
+		//
+		// THE COMPARISON IS EQUALITY, not a prefix. A prefix test stops
+		// discriminating exactly where the row matters: "replica-1" is a prefix
+		// of "replica-10", so two replicas whose ids differ only by a trailing
+		// digit would read as each other's and the duplicate-suppression claim
+		// would pass with no suppression happening. The suffix is Factory's and
+		// is named here so that a change to it fails loudly rather than
+		// silently loosening this row.
 		seedOverdueCommand(t, ctx, store, clock, "a")
 		holdersA := awaitClaims(t, commands, "replica A")
-		if len(holdersA) != 1 || !strings.HasPrefix(holdersA[0], replicaA.ReplicaID) {
-			t.Fatalf("replica A's sweeper filed claims under %v, want exactly one carrying its own replica id %q", holdersA, replicaA.ReplicaID)
+		if len(holdersA) != 1 || holdersA[0] != replicaA.ReplicaID+commandSweepHolderSuffix {
+			t.Fatalf("replica A's sweeper filed claims under %v, want exactly [%q]", holdersA, replicaA.ReplicaID+commandSweepHolderSuffix)
 		}
 
 		// Replica A is stopped and replica B composed only now, so the second
@@ -409,8 +413,8 @@ func TestFactoryReconciliationSweeps(t *testing.T) {
 		}
 		seedOverdueCommand(t, ctx, store, clock, "b")
 		holdersB := awaitClaims(t, second, "replica B")
-		if len(holdersB) != 1 || !strings.HasPrefix(holdersB[0], replicaB.ReplicaID) {
-			t.Fatalf("replica B's sweeper filed claims under %v, want exactly one carrying its own replica id %q", holdersB, replicaB.ReplicaID)
+		if len(holdersB) != 1 || holdersB[0] != replicaB.ReplicaID+commandSweepHolderSuffix {
+			t.Fatalf("replica B's sweeper filed claims under %v, want exactly [%q]", holdersB, replicaB.ReplicaID+commandSweepHolderSuffix)
 		}
 
 		if holdersA[0] == holdersB[0] {
@@ -420,7 +424,7 @@ func TestFactoryReconciliationSweeps(t *testing.T) {
 		// Neither replica ever filed under the other's name. Without this the
 		// pair above would pass for a build that used whichever id it saw last.
 		for _, holder := range second.ClaimHolders() {
-			if strings.HasPrefix(holder, replicaA.ReplicaID) {
+			if holder == replicaA.ReplicaID+commandSweepHolderSuffix {
 				t.Fatalf("replica B's sweeper filed a claim under replica A's holder id %q", holder)
 			}
 		}
@@ -433,6 +437,14 @@ func TestFactoryReconciliationSweeps(t *testing.T) {
 		BaselineGoroutines: baseline,
 	})
 }
+
+// commandSweepHolderSuffix is what factory v0.5.0 appends to a replica id when
+// the COMMAND sweep files a reconciliation claim.
+//
+// It is restated here because Factory exports no constant for it, and it is
+// restated rather than approximated with a prefix test so that a drift fails
+// loudly. See the holder-id row for why a prefix would stop discriminating.
+const commandSweepHolderSuffix = "/commands"
 
 // storeOrderedPageCeiling is Storage's page ceiling, restated so a bound
 // assertion has something to compare against without importing storage here.

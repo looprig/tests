@@ -6,6 +6,13 @@
 # the dirs list picks up integration-tagged files too.
 GO_DIRS := $(shell GOWORK=off go list -f '{{.Dir}}' -tags integration ./...)
 
+# THIS SUITE CANNOT BE VERIFIED FROM AN ISOLATED CLONE OF THIS REPOSITORY.
+# It needs the SIBLING CHECKOUTS to be present beside it: ../mcp (the MCP
+# adapter cases resolve it on disk), and the collection root itself, which
+# root_layout_test.go and dependency_boundary_test.go walk. Run it from a full
+# workspace checkout. A clone on its own fails ~22 cases, and every one of those
+# failures is the missing siblings rather than a property of this module -- it
+# has been mistaken for one before, in a release gate.
 test:
 	LOOPRIG_LIVE_NETWORK=0 GOWORK=off go test -count=1 -tags integration -race ./...
 

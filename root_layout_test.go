@@ -1,5 +1,13 @@
 package tests
 
+// PRECONDITION FOR THIS WHOLE MODULE, recorded here because this file is one
+// of the two that imposes it: the suite needs the SIBLING CHECKOUTS beside it.
+// This file and dependency_boundary_test.go walk the collection root, and the
+// MCP cases resolve ../mcp on disk. An isolated clone of this repository fails
+// about twenty-two cases for that reason alone, and a release gate has already
+// mistaken those failures for a property of the code under review. Run the
+// suite from a full workspace checkout.
+//
 // This file adds a cross-module CI check to the guards already living
 // alongside dependency_boundary_test.go and release_modfile_guard_test.go:
 // a lightweight root-layout consistency check across every sibling
