@@ -23,9 +23,11 @@ import (
 	"github.com/looprig/factory"
 	"github.com/looprig/factory/identity"
 	"github.com/looprig/harness/pkg/event"
+	"github.com/looprig/harness/pkg/gate"
 	"github.com/looprig/harness/pkg/journal"
 	"github.com/looprig/harness/pkg/loop"
 	"github.com/looprig/harness/pkg/rig"
+	"github.com/looprig/harness/pkg/runtimecommand"
 	"github.com/looprig/harness/pkg/session"
 	harnessstore "github.com/looprig/harness/pkg/sessionstore"
 	"github.com/looprig/harness/pkg/tool"
@@ -234,6 +236,23 @@ type PooledAskTool struct {
 	mu      sync.Mutex
 	calls   int
 	answers []string
+	lastErr error
+}
+
+// Calls reports how many times the tool ran.
+func (t *PooledAskTool) Calls() int {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	return t.calls
+}
+
+// LastErr reports the last failure the gate request returned, if any. It exists
+// so a case that never sees a gate can say whether the tool ran and was refused
+// rather than never running at all.
+func (t *PooledAskTool) LastErr() error {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	return t.lastErr
 }
 
 // Info satisfies tool.InvokableTool.
@@ -243,6 +262,23 @@ func (t *PooledAskTool) Info(context.Context) (*tool.ToolInfo, error) {
 		Desc:   "Asks the user a question and returns their answer.",
 		Schema: []byte(`{"type":"object","properties":{},"additionalProperties":false}`),
 	}, nil
+}
+
+// PrepareCall satisfies tool.CallPreparer, and the tool must have one.
+//
+// A loop under an AccessGate refuses a tool that cannot prepare a call --
+// "permission denied: tool has no call preparation", measured -- so the absence
+// of this method is indistinguishable from a denial. The prepared request names
+// NO requirement, which the evaluator approves trivially: this tool asks the
+// user a question, it executes nothing, and inventing a capability requirement
+// for it would be modelling a permission this lane is not about.
+func (t *PooledAskTool) PrepareCall(_ context.Context, executionID uuid.UUID, _ string) (tool.Request, tool.PreparedArtifact, error) {
+	return tool.Request{
+		ToolName:           PooledAskToolName,
+		Summary:            "ask the user a question",
+		ExecutionID:        executionID.String(),
+		ExpiresAtUnixMilli: time.Now().Add(time.Hour).UnixMilli(),
+	}, nil, nil
 }
 
 // InvokableRun satisfies tool.InvokableTool.
@@ -256,6 +292,9 @@ func (t *PooledAskTool) InvokableRun(ctx context.Context, _ string) (*tool.ToolR
 	}
 	answer, err := loop.RequestUserInput(ctx, question, nil)
 	if err != nil {
+		t.mu.Lock()
+		t.lastErr = err
+		t.mu.Unlock()
 		return nil, err
 	}
 	t.mu.Lock()
@@ -271,7 +310,51 @@ func (t *PooledAskTool) Answers() []string {
 	return append([]string(nil), t.answers...)
 }
 
-var _ tool.InvokableTool = (*PooledAskTool)(nil)
+var (
+	_ tool.InvokableTool = (*PooledAskTool)(nil)
+	_ tool.CallPreparer  = (*PooledAskTool)(nil)
+)
+
+// pooledAllowAll is the access gate the gated loop runs under.
+//
+// It is REQUIRED, not decorative: with no loop.AccessGate wired, the loop
+// runner denies every prepared call fail-secure and the tool never runs at all
+// -- measured here as an agent that made two model calls, finished its turn and
+// never entered the tool, with no error anywhere. It is allow-all because this
+// lane is about the GATE a tool raises, not about the permission model that
+// decides whether the tool may run; the permission model has its own cases.
+func pooledAllowAll(tb TB) loop.AccessGate {
+	tb.Helper()
+	kinds := []string{
+		tool.CapabilityCommandExecute,
+		"tool.invoke",
+		"filesystem.read",
+		"filesystem.write",
+		"network",
+		"context.load",
+	}
+	bindings := make([]gate.AccessBinding, 0, len(kinds))
+	for _, kind := range kinds {
+		bindings = append(bindings, gate.AccessBinding{Kind: kind, Source: pooledAllowSource{}})
+	}
+	evaluator, err := gate.NewHeadlessEvaluator(bindings, pooledNoRules{}, nil)
+	if err != nil {
+		tb.Fatalf("orchestrationtest: gate.NewHeadlessEvaluator: %v", err)
+		return nil
+	}
+	return evaluator
+}
+
+type pooledAllowSource struct{}
+
+func (pooledAllowSource) AccessVersion() uint16                   { return gate.CurrentAccessVersion }
+func (pooledAllowSource) AccessFor(string, string) (uint8, error) { return gate.AccessAllow, nil }
+
+type pooledNoRules struct{}
+
+func (pooledNoRules) MatchesDeny(context.Context, tool.Requirement) (bool, error)  { return false, nil }
+func (pooledNoRules) MatchesAllow(context.Context, tool.Requirement) (bool, error) { return false, nil }
+func (pooledNoRules) WriteRules(context.Context, []tool.RuleCandidate) error       { return nil }
 
 func pooledAskDefinition(shared *PooledAskTool) tool.Definition {
 	return tool.NewDefinition(PooledAskToolName, 0, func(context.Context, tool.Bindings) ([]tool.InvokableTool, error) {
@@ -307,6 +390,21 @@ type PooledTails struct {
 	current   map[pooledTailKey][]chan sessionwire.EnduringPublication
 	subs      []pooledTailKey
 	dropped   int
+	notes     []string
+}
+
+// bridgeNote records one bridge lifecycle observation.
+func (t *PooledTails) bridgeNote(note string) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	t.notes = append(t.notes, note)
+}
+
+// BridgeNotes reports the committed-event bridge's lifecycle, in order.
+func (t *PooledTails) BridgeNotes() []string {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	return append([]string(nil), t.notes...)
 }
 
 // NewPooledTails returns an empty tail set.
@@ -374,6 +472,32 @@ func (t *PooledTails) Emit(key pooledTailKey, n int) {
 	}
 }
 
+// Hint commits ONE publication for a session whose tail is driven by the
+// harness session's own committed events.
+//
+// It exists for a property of host v0.4.0 that is not obvious and cost a day to
+// find: HOST'S GATE PUBLISHER PASSES ONLY ON A HINT FROM THE RUNTIME'S
+// COMMITTED PUBLICATION STREAM. internal/gates' run loop subscribes to that
+// stream and folds the journal after every delivery; its only timer is a retry
+// for a FAILED subscription. So a runtime that opens a gate and then commits no
+// publication leaves the gate journaled, unprojected and invisible to Factory
+// for as long as the session stays quiet.
+//
+// A real product never notices, because its committed stream IS its session's
+// event stream and a gate opening is an event on it. This kit's stream is
+// synthetic -- three publications per applied command -- so the gated world
+// bridges the harness stream into hints explicitly. See pooledSession.
+//
+// In a BRIDGED world this is the ONLY thing that commits a publication:
+// ApplyCommand emits nothing, so the product's stream is one publication per
+// committed harness event, which is what a real product's stream is. In an
+// UNBRIDGED world nothing calls this and the stream is three publications per
+// applied command, which keeps a viewer's sequence numbers deterministic for
+// the cases that assert on them.
+func (t *PooledTails) Hint(tenant sessionwire.TenantID, s sessionwire.SessionID) {
+	t.Emit(pooledTailKey{tenant, s}, 1)
+}
+
 // Tip reports the highest committed sequence for one session.
 func (t *PooledTails) Tip(tenant sessionwire.TenantID, s sessionwire.SessionID) uint64 {
 	t.mu.Lock()
@@ -431,6 +555,9 @@ type PooledRig struct {
 	rigs     map[sessionwire.TenantID]*rig.Rig
 	recorder *pooledRecorder
 	tails    *PooledTails
+	// bridge forwards the harness session's own committed public events into
+	// the product's tail as hints. See PooledTails.Hint.
+	bridge bool
 
 	mu       sync.Mutex
 	creates  []PooledLaunch
@@ -454,12 +581,7 @@ func (p *PooledRig) NewSession(ctx context.Context, req department.RigCreateRequ
 	p.mu.Lock()
 	p.creates = append(p.creates, PooledLaunch{req.TenantID, req.RigSessionID})
 	p.mu.Unlock()
-	return &pooledSession{
-		controller: controller,
-		recorder:   p.recorder,
-		tails:      p.tails,
-		key:        pooledTailKey{req.TenantID, req.SessionID},
-	}, nil
+	return p.adapt(controller, pooledTailKey{req.TenantID, req.SessionID}), nil
 }
 
 // RestoreSession satisfies department.Rig.
@@ -475,12 +597,17 @@ func (p *PooledRig) RestoreSession(ctx context.Context, id uuid.UUID, req depart
 	p.mu.Lock()
 	p.restores = append(p.restores, PooledLaunch{req.TenantID, id})
 	p.mu.Unlock()
-	return &pooledSession{
-		controller: controller,
-		recorder:   p.recorder,
-		tails:      p.tails,
-		key:        pooledTailKey{req.TenantID, req.SessionID},
-	}, nil
+	return p.adapt(controller, pooledTailKey{req.TenantID, req.SessionID}), nil
+}
+
+// adapt wraps one launched harness session as Host's department.RigSession,
+// starting the committed-event bridge when this world needs one.
+func (p *PooledRig) adapt(controller session.SessionController, key pooledTailKey) department.RigSession {
+	adapted := &pooledSession{controller: controller, recorder: p.recorder, tails: p.tails, key: key, bridged: p.bridge}
+	if p.bridge {
+		adapted.startBridge()
+	}
+	return adapted
 }
 
 // Creates and Restores report what this Host's rig launched, in order.
@@ -505,6 +632,57 @@ type pooledSession struct {
 	recorder   *pooledRecorder
 	tails      *PooledTails
 	key        pooledTailKey
+
+	// bridged reports which of the two tail disciplines this session runs
+	// under. They are exclusive, and mixing them would interleave two
+	// sequences into one stream.
+	bridged bool
+}
+
+// startBridge forwards every committed public event the harness session
+// produces into the product's tail as a hint.
+//
+// It is what makes a GATE visible. Host's gate publisher folds the journal only
+// when the runtime's committed stream delivers, so without this a gate opens,
+// is journaled, and is never projected -- measured. A real product gets this
+// for free because its committed stream is the session's own event stream; this
+// kit's is synthetic, so the bridge is explicit.
+//
+// A session whose persistence cannot report committed bytes reports the
+// capability as absent, and the bridge is simply not started: that is the
+// two-result form's whole point, and guessing here would be worse than not
+// bridging.
+func (s *pooledSession) startBridge() {
+	provider, ok := s.controller.(session.CommittedPublicEventProvider)
+	if !ok {
+		s.tails.bridgeNote("no CommittedPublicEventProvider")
+		return
+	}
+	source, ok := provider.CommittedPublicEvents()
+	if !ok {
+		s.tails.bridgeNote("capability absent")
+		return
+	}
+	// Enduring from EVERY loop, which is the filter host's own adapter uses.
+	// The ZERO filter selects no loop at all: it delivered one event in a whole
+	// gated session and the gate was never projected. A filter is DECLARED
+	// INTEREST evaluated before the send, so an empty one is not "everything".
+	subscription, err := source.SubscribeCommittedPublicEvents(event.EventFilter{
+		Enduring: event.LoopScope{All: true},
+	})
+	if err != nil {
+		s.tails.bridgeNote("subscribe failed: " + err.Error())
+		return
+	}
+	s.tails.bridgeNote("subscribed")
+	go func() {
+		defer func() { _ = subscription.Close() }()
+		for delivery := range subscription.Events() {
+			s.tails.bridgeNote(fmt.Sprintf("delivery %T", delivery))
+			s.tails.Hint(s.key.tenant, s.key.session)
+		}
+		s.tails.bridgeNote("bridge closed")
+	}()
 }
 
 func (s *pooledSession) ID() uuid.UUID { return s.controller.SessionID() }
@@ -527,7 +705,21 @@ func (s *pooledSession) SubscribeCommitted(context.Context, sessionwire.EventID)
 	return s.tails.subscribe(s.key), nil
 }
 
-// ApplyCommand satisfies department.CommandApplier.
+// ApplyCommand satisfies department.CommandApplier, through HARNESS'S OWN
+// runtime-command seam.
+//
+// It used to call Submit for anything carrying text and record the dispatch,
+// and a recorder-backed evidence reader then vouched that the command had
+// applied. That was a fake LOOSER than the dependency, and it was measured
+// doing exactly the damage that implies: a gate response arrived here, matched
+// no text, was recorded as dispatched, and SETTLED APPLIED while the agent's
+// gate stayed open and the user's answer never reached it. A green test said
+// the whole chain worked.
+//
+// So every command now goes through runtimecommand.Applier, which writes the
+// durable application prefix and the kind's disposition frame BEFORE the
+// effect -- and PooledEvidence reads those frames rather than this module's
+// opinion. A command harness refuses is a command that does not settle.
 //
 // It REFUSES an unframed command for the reason FakeRuntime does: Host mints a
 // runtime UUID for every command it applies, and a zero one means the case
@@ -536,14 +728,115 @@ func (s *pooledSession) ApplyCommand(ctx context.Context, cmd department.Runtime
 	if cmd.RuntimeCommandID.IsZero() {
 		return ErrUnframedCommand
 	}
-	if texts := pooledTexts(cmd.Payload); len(texts) > 0 {
-		if _, err := s.controller.Submit(ctx, []content.Block{&content.TextBlock{Text: strings.Join(texts, "\n")}}); err != nil {
+	applier, ok := s.controller.(runtimecommand.Applier)
+	if !ok {
+		return ErrRuntimeCannotApply
+	}
+	epoch, held := s.LeaseEpoch()
+	if !held {
+		return ErrRuntimeHoldsNoLease
+	}
+	admitted := runtimecommand.Admitted{
+		CommandID:        runtimecommand.CommandID(cmd.CommandID),
+		RuntimeCommandID: cmd.RuntimeCommandID,
+		LeaseEpoch:       epoch,
+		AttemptID:        runtimecommand.AttemptID(cmd.AttemptID),
+	}
+	switch cmd.Kind {
+	case PooledKindCreate, PooledKindRestore:
+		// HARNESS NAMES NEITHER KIND, and runtimecommand.Admitted refuses a kind
+		// outside its closed set, so neither can be applied through the seam.
+		// The product's effect for a create is to submit its blocks; the
+		// session itself was launched by the attach that preceded this. See
+		// PooledEvidence.ReadDispositionEvidence.
+		if texts := pooledTexts(cmd.Payload); len(texts) > 0 {
+			if _, err := s.controller.Submit(ctx, []content.Block{&content.TextBlock{Text: strings.Join(texts, "\n")}}); err != nil {
+				return err
+			}
+			if !s.bridged {
+				s.tails.Emit(s.key, PooledPublicationsPerInput)
+			}
+		}
+		s.recorder.add(cmd)
+		return nil
+	case PooledKindGateResponse:
+		answer, err := pooledGateAnswer(cmd)
+		if err != nil {
 			return err
 		}
+		admitted.Kind = runtimecommand.KindGateResponse
+		admitted.GateResponse = answer
+	case PooledKindInterrupt:
+		admitted.Kind = runtimecommand.KindInterrupt
+	default:
+		// input, and any kind a newer Factory admits that this product treats
+		// as one. A command carrying no blocks has nothing to apply; it is
+		// recorded and acknowledged rather than sent as an empty input, which
+		// harness refuses.
+		texts := pooledTexts(cmd.Payload)
+		if len(texts) == 0 {
+			s.recorder.add(cmd)
+			return nil
+		}
+		admitted.Kind = runtimecommand.KindInput
+		admitted.Blocks = []content.Block{&content.TextBlock{Text: strings.Join(texts, "\n")}}
+	}
+	if _, err := applier.ApplyRuntimeCommand(ctx, admitted); err != nil {
+		return err
+	}
+	if !s.bridged && admitted.Kind == runtimecommand.KindInput {
 		s.tails.Emit(s.key, PooledPublicationsPerInput)
 	}
 	s.recorder.add(cmd)
 	return nil
+}
+
+// The admitted command kinds Factory files, restated because Factory exports
+// none of them. A drift fails loudly: an unknown kind takes the input arm and
+// harness refuses a body it cannot read as blocks.
+const (
+	PooledKindCreate       = "create"
+	PooledKindRestore      = "restore"
+	PooledKindInput        = "input"
+	PooledKindInterrupt    = "interrupt"
+	PooledKindGateResponse = "gate_response"
+)
+
+// ErrRuntimeCannotApply and ErrRuntimeHoldsNoLease are the two refusals this
+// product runtime makes on its own behalf.
+var (
+	ErrRuntimeCannotApply  = errors.New("orchestrationtest: the harness session cannot apply an admitted runtime command")
+	ErrRuntimeHoldsNoLease = errors.New("orchestrationtest: the harness session reports no held journal lease")
+)
+
+// pooledGateAnswer reads Core's gate-response record out of an admitted
+// command's body and builds harness's answer from it.
+//
+// The SOURCE is the user, and it is asserted here rather than taken from the
+// body: Core's record carries no source, a Host sets it, and harness refuses a
+// source a caller may not assert. Everything else about the answer -- whether
+// the gate is open, whether the action is one of its controls, whether the
+// values satisfy its schema -- is the session's to decide, and this does not
+// pre-empt any of it.
+func pooledGateAnswer(cmd department.RuntimeCommand) (*gate.GateResponse, error) {
+	if len(cmd.Payload) == 0 {
+		return nil, fmt.Errorf("orchestrationtest: the gate response %s carries no inline body", cmd.CommandID)
+	}
+	var request sessionwire.GateResponseRequest
+	if err := json.Unmarshal(cmd.Payload, &request); err != nil {
+		return nil, fmt.Errorf("orchestrationtest: the gate response %s is not a Core record: %w", cmd.CommandID, err)
+	}
+	gateID, err := uuid.Parse(string(request.GateID))
+	if err != nil {
+		return nil, fmt.Errorf("orchestrationtest: the gate response %s names %q, which is not a gate identity: %w",
+			cmd.CommandID, request.GateID, err)
+	}
+	return &gate.GateResponse{
+		GateID: gate.ID(gateID),
+		Action: request.Action,
+		Values: request.Values,
+		Source: gate.ResponseSource{Kind: gate.ResponseFromUser},
+	}, nil
 }
 
 // pooledTexts pulls every "text" member out of a command payload, whatever its
@@ -575,31 +868,57 @@ func pooledTexts(payload []byte) []string {
 	return texts
 }
 
-// PooledEvidence is the settlement evidence reader, EMBEDDING the real harness
-// journal store: the same value is Host's runtime-journal reader, which
-// host.Compose refuses unless it is a harness store.
+// PooledEvidence is the settlement evidence reader AND Host's runtime-journal
+// reader: one value doing both jobs, which is what host v0.3.0 made this seam.
 //
-// It vouches only for a dispatch the product runtime actually recorded, so a
-// settlement can never be claimed for a command that never reached the runtime.
+// FOR THREE OF THE FIVE ADMITTED KINDS IT OVERRIDES NOTHING: the embedded
+// *harness sessionstore.Store already implements
+// sessionstore.DispositionEvidenceReader and answers from the runtime's OWN
+// durable disposition frame. An earlier version of this type answered every
+// kind from a recorder of dispatches this module made, and that fake was looser
+// than the dependency in the way that costs most: a gate response the runtime
+// never applied settled APPLIED, because "we handed it over" is not "it took
+// effect". See ReadDispositionEvidence for the two kinds that still have to be
+// vouched for, and why.
 type PooledEvidence struct {
 	*harnessstore.Store
 	recorder *pooledRecorder
 }
 
-// ReadDispositionEvidence satisfies sessionstore.DispositionEvidenceReader.
-func (e PooledEvidence) ReadDispositionEvidence(_ context.Context, req sessionstore.DispositionEvidenceRequest) (sessionstore.DispositionEvidence, error) {
-	if e.recorder.found(req.CommandID, string(req.Attempt.AttemptID)) {
-		return sessionstore.DispositionEvidence{
-			AttemptID:           req.Attempt.AttemptID,
-			Kind:                sessionstore.DispositionApplied,
-			AttemptJournalEpoch: req.Attempt.JournalEpoch,
-			AuthorJournalEpoch:  req.Attempt.JournalEpoch,
-			DispositionSeq:      1,
-		}, nil
+// ReadDispositionEvidence answers for the two kinds HARNESS CANNOT SETTLE and
+// delegates every other kind to the embedded harness store.
+//
+// THE SPLIT IS A FINDING, not a convenience. sessionstore settles a command
+// only from evidence whose Kind EQUALS the inbox record's, and
+// runtimecommand.Kind is a closed set of three: input, interrupt and
+// gate_response. Factory admits five: those three plus create and restore. Host
+// documents create and restore as "still DRIVEN INTO THE RUNTIME like every
+// other kind -- because what settles a command is a correlated durable effect,
+// and residency is not one", and its own harness adapter then REFUSES both
+// (H6). So a create admitted into the disposition family has no path to a
+// harness disposition frame at all, and settles from nothing.
+//
+// This reader therefore vouches for exactly those two, from the product's own
+// record of what it submitted -- which is the product's claim about its own
+// effect and nothing more -- and hands input, interrupt and gate_response to
+// the runtime's real durable frames. That division is what makes the gate case
+// meaningful: an answer the runtime did not apply does not settle here.
+func (e PooledEvidence) ReadDispositionEvidence(ctx context.Context, req sessionstore.DispositionEvidenceRequest) (sessionstore.DispositionEvidence, error) {
+	if req.Kind != PooledKindCreate && req.Kind != PooledKindRestore {
+		return e.Store.ReadDispositionEvidence(ctx, req)
 	}
-	return sessionstore.DispositionEvidence{}, fmt.Errorf(
-		"%w: the runtime recorded no dispatch of %s under attempt %s",
-		ErrEvidenceNotYetReadable, req.CommandID, req.Attempt.AttemptID)
+	if !e.recorder.found(req.CommandID, string(req.Attempt.AttemptID)) {
+		return sessionstore.DispositionEvidence{}, fmt.Errorf(
+			"%w: the runtime recorded no dispatch of %s under attempt %s",
+			ErrEvidenceNotYetReadable, req.CommandID, req.Attempt.AttemptID)
+	}
+	return sessionstore.DispositionEvidence{
+		AttemptID:           req.Attempt.AttemptID,
+		Kind:                sessionstore.DispositionApplied,
+		AttemptJournalEpoch: req.Attempt.JournalEpoch,
+		AuthorJournalEpoch:  req.Attempt.JournalEpoch,
+		DispositionSeq:      1,
+	}, nil
 }
 
 // ---- the world -------------------------------------------------------------
@@ -675,13 +994,20 @@ func NewPooledWorld(tb TB, ctx context.Context, options PooledWorldOptions) *Poo
 }
 
 // PooledModel is the model every pooled loop runs on.
+//
+// It DECLARES TOOL SUPPORT, and that is load bearing rather than tidy: a model
+// whose capabilities omit tools has its tool set stripped before the request,
+// so a scripted tool call is never dispatched and the tool never runs. Measured
+// -- the gate case's agent made two model calls, finished its turn and never
+// entered the tool, with no error anywhere.
 func PooledModel() model.Model {
-	return model.Model{
-		Provider:  "orchestrationtest",
-		APIFormat: model.APIFormatOpenAI,
-		BaseURL:   "http://127.0.0.1/v1",
-		Name:      "orchestrationtest-model",
-	}
+	return model.CustomModel(
+		model.ProviderName("orchestrationtest"),
+		model.APIFormatOpenAI,
+		"http://127.0.0.1/v1",
+		"orchestrationtest-model",
+		model.WithTools(),
+	)
 }
 
 func (w *PooledWorld) defineRig(tb TB, tenant sessionwire.TenantID) *rig.Rig {
@@ -691,7 +1017,13 @@ func (w *PooledWorld) defineRig(tb TB, tenant sessionwire.TenantID) *rig.Rig {
 		loop.WithInference(w.LLM, PooledModel()),
 	}
 	if w.gated {
-		loopOptions = append(loopOptions, loop.WithTools(pooledAskDefinition(w.AskTool)))
+		loopOptions = append(loopOptions,
+			loop.WithTools(pooledAskDefinition(w.AskTool)),
+			loop.WithAccessGate(pooledAllowAll(tb)),
+			// An access gate obliges a policy revision: loop.Define refuses
+			// missing_policy_revision otherwise.
+			loop.WithPolicyRevision("orchestrationtest-v1"),
+		)
 	}
 	definition, err := loop.Define(loopOptions...)
 	if err != nil {
@@ -784,7 +1116,7 @@ func StartPooledHost(tb TB, ctx context.Context, world *PooledWorld, id sessionw
 		journals[host.EvidenceKey{TenantID: tenant, StorageBindingID: PooledBinding}] =
 			PooledEvidence{Store: world.Journals[tenant], recorder: recorder}
 	}
-	product := &PooledRig{rigs: rigs, recorder: recorder, tails: world.Tails}
+	product := &PooledRig{rigs: rigs, recorder: recorder, tails: world.Tails, bridge: world.gated}
 
 	blueprint := host.Composition{
 		Options: host.Options{
@@ -1108,6 +1440,48 @@ func (f *PooledFactory) Post(tb TB, ctx context.Context, tenant sessionwire.Tena
 	defer response.Body.Close()
 	answer, _ := io.ReadAll(response.Body)
 	return response.StatusCode, string(answer)
+}
+
+// Get sends one authenticated read as tenant and returns the status and body.
+func (f *PooledFactory) Get(tb TB, ctx context.Context, tenant sessionwire.TenantID, path string) (int, []byte) {
+	tb.Helper()
+	request, err := http.NewRequestWithContext(ctx, http.MethodGet, f.BaseURL+path, nil)
+	if err != nil {
+		tb.Fatalf("orchestrationtest: building GET %s: %v", path, err)
+		return 0, nil
+	}
+	request.Header.Set("Authorization", "Bearer "+PooledBearers[tenant])
+	response, err := f.client.Do(request)
+	if err != nil {
+		tb.Fatalf("orchestrationtest: GET %s as %s: %v", path, tenant, err)
+		return 0, nil
+	}
+	defer response.Body.Close()
+	body, _ := io.ReadAll(response.Body)
+	return response.StatusCode, body
+}
+
+// OpenGates reads one session's open gate projection THROUGH FACTORY's own
+// routed read, which is the path a browser takes and the one that runs
+// sessionstore's ReadGates behind it.
+//
+// Reading the store directly would prove the Host published a gate and say
+// nothing about whether Factory can serve it -- and serving it is the half that
+// the sessionstore v0.12.0 ROLLOUT RULE is about: a Factory below v0.12.0
+// refuses these pages outright.
+func (f *PooledFactory) OpenGates(tb TB, ctx context.Context, tenant sessionwire.TenantID, s sessionwire.SessionID) sessionwire.GatePage {
+	tb.Helper()
+	status, body := f.Get(tb, ctx, tenant, "/v1/sessions/"+string(s)+"/gates")
+	if status != http.StatusOK {
+		tb.Fatalf("orchestrationtest: Factory answered the gates read for %s %d: %s", s, status, body)
+		return sessionwire.GatePage{}
+	}
+	var page sessionwire.GatePage
+	if err := page.UnmarshalJSON(body); err != nil {
+		tb.Fatalf("orchestrationtest: the gates page is not a Core GatePage (%s): %v", body, err)
+		return sessionwire.GatePage{}
+	}
+	return page
 }
 
 // PooledEnvelope is a wire command envelope at the current version.
