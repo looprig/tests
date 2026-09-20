@@ -1754,6 +1754,10 @@ func (v *PooledViewer) Watch(tb TB, ctx context.Context, tenant sessionwire.Tena
 	}
 }
 
+// Close disconnects this viewer, as a browser tab closing does. It is
+// idempotent; the fixture's cleanup closes it again.
+func (v *PooledViewer) Close() { v.client.Close() }
+
 // Records reports every publication this viewer received, summarised.
 func (v *PooledViewer) Records() []string {
 	v.mu.Lock()
@@ -1819,7 +1823,20 @@ func pooledSummarise(data []byte) (string, sessionwire.TenantID, sessionwire.Ses
 // is told about a gap, and is therefore not one. A journal_tip hint changes
 // nothing.
 func PooledCoveredThrough(records []string) (uint64, error) {
-	var position uint64
+	return PooledCoveredThroughFrom(records, 0)
+}
+
+// PooledCoveredThroughFrom is PooledCoveredThrough for a client that already
+// holds everything through start.
+//
+// A RECONNECTING BROWSER IS EXACTLY THAT CLIENT. It learns its position from a
+// journal read, not from the socket -- a subscribe to a quiet session delivers
+// nothing at all -- so its live tail legitimately begins at start+1 and a rule
+// anchored at zero would read the first record as a silent gap. Measured: a
+// browser that came back at tip 6 received [E7 E8 E9], exactly once and in
+// order, with no reset, and the zero-anchored rule called it a gap.
+func PooledCoveredThroughFrom(records []string, start uint64) (uint64, error) {
+	position := start
 	for _, record := range records {
 		var first, second uint64
 		switch {
