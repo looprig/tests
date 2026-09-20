@@ -805,6 +805,22 @@ func (s *pooledSession) SubscribeCommitted(context.Context, sessionwire.EventID)
 // embedded harness store is the ONLY evidence reader. A command harness refuses
 // is a command that does not settle.
 //
+// # There is no BlockDecoder to bind here, and that is not a gap
+//
+// host v0.5.0's consumer obligation says "a kit Host must bind a BlockDecoder,
+// and the create path assumes it reads the INPUT-SHAPED body". That option is
+// host/internal/harnessadapter's, and harnessadapter is HOST'S OWN reference
+// product adapter -- internal, and not what this kit runs. The kit IS the
+// product: PooledRig is the department.Rig, and this method is where the
+// obligation actually lands.
+//
+// So it is met in substance rather than by name, and the substance is the part
+// that matters: the create path reads the input-shaped blocks, by decoding the
+// create's own Core CreateRequest rather than being handed a re-presented
+// InputRequest. A decoder written against a bare block array would refuse every
+// command, which is the failure the obligation warns about, and this one is
+// written against Core's records instead.
+//
 // # The decode is BY KIND and by Core's own records
 //
 // A create's stored body is a Core CreateRequest and an input's is an
