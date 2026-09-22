@@ -1,6 +1,21 @@
 //go:build integration
 
-// This file is runbook 07 task I1.3 cases 2, 3 and 4.
+// This file is runbook 07 task I1.3 cases 2, 3 and 4 over the DURABLE plane.
+// Case 1 and case 3's placement half are driven across real replicas and a
+// real pooled Host in factory_reconciliation_pooled_integration_test.go; case 5
+// is factory_reconciliation_brokerless_integration_test.go.
+//
+// # Which sweep each test drives, and why that matters
+//
+// Factory runs FOUR sweeps. TestFactoryReconciliationSweeps drives the LEGACY
+// command deadline sweep, which Factory's own composition calls unreachable in
+// production: legacy rows live only on legacy sessions and nothing admits into
+// them. Its rows are kept, and seed legacy rows directly, because the sweep
+// still runs and a store may still hold such rows. The sweep production
+// actually runs is the DISPOSITION deadline sweep, and
+// TestFactoryDispositionSweepVisitsEveryShardInBoundedPages holds it to the
+// same contract with every command admitted through Factory.
+// TestFactoryGateSweepRetiresStaleIntents is the gate sweep (case 4).
 //
 // # What changed, and why this file could not exist before
 //
@@ -28,7 +43,9 @@ package tests
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"net/http"
 	"testing"
 	"time"
 
@@ -132,7 +149,9 @@ func awaitDueGates(t *testing.T, gates *orchestrationtest.StoreGates, want int) 
 	}
 }
 
-// TestFactoryReconciliationSweeps is I1.3 cases 2, 3 and 4.
+// TestFactoryReconciliationSweeps is I1.3 cases 2-4 over the LEGACY command
+// sweep and the store's claim and gate contracts. See the file header for why
+// the disposition sweep has its own test.
 func TestFactoryReconciliationSweeps(t *testing.T) {
 	ctx := coldReadContext(t)
 	baseline := orchestrationtest.CaptureGoroutines()
@@ -147,7 +166,7 @@ func TestFactoryReconciliationSweeps(t *testing.T) {
 	})
 	gates := replicaA.Gates
 
-	t.Run("case 2: the sweep visits every shard, round robin, in bounded pages", func(t *testing.T) {
+	t.Run("case 2 (legacy sweep): the sweep visits every shard, round robin, in bounded pages", func(t *testing.T) {
 		// The shard count is 4, not 1. A rotation over one shard is
 		// indistinguishable from no rotation at all -- the degenerate constant
 		// for this structural input is exactly 1 -- so the kit's seams report
@@ -175,8 +194,11 @@ func TestFactoryReconciliationSweeps(t *testing.T) {
 			t.Fatalf("after %d queries the sweep reached shards %v, want all %d", len(requests), seen, shards)
 		}
 		// Round-robin, not random and not always-shard-zero: consecutive
-		// queries must advance. Asserting only "all shards eventually" would
-		// pass for a sweeper that picked uniformly at random.
+		// queries must advance. This inspects only the first `shards` queries,
+		// which makes it a STRUCTURAL check of the rotation's first cycle; the
+		// disposition test holds EVERY consecutive pair to it. Asserting only
+		// "all shards eventually" would pass for a sweeper that picked
+		// uniformly at random.
 		for i := 1; i < len(requests) && i < shards; i++ {
 			if requests[i].Shard == requests[i-1].Shard && requests[i].Cursor == "" {
 				t.Fatalf("queries %d and %d both opened shard %d; the rotation does not advance",
@@ -185,28 +207,7 @@ func TestFactoryReconciliationSweeps(t *testing.T) {
 		}
 	})
 
-	t.Run("case 2: the page shape does not grow with tenant count", func(t *testing.T) {
-		// "Independent of tenant count" is the case's own words and it is a
-		// STRUCTURAL claim: adding tenants must not change what one pass asks
-		// the store for. The row measures the request shape before and after
-		// twenty more tenants exist.
-		before := shapeOf(commands.DueRequests())
-		for i := range 20 {
-			tenant := sessionwire.TenantID(fmt.Sprintf("%sbulk-%02d", orchestrationtest.TenantPrefix, i))
-			seedForeignSession(t, ctx, store, tenant, i)
-		}
-		mark := len(commands.DueRequests())
-		after := shapeOf(awaitDue(t, commands, mark+orchestrationtest.KitControlShards*2)[mark:])
-		if before.maxLimit != after.maxLimit {
-			t.Fatalf("the due-page limit moved from %d to %d when twenty tenants were added",
-				before.maxLimit, after.maxLimit)
-		}
-		if after.maxLimit <= 0 {
-			t.Fatalf("the post-seed sweep asked for an unbounded page")
-		}
-	})
-
-	t.Run("case 3: a terminal command never consumes a due page", func(t *testing.T) {
+	t.Run("case 3 (legacy store view): a terminal command leaves the due view", func(t *testing.T) {
 		// A SEPARATE durable plane, with no Factory attached to it.
 		//
 		// That is not isolation for tidiness: the claim is that a TERMINAL
@@ -261,7 +262,7 @@ func TestFactoryReconciliationSweeps(t *testing.T) {
 		}
 	})
 
-	t.Run("case 3: a claim refuses a peer and recovers after expiry", func(t *testing.T) {
+	t.Run("case 3 (store contract): a claim refuses a peer and recovers after expiry", func(t *testing.T) {
 		// The durable half, and labelled as what it is: this exercises
 		// SessionStore's claim compare-and-swap directly, with the two holder
 		// ids supplied by the test. It is NOT evidence about Factory -- the row
@@ -310,7 +311,7 @@ func TestFactoryReconciliationSweeps(t *testing.T) {
 		}
 	})
 
-	t.Run("case 4: the gate sweep runs and Factory does not resolve an open gate", func(t *testing.T) {
+	t.Run("case 4 (shard reach): the gate sweep runs and Factory does not resolve an open gate", func(t *testing.T) {
 		// An OPEN gate past its deadline is due work nobody has dealt with, and
 		// the case's rule is that the sweep must NOT answer it: answering a cold
 		// gate is a decision only a participant can make. So the assertion is a
@@ -349,7 +350,7 @@ func TestFactoryReconciliationSweeps(t *testing.T) {
 		}
 	})
 
-	t.Run("case 3: each replica's own sweeper files claims under its own holder id", func(t *testing.T) {
+	t.Run("case 3 (legacy sweep): each replica's own sweeper files claims under its own holder id", func(t *testing.T) {
 		// THIS is the row that makes case 3's replica half evidence about
 		// Factory, and it replaces one that was not.
 		//
@@ -450,84 +451,45 @@ const commandSweepHolderSuffix = "/commands"
 // assertion has something to compare against without importing storage here.
 const storeOrderedPageCeiling = 1000
 
-type duePageShape struct{ maxLimit int }
-
-func shapeOf(requests []sessionstore.ListDueCommandsRequest) duePageShape {
-	shape := duePageShape{}
-	for _, req := range requests {
-		if req.Limit > shape.maxLimit {
-			shape.maxLimit = req.Limit
-		}
-	}
-	return shape
-}
-
-// seedForeignSession creates one session under a tenant that is not the
-// fixture's, so the tenant-count axis is real rather than a second session.
-func seedForeignSession(t *testing.T, ctx context.Context, store *orchestrationtest.StoreFixture, tenant sessionwire.TenantID, n int) {
-	t.Helper()
-	now := store.Clock.Now()
-	if _, _, err := store.Store.CreateCatalogEntry(ctx, sessionstore.CreateCatalogEntryRequest{
-		TenantID:               tenant,
-		SessionID:              sessionwire.SessionID(fmt.Sprintf("session-bulk-%02d", n)),
-		AgentID:                blockedAgent,
-		RuntimeCompatibilityID: string(blockedCompatibility),
-		CreatedAt:              now,
-		LastActiveAt:           now,
-		State:                  sessionwire.SessionStateIdle,
-		Residency:              sessionwire.SessionResidencyCold,
-		DesiredPlacement:       sessionwire.HostPlacementPooled,
-	}); err != nil {
-		t.Fatalf("seeding a foreign-tenant session: %v", err)
-	}
-}
-
 // appearsInDuePages reports whether one command is reachable in any shard's due
-// page at the fixture clock's now.
+// view at the fixture clock's now plus two hours, walking every page of every
+// shard. It waits up to ten seconds for the answer to become want.
 //
 // It reads the store directly rather than watching the sweep, because the sweep
 // SETTLES what it finds: a row that waited for the sweeper to report the command
-// would be racing the sweeper's own removal of it.
+// would be racing the sweeper's own removal of it. Every page is followed to
+// its end and every error fails the case -- a scan that stopped at the first
+// page, or swallowed a failed read, would report "absent" for a row it never
+// looked at.
 func appearsInDuePages(t *testing.T, ctx context.Context, store *orchestrationtest.StoreFixture, command sessionwire.CommandID, want bool) bool {
 	t.Helper()
 	deadline := time.Now().Add(10 * time.Second)
 	for {
-		for shard := range orchestrationtest.KitControlShards {
-			page, err := store.Store.ListDueCommands(ctx, sessionstore.ListDueCommandsRequest{
-				Shard:         shard,
-				DueAtOrBefore: store.Clock.Now().Add(2 * time.Hour),
-				Limit:         100,
-			})
-			if err != nil {
-				t.Fatalf("listing due commands in shard %d: %v", shard, err)
-				return false
-			}
-			for _, due := range page.Commands {
-				if due.Entry.Record.CommandID == command {
-					if want {
-						return true
-					}
-					break
-				}
-			}
-		}
 		present := false
 		for shard := range orchestrationtest.KitControlShards {
-			page, _ := store.Store.ListDueCommands(ctx, sessionstore.ListDueCommandsRequest{
+			req := sessionstore.ListDueCommandsRequest{
 				Shard:         shard,
 				DueAtOrBefore: store.Clock.Now().Add(2 * time.Hour),
 				Limit:         100,
-			})
-			for _, due := range page.Commands {
-				if due.Entry.Record.CommandID == command {
-					present = true
+			}
+			for {
+				page, err := store.Store.ListDueCommands(ctx, req)
+				if err != nil {
+					t.Fatalf("listing due commands in shard %d: %v", shard, err)
+					return false
 				}
+				for _, due := range page.Commands {
+					if due.Entry.Record.CommandID == command {
+						present = true
+					}
+				}
+				if page.NextCursor == "" {
+					break
+				}
+				req = sessionstore.ListDueCommandsRequest{Shard: shard, Limit: 100, Cursor: page.NextCursor}
 			}
 		}
-		if present == want {
-			return present
-		}
-		if time.Now().After(deadline) {
+		if present == want || time.Now().After(deadline) {
 			return present
 		}
 		time.Sleep(time.Millisecond)
@@ -558,3 +520,692 @@ func openGate(t *testing.T, ctx context.Context, store *orchestrationtest.StoreF
 }
 
 func kitRuntimeCommandUUID() string { return "3f2a1b0c-4d5e-4a6b-8c7d-9e0f1a2b3c4d" }
+
+// ---- the DISPOSITION deadline sweep: the one production runs ----------------
+
+// dispositionPageLimit and dispositionMaxPages are the bounds the disposition
+// and gate rows compose. They are deliberately tiny: a bound of 256 over a
+// fixture of twenty rows is never reached, so a row built on the defaults
+// could not tell a bounded sweep from an unbounded one. With MaxPages 1 every
+// due-page query IS one pass, which is what lets the rows below read "queries
+// per pass" off the recorded request stream.
+const (
+	dispositionPageLimit = 2
+	dispositionMaxPages  = 1
+	dispositionHolderSfx = "/dispositions"
+)
+
+func boundedReconcileLimits() factory.ReconcileLimits {
+	limits := reconcileLimits()
+	limits.MaxDuePerSweep = dispositionPageLimit
+	limits.MaxConcurrent = dispositionMaxPages
+	return limits
+}
+
+// dispositionWorld is one real Factory with the create plane composed, over a
+// real Store, admitting in many tenants, with its command seam recorded.
+type dispositionWorld struct {
+	store    *orchestrationtest.StoreFixture
+	clock    *orchestrationtest.Clock
+	commands *orchestrationtest.StoreCommands
+	replica  *orchestrationtest.FactoryFixture
+	bearers  []string
+	tenants  map[string]sessionwire.TenantID
+}
+
+func newDispositionWorld(t *testing.T, ctx context.Context, tenants int) *dispositionWorld {
+	t.Helper()
+	clock := orchestrationtest.NewClock(time.Unix(coldReadEpoch, 0))
+	store := orchestrationtest.NewStoreFixture(t, ctx, clock)
+	world := &dispositionWorld{
+		store:    store,
+		clock:    clock,
+		commands: orchestrationtest.NewStoreCommands(store.Store),
+		tenants:  map[string]sessionwire.TenantID{orchestrationtest.KitActorCredential: store.Tenant},
+		bearers:  []string{orchestrationtest.KitActorCredential},
+	}
+	for i := 1; i < tenants; i++ {
+		bearer := fmt.Sprintf("orchestrationtest-bearer-%02d", i)
+		world.tenants[bearer] = sessionwire.TenantID(fmt.Sprintf("%s%s-t%02d", orchestrationtest.TenantPrefix, store.Tenant[len(orchestrationtest.TenantPrefix):], i))
+		world.bearers = append(world.bearers, bearer)
+	}
+	world.replica = orchestrationtest.NewFactoryFixtureWithSeams(t, store, clock, orchestrationtest.FactorySeams{
+		Commands:              world.commands,
+		ReplicaID:             "orchestrationtest-disposition-replica",
+		Reconcile:             boundedReconcileLimits(),
+		Templates:             []factory.LaunchTemplate{orchestrationtest.KitLaunchTemplate(orchestrationtest.LaneAgent, string(orchestrationtest.LaneCompatibility))},
+		SessionBindingID:      orchestrationtest.LaneStorageBinding,
+		SessionBindingVersion: orchestrationtest.LaneBindingVersion,
+		Verifier:              &orchestrationtest.MultiTenantVerifier{Bearers: world.tenants, Clock: clock},
+	})
+	return world
+}
+
+// dueCommand names one admitted command.
+type dueCommand struct {
+	tenant  sessionwire.TenantID
+	session sessionwire.SessionID
+	command sessionwire.CommandID
+}
+
+// create admits one session's create THROUGH FACTORY, as bearer's tenant. The
+// create is a disposition command whose apply deadline Factory stamps from its
+// own composed clock and ReconcileLimits.ApplyDeadline.
+func (w *dispositionWorld) create(t *testing.T, ctx context.Context, bearer, tag string) dueCommand {
+	t.Helper()
+	session := sessionwire.SessionID("session-" + tag)
+	command := sessionwire.CommandID("command-" + tag)
+	status, body := w.replica.PostAs(t, ctx, bearer, "/v1/sessions", orchestrationtest.CreateBody(session, command))
+	if status != http.StatusCreated {
+		t.Fatalf("Factory answered the create %s with %d: %s", tag, status, body)
+	}
+	return dueCommand{tenant: w.tenants[bearer], session: session, command: command}
+}
+
+func (w *dispositionWorld) state(t *testing.T, ctx context.Context, c dueCommand) sessionstore.InboxState {
+	t.Helper()
+	entry, err := w.store.Store.GetDispositionCommand(ctx, sessionstore.GetDispositionCommandRequest{
+		TenantID: c.tenant, SessionID: c.session, CommandID: c.command,
+	})
+	if err != nil {
+		t.Fatalf("reading %s/%s: %v", c.session, c.command, err)
+	}
+	return entry.Record.State
+}
+
+// shardsOf reads, straight from the store, which shard's due view holds each
+// named command within bound. It walks every page of every shard.
+func (w *dispositionWorld) shardsOf(t *testing.T, ctx context.Context, bound time.Time, commands []dueCommand) map[sessionwire.CommandID]int {
+	t.Helper()
+	want := map[sessionwire.CommandID]bool{}
+	for _, c := range commands {
+		want[c.command] = true
+	}
+	found := map[sessionwire.CommandID]int{}
+	for shard := range orchestrationtest.KitControlShards {
+		req := sessionstore.ListDueDispositionCommandsRequest{Shard: shard, DueAtOrBefore: bound, Limit: 100}
+		for {
+			page, err := w.store.Store.ListDueDispositionCommands(ctx, req)
+			if err != nil {
+				t.Fatalf("listing shard %d's due disposition commands: %v", shard, err)
+			}
+			for _, entry := range page.Commands {
+				if id := entry.Record.Descriptor.CommandID; want[id] {
+					found[id] = shard
+				}
+			}
+			if page.NextCursor == "" {
+				break
+			}
+			req = sessionstore.ListDueDispositionCommandsRequest{Shard: shard, Limit: 100, Cursor: page.NextCursor}
+		}
+	}
+	return found
+}
+
+// awaitRejected waits until the sweep has rejected every named command, and
+// fails naming the ones it never reached and the shards they live in.
+func (w *dispositionWorld) awaitRejected(t *testing.T, ctx context.Context, commands []dueCommand, shards map[sessionwire.CommandID]int) {
+	t.Helper()
+	deadline := time.Now().Add(30 * time.Second)
+	for {
+		var pending []string
+		for _, c := range commands {
+			if w.state(t, ctx, c) != sessionstore.InboxStateRejected {
+				pending = append(pending, fmt.Sprintf("%s(shard %d)", c.command, shards[c.command]))
+			}
+		}
+		if len(pending) == 0 {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("after 30s the disposition sweep had not rejected %d expired commands: %v", len(pending), pending)
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+}
+
+// assertBoundedRotation holds one window of the disposition sweep's recorded
+// queries to the fixed-shard contract.
+//
+// Every query is ONE PASS, because MaxPages is 1, and consecutive passes visit
+// consecutive shards: a pass is not allowed to linger on a shard, to skip one,
+// or to answer for all of them from shard zero. Every query asks for exactly
+// the composed page limit. A resumed pass carries a cursor and no bound of its
+// own; a fresh pass carries a bound and no cursor.
+func assertBoundedRotation(t *testing.T, phase string, requests []sessionstore.ListDueDispositionCommandsRequest) (resumed int) {
+	t.Helper()
+	shards := orchestrationtest.KitControlShards
+	if len(requests) < shards {
+		t.Fatalf("%s: only %d disposition queries were recorded; a rotation needs at least %d", phase, len(requests), shards)
+	}
+	seen := map[int]bool{}
+	for i, req := range requests {
+		if req.Shard < 0 || req.Shard >= shards {
+			t.Fatalf("%s: query %d named shard %d, outside [0,%d)", phase, i, req.Shard, shards)
+		}
+		seen[req.Shard] = true
+		if req.Limit != dispositionPageLimit {
+			t.Fatalf("%s: query %d asked for %d rows; the composed page limit is %d", phase, i, req.Limit, dispositionPageLimit)
+		}
+		if (req.Cursor == "") == req.DueAtOrBefore.IsZero() {
+			t.Fatalf("%s: query %d carries cursor %q and bound %v; a pass is either fresh or resumed", phase, i, req.Cursor, req.DueAtOrBefore)
+		}
+		if req.Cursor != "" {
+			resumed++
+		}
+		if i > 0 && req.Shard != (requests[i-1].Shard+1)%shards {
+			t.Fatalf("%s: query %d visited shard %d right after shard %d; the fixed-shard rotation does not advance one shard per pass",
+				phase, i, req.Shard, requests[i-1].Shard)
+		}
+	}
+	if len(seen) != shards {
+		t.Fatalf("%s: the sweep reached shards %v, want all %d", phase, seen, shards)
+	}
+	return resumed
+}
+
+// TestFactoryDispositionSweepVisitsEveryShardInBoundedPages is I1.3 cases 2
+// and 3 (terminal rows, holder identity) over the DISPOSITION deadline sweep --
+// the sweep a deployment actually runs, since every command Factory admits is
+// a disposition command and the legacy sweep's rows can only exist on a store
+// that already held them.
+//
+// Every command is admitted THROUGH FACTORY, in every tenant, and is settled
+// by Factory's own sweep. The evidence is durable: each expired command ends
+// REJECTED in the store, and the recorder only reads what the sweep asked.
+func TestFactoryDispositionSweepVisitsEveryShardInBoundedPages(t *testing.T) {
+	ctx := coldReadContext(t)
+	const manyTenants = 20
+	w := newDispositionWorld(t, ctx, manyTenants+1)
+	applyDeadline := factory.DefaultReconcileLimits().ApplyDeadline
+
+	// PHASE ONE: one tenant, enough sessions that EVERY shard holds more than
+	// one page of expired work. A shard with a page or less is one no pass
+	// ever has to resume in, and "bounded pages" would be vacuous there.
+	var first []dueCommand
+	var shards map[sessionwire.CommandID]int
+	perShard := func() map[int]int {
+		counts := map[int]int{}
+		for _, shard := range shards {
+			counts[shard]++
+		}
+		return counts
+	}
+	for i := 0; ; i++ {
+		first = append(first, w.create(t, ctx, orchestrationtest.KitActorCredential, fmt.Sprintf("disp-one-%03d", i)))
+		if len(first) < 4*orchestrationtest.KitControlShards {
+			continue
+		}
+		shards = w.shardsOf(t, ctx, w.clock.Now().Add(2*applyDeadline), first)
+		if len(shards) != len(first) {
+			t.Fatalf("%d of %d admitted creates are not in any shard's due view", len(first)-len(shards), len(first))
+		}
+		enough := len(perShard()) == orchestrationtest.KitControlShards
+		for _, n := range perShard() {
+			enough = enough && n > dispositionPageLimit
+		}
+		if enough {
+			break
+		}
+		if i > 200 {
+			t.Fatalf("200 sessions did not fill every shard past one page: %v", perShard())
+		}
+	}
+	t.Logf("phase one: %d commands, per shard %v", len(first), perShard())
+
+	// Nothing is due until the kit clock passes the deadline Factory stamped.
+	// The sweep is already running; it must not have settled anything.
+	for _, c := range first {
+		if state := w.state(t, ctx, c); state != sessionstore.InboxStatePending {
+			t.Fatalf("%s is %q before its apply deadline", c.command, state)
+		}
+	}
+	mark := len(w.commands.DispositionDueRequests())
+	w.clock.Advance(applyDeadline + time.Second)
+	w.awaitRejected(t, ctx, first, shards)
+	phaseOne := w.commands.DispositionDueRequests()[mark:]
+	resumedOne := assertBoundedRotation(t, "phase one", phaseOne)
+	if resumedOne == 0 {
+		t.Fatalf("phase one: every shard held more than %d expired rows and no pass resumed from a cursor; "+
+			"the sweep is not paging", dispositionPageLimit)
+	}
+
+	t.Run("case 3: the disposition sweep claims under its own holder, never placement's", func(t *testing.T) {
+		// The disposition sweep claims each session before it rejects, and it
+		// must do so under a holder of its OWN. The store treats an acquire by
+		// the claim's current holder as an EXTENSION, so under the bare replica
+		// id -- which is what placement claims under -- this sweep would
+		// "extend" a claim placement holds mid-attach, reject, and RELEASE it,
+		// letting a second replica attach the same session (Factory's B5 N1).
+		want := w.replica.ReplicaID + dispositionHolderSfx
+		requests := w.commands.ClaimRequests()
+		if len(requests) < len(first) {
+			t.Fatalf("the sweep filed %d claims for %d rejections", len(requests), len(first))
+		}
+		for _, req := range requests {
+			if req.HolderID != want {
+				t.Fatalf("the disposition sweep claimed %s under %q, want exactly %q", req.SessionID, req.HolderID, want)
+			}
+			if req.HolderID == w.replica.ReplicaID {
+				t.Fatalf("the disposition sweep claimed under the bare replica id, which is placement's holder")
+			}
+		}
+		if got := len(w.commands.RejectedDispositions()); got < len(first) {
+			t.Fatalf("the sweep recorded %d rejections, want at least %d", got, len(first))
+		}
+	})
+
+	t.Run("case 3: terminal rows never consume a due page", func(t *testing.T) {
+		// Every shard now holds more than one PAGE of terminal (rejected) rows
+		// with EARLIER deadlines than anything admitted next. If terminal rows
+		// stayed in the due view they would fill a Limit-sized first page ahead
+		// of the live row. The live row must be on the first page, and the
+		// page must have examined nothing else.
+		probe := w.create(t, ctx, orchestrationtest.KitActorCredential, "disp-probe")
+		shard, ok := w.shardsOf(t, ctx, w.clock.Now().Add(2*applyDeadline), []dueCommand{probe})[probe.command]
+		if !ok {
+			t.Fatalf("the probe is not due work; the row cannot discriminate")
+		}
+		if perShard()[shard] <= dispositionPageLimit {
+			t.Fatalf("shard %d holds only %d terminal rows; the row needs more than a page", shard, perShard()[shard])
+		}
+		page, err := w.store.Store.ListDueDispositionCommands(ctx, sessionstore.ListDueDispositionCommandsRequest{
+			Shard: shard, DueAtOrBefore: w.clock.Now().Add(2 * applyDeadline), Limit: dispositionPageLimit,
+		})
+		if err != nil {
+			t.Fatalf("reading shard %d's first due page: %v", shard, err)
+		}
+		if len(page.Commands) != 1 || page.Commands[0].Record.Descriptor.CommandID != probe.command {
+			t.Fatalf("shard %d's first page is %d rows, want exactly the live probe: terminal rows are consuming it", shard, len(page.Commands))
+		}
+		if page.Examined != 1 {
+			t.Fatalf("shard %d's first page examined %d rows for one live command; %d terminal rows are still in the due view",
+				shard, page.Examined, page.Examined-1)
+		}
+		first = append(first, probe)
+		shards[probe.command] = shard
+	})
+
+	// PHASE TWO: twenty MORE tenants, each admitting through the same Factory.
+	// The page shape and the rotation must be exactly what they were with one.
+	var second []dueCommand
+	for i, bearer := range w.bearers[1:] {
+		second = append(second, w.create(t, ctx, bearer, fmt.Sprintf("disp-many-%02d", i)))
+	}
+	for i := range 2 * orchestrationtest.KitControlShards {
+		second = append(second, w.create(t, ctx, orchestrationtest.KitActorCredential, fmt.Sprintf("disp-many-own-%02d", i)))
+	}
+	shardsTwo := w.shardsOf(t, ctx, w.clock.Now().Add(2*applyDeadline), second)
+	for k, v := range shardsTwo {
+		shards[k] = v
+	}
+	tenantsSeen := map[sessionwire.TenantID]bool{}
+	for _, c := range second {
+		tenantsSeen[c.tenant] = true
+	}
+	if len(tenantsSeen) != manyTenants+1 {
+		t.Fatalf("phase two admitted work in %d tenants, want %d", len(tenantsSeen), manyTenants+1)
+	}
+	mark = len(w.commands.DispositionDueRequests())
+	w.clock.Advance(applyDeadline + time.Second)
+	w.awaitRejected(t, ctx, append(second, first[len(first)-1]), shards)
+	phaseTwo := w.commands.DispositionDueRequests()[mark:]
+
+	t.Run("case 2: the sweep visits every shard, one bounded page per pass, whatever the tenant count", func(t *testing.T) {
+		resumedTwo := assertBoundedRotation(t, "phase two", phaseTwo)
+		// The per-pass shape is compared, not merely bounded: one query of
+		// exactly Limit rows per pass with one tenant and with twenty-one. And
+		// the request NAMES no tenant at all -- ListDueDispositionCommandsRequest
+		// has no tenant member -- so the tenant count cannot enter the query;
+		// what it could change is how many rows a shard holds, which is what
+		// the resumed passes absorb.
+		t.Logf("phase one: %d passes (%d resumed) for %d commands in 1 tenant; phase two: %d passes (%d resumed) for %d commands in %d tenants",
+			len(phaseOne), resumedOne, len(first), len(phaseTwo), resumedTwo, len(second), len(tenantsSeen))
+		byShard := map[int]int{}
+		for _, c := range second {
+			byShard[shards[c.command]]++
+		}
+		if len(byShard) != orchestrationtest.KitControlShards {
+			t.Fatalf("phase two's work landed in shards %v; the row needs due work in every shard", byShard)
+		}
+	})
+}
+
+// ---- case 4: gate deadline intents ------------------------------------------
+
+// seedGate opens one legacy gate on session through store, at seq. It is the
+// multi-gate sibling of openGate: openGate re-projects the catalog with no
+// gates, which on a session that already has one DROPS it -- turning an open
+// gate into a remnant the case did not mean to make.
+func seedGate(t *testing.T, ctx context.Context, store *sessionstore.Store, fixture *orchestrationtest.StoreFixture, session sessionwire.SessionID, gate sessionwire.GateID, seq uint64, deadline time.Time) error {
+	t.Helper()
+	_, err := store.OpenGate(ctx, sessionstore.OpenGateRequest{
+		TenantID:   fixture.Tenant,
+		SessionID:  session,
+		LeaseEpoch: 1,
+		Gate: sessionwire.GateProjection{
+			GateID:           gate,
+			Kind:             "permission",
+			OpenedEventID:    sessionwire.EventID(fmt.Sprintf("event-gate-%d", seq)),
+			OpenedJournalSeq: seq,
+			Deadline:         deadline,
+			Answerability:    sessionwire.GateAnswerabilityResident,
+			Prompt:           sessionwire.GatePrompt{Title: "orchestrationtest gate"},
+		},
+	})
+	return err
+}
+
+// historyGates is how many gates case 4 opens and resolves cleanly after the
+// sweep has retired the stale intents.
+const historyGates = 10
+
+// dueGateScan is one full walk of every shard's due-gate view.
+type dueGateScan struct {
+	examined int
+	open     map[sessionwire.GateID]bool
+	remnants map[sessionwire.GateID]bool
+}
+
+func scanDueGates(t *testing.T, ctx context.Context, store *orchestrationtest.StoreFixture, bound time.Time) dueGateScan {
+	t.Helper()
+	scan := dueGateScan{open: map[sessionwire.GateID]bool{}, remnants: map[sessionwire.GateID]bool{}}
+	for shard := range orchestrationtest.KitControlShards {
+		req := sessionstore.ListDueGatesRequest{Shard: shard, DueAtOrBefore: bound, Limit: 100}
+		for {
+			page, err := store.Store.ListDueGates(ctx, req)
+			if err != nil {
+				t.Fatalf("listing shard %d's due gates: %v", shard, err)
+			}
+			scan.examined += page.Examined
+			for _, gate := range page.Gates {
+				scan.open[gate.Gate.GateID] = true
+			}
+			for _, remnant := range page.Remnants {
+				scan.remnants[remnant.GateID] = true
+			}
+			if page.NextCursor == "" {
+				break
+			}
+			req = sessionstore.ListDueGatesRequest{Shard: shard, Limit: 100, Cursor: page.NextCursor}
+		}
+	}
+	return scan
+}
+
+// TestFactoryGateSweepRetiresStaleIntents is I1.3 case 4.
+//
+// Three kinds of gate deadline intent are seeded on ONE session, so they share
+// a shard and are ordered by deadline in one due view:
+//
+//   - three STILL-OPEN gates, past their deadlines, at the head of the view;
+//   - a CRASH-BEFORE-OPEN intent: OpenGate made the intent durable and the
+//     process died before the projection write (driven by failing that write
+//     in a second real Store over the same bytes, not by writing the intent by
+//     hand);
+//   - a DURABLY-RESOLVED intent: ResolveGate cleared the projection and died
+//     before tombstoning the intent.
+//
+// The two stale intents sit BEHIND more than one page of open gates, and open
+// gates never leave the view -- Factory must not answer them -- so a sweep can
+// reach the stale ones only by resuming from its cursor.
+func TestFactoryGateSweepRetiresStaleIntents(t *testing.T) {
+	ctx := coldReadContext(t)
+	clock := orchestrationtest.NewClock(time.Unix(coldReadEpoch, 0))
+	store := orchestrationtest.NewStoreFixture(t, ctx, clock)
+	crashing, faults := store.OpenCrashingStore(ctx)
+
+	session := store.SeedSession(ctx, blockedAgent, string(blockedCompatibility))
+	var seq uint64
+	// Every event any gate below names is committed up front and the catalog
+	// advanced ONCE. Advancing it again later would re-project the session's
+	// open gates wholesale and drop them, manufacturing remnants.
+	const events = 5 + historyGates
+	for i := 1; i <= events; i++ {
+		seq = store.AppendPublicEvent(ctx, session, sessionwire.EventID(fmt.Sprintf("event-gate-%d", i)), []byte(fmt.Sprintf(`{"n":%d}`, i)))
+	}
+	store.AdvanceCatalogJournal(ctx, session, 1, seq, sessionwire.EventID(fmt.Sprintf("event-gate-%d", events)), nil)
+
+	now := clock.Now()
+	open := []sessionwire.GateID{"gate-open-1", "gate-open-2", "gate-open-3"}
+	for i, gate := range open {
+		if err := seedGate(t, ctx, store.Store, store, session, gate, uint64(i+1), now.Add(time.Duration(i-60)*time.Minute)); err != nil {
+			t.Fatalf("opening %s: %v", gate, err)
+		}
+	}
+	const crashed, resolved = sessionwire.GateID("gate-crash-before-open"), sessionwire.GateID("gate-durably-resolved")
+
+	faults.FailUpdates(true)
+	if err := seedGate(t, ctx, crashing, store, session, crashed, 4, now.Add(-30*time.Minute)); err == nil {
+		t.Fatalf("the open survived its projection write failing; the crash point was not reached")
+	}
+	faults.FailUpdates(false)
+
+	if err := seedGate(t, ctx, store.Store, store, session, resolved, 5, now.Add(-20*time.Minute)); err != nil {
+		t.Fatalf("opening %s: %v", resolved, err)
+	}
+	faults.FailDeletes(true)
+	if _, err := crashing.ResolveGate(ctx, sessionstore.ResolveGateRequest{
+		TenantID: store.Tenant, SessionID: session, LeaseEpoch: 1, GateID: resolved,
+	}); err == nil {
+		t.Fatalf("the resolve survived its intent tombstone failing; the crash point was not reached")
+	}
+	faults.FailDeletes(false)
+	if faults.Fired() != 2 {
+		t.Fatalf("%d crash points fired, want 2", faults.Fired())
+	}
+
+	// The durable state the crashes left, read before any Factory exists.
+	before := scanDueGates(t, ctx, store, clock.Now())
+	for _, gate := range open {
+		if !before.open[gate] {
+			t.Fatalf("%s is not an open due gate; the fixture is wrong", gate)
+		}
+	}
+	if !before.remnants[crashed] || !before.remnants[resolved] {
+		t.Fatalf("the crashes left remnants %v, want %s and %s", before.remnants, crashed, resolved)
+	}
+	if len(open) <= dispositionPageLimit {
+		t.Fatalf("%d open gates do not fill a %d-row page; the cursor half cannot discriminate", len(open), dispositionPageLimit)
+	}
+
+	replica := orchestrationtest.NewFactoryFixtureWithSeams(t, store, clock, orchestrationtest.FactorySeams{
+		ReplicaID: "orchestrationtest-gate-replica",
+		Reconcile: boundedReconcileLimits(),
+	})
+	gates := replica.Gates
+
+	// A remnant younger than MinGateIntentRemnantAge is indistinguishable from
+	// an open in flight, and the store refuses to retire it. The sweep runs
+	// over it several times first; nothing may be retired yet.
+	awaitDueGates(t, gates, 4*orchestrationtest.KitControlShards)
+	if got := scanDueGates(t, ctx, store, clock.Now()); !got.remnants[crashed] || !got.remnants[resolved] {
+		t.Fatalf("a remnant was retired inside its in-flight window: %v", got.remnants)
+	}
+
+	clock.Advance(sessionstore.MinGateIntentRemnantAge + time.Minute)
+	deadline := time.Now().Add(30 * time.Second)
+	for {
+		got := scanDueGates(t, ctx, store, clock.Now())
+		if len(got.remnants) == 0 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("after 30s the gate sweep had not retired remnants %v; retired requests %v", got.remnants, gates.Retired())
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+
+	t.Run("case 4: stale intents retire, through Factory's own sweep", func(t *testing.T) {
+		retired := map[sessionwire.GateID]bool{}
+		for _, req := range gates.Retired() {
+			retired[req.GateID] = true
+		}
+		if !retired[crashed] || !retired[resolved] {
+			t.Fatalf("Factory's sweep retired %v; want both %s and %s", retired, crashed, resolved)
+		}
+		for _, gate := range open {
+			if retired[gate] {
+				t.Fatalf("Factory's sweep asked to retire the still-open gate %s", gate)
+			}
+		}
+	})
+
+	t.Run("case 4: open gates are not resolved by Factory", func(t *testing.T) {
+		page, err := store.Store.ReadGates(ctx, sessionstore.ReadGatesRequest{TenantID: store.Tenant, SessionID: session})
+		if err != nil {
+			t.Fatalf("reading gates: %v", err)
+		}
+		projected := map[sessionwire.GateID]bool{}
+		for _, gate := range page.Gates {
+			projected[gate.GateID] = true
+		}
+		for _, gate := range open {
+			if !projected[gate] {
+				t.Fatalf("the still-open gate %s left the projection", gate)
+			}
+		}
+		if page.OpenGateCount != uint64(len(open)) {
+			t.Fatalf("OpenGateCount is %d, want %d", page.OpenGateCount, len(open))
+		}
+	})
+
+	t.Run("case 4: cursors reach work behind a full page of open gates", func(t *testing.T) {
+		// Open gates never leave the view and sort first, so every page read
+		// from the head of this shard is open gates and nothing else. The
+		// remnants were retired, so the sweep reached them -- and it can only
+		// have done that by resuming. This is the continuation being USED.
+		resumed := 0
+		for _, req := range gates.DueRequests() {
+			if req.Limit != dispositionPageLimit {
+				t.Fatalf("a gate query asked for %d rows; the composed page limit is %d", req.Limit, dispositionPageLimit)
+			}
+			if req.Cursor != "" {
+				resumed++
+			}
+		}
+		if resumed == 0 {
+			t.Fatalf("the gate sweep never resumed from a cursor, yet retired rows behind a full page")
+		}
+	})
+
+	t.Run("case 4: retired gates do not accumulate in due pages", func(t *testing.T) {
+		// History is made on purpose: historyGates more gates opened and resolved
+		// cleanly, each leaving a tombstone. The due view must still examine
+		// exactly the three open gates -- tombstones are not rows a page pays
+		// for, or the view would slow down forever as a session ages.
+		for i := range historyGates {
+			gate := sessionwire.GateID(fmt.Sprintf("gate-history-%02d", i))
+			if err := seedGate(t, ctx, store.Store, store, session, gate, uint64(6+i), clock.Now().Add(-time.Minute)); err != nil {
+				t.Fatalf("opening %s: %v", gate, err)
+			}
+			if _, err := store.Store.ResolveGate(ctx, sessionstore.ResolveGateRequest{
+				TenantID: store.Tenant, SessionID: session, LeaseEpoch: 1, GateID: gate,
+			}); err != nil {
+				t.Fatalf("resolving %s: %v", gate, err)
+			}
+		}
+		after := scanDueGates(t, ctx, store, clock.Now().Add(time.Hour))
+		if after.examined != len(open) || len(after.open) != len(open) || len(after.remnants) != 0 {
+			t.Fatalf("the due view examined %d rows (%d open, %d remnants) after retirement and ten resolved gates, want exactly the %d open ones",
+				after.examined, len(after.open), len(after.remnants), len(open))
+		}
+	})
+}
+
+// TestFactoryGateSweepCannotRetireADispositionRemnant is I1.3 case 4 on the
+// sessions production actually gates on -- and it is a TRIP-WIRE, pinning a
+// sessionstore v0.12.0 defect this lane found rather than a behaviour anyone
+// wants.
+//
+// Since host v0.4.0 every gate a Host publishes is on a DISPOSITION session,
+// written under a store-issued residency grant. A crash between OpenGate's
+// intent write and its projection write leaves a remnant there exactly as it
+// does on a legacy session. But sessionstore v0.12.0's RetireGateDeadlineIntent
+// reserves the LEGACY protocol mode before it deletes (shards.go, "Retirement
+// mutates legacy gate state"), so on a disposition-bound session it refuses
+// with `catalog conflict (binding.protocol_mode)` -- forever. Factory's sweep
+// classifies the refusal as an ordinary outcome and asks again every pass.
+//
+// The remnant does not BLOCK the sweep -- the cursor steps past it, which the
+// legacy test above proves -- but it is never retired, so disposition remnants
+// accumulate in the due view for the life of the session. The fix is owed by
+// sessionstore; when it lands this row fails, and must be flipped to assert
+// retirement the way TestFactoryGateSweepRetiresStaleIntents does.
+func TestFactoryGateSweepCannotRetireADispositionRemnant(t *testing.T) {
+	ctx := coldReadContext(t)
+	w := newDispositionWorld(t, ctx, 1)
+	created := w.create(t, ctx, orchestrationtest.KitActorCredential, "gate-disposition")
+	crashing, faults := w.store.OpenCrashingStore(ctx)
+	grant, err := crashing.AcquireResidency(ctx, sessionstore.AcquireResidencyRequest{TenantID: created.tenant, SessionID: created.session})
+	if err != nil {
+		t.Fatalf("acquiring residency on the disposition session: %v", err)
+	}
+	const gate = sessionwire.GateID("gate-disposition-crash-before-open")
+	faults.FailUpdates(true)
+	if _, err := crashing.OpenGate(ctx, sessionstore.OpenGateRequest{
+		TenantID: created.tenant, SessionID: created.session, Residency: grant,
+		Gate: sessionwire.GateProjection{
+			GateID: gate, Kind: "permission", OpenedEventID: "event-disposition-gate", OpenedJournalSeq: 1,
+			Deadline: w.clock.Now().Add(-time.Minute), Answerability: sessionwire.GateAnswerabilityResident,
+			Prompt: sessionwire.GatePrompt{Title: "orchestrationtest gate"},
+		},
+	}); err == nil {
+		t.Fatalf("the open survived its projection write failing; the crash point was not reached")
+	}
+	faults.FailUpdates(false)
+	if !scanDueGates(t, ctx, w.store, w.clock.Now()).remnants[gate] {
+		t.Fatalf("the crash left no remnant on the disposition session; the fixture is wrong")
+	}
+
+	w.clock.Advance(sessionstore.MinGateIntentRemnantAge + time.Minute)
+	orchestrationtest.PooledWait(t, "Factory's sweep asked to retire the disposition remnant", 30*time.Second, func() bool {
+		for _, req := range w.replica.Gates.Retired() {
+			if req.GateID == gate {
+				return true
+			}
+		}
+		return false
+	})
+	// Several more passes, then the durable answer.
+	awaitDueGates(t, w.replica.Gates, len(w.replica.Gates.DueRequests())+2*orchestrationtest.KitControlShards)
+	if !scanDueGates(t, ctx, w.store, w.clock.Now()).remnants[gate] {
+		t.Fatalf("TRIP-WIRE FIRED: the disposition remnant was retired. sessionstore now retires remnants on " +
+			"disposition sessions; flip this row to assert retirement and drop the owed item from the I1.3 record")
+	}
+	var refusal *sessionstore.CatalogError
+	for _, remnant := range scanDueGatesRemnants(t, ctx, w.store, w.clock.Now()) {
+		if remnant.GateID != gate {
+			continue
+		}
+		err := w.store.Store.RetireGateDeadlineIntent(ctx, sessionstore.RetireGateDeadlineIntentRequest(remnant))
+		if !errors.As(err, &refusal) || refusal.Code != sessionstore.CatalogErrorConflict || refusal.Field != "binding.protocol_mode" {
+			t.Fatalf("retiring the disposition remnant answered %v; the pinned defect is catalog conflict (binding.protocol_mode)", err)
+		}
+	}
+	if refusal == nil {
+		t.Fatalf("the remnant vanished between two reads")
+	}
+}
+
+// scanDueGatesRemnants returns every remnant in every shard's due view.
+func scanDueGatesRemnants(t *testing.T, ctx context.Context, store *orchestrationtest.StoreFixture, bound time.Time) []sessionstore.RemnantGateIntent {
+	t.Helper()
+	var remnants []sessionstore.RemnantGateIntent
+	for shard := range orchestrationtest.KitControlShards {
+		req := sessionstore.ListDueGatesRequest{Shard: shard, DueAtOrBefore: bound, Limit: 100}
+		for {
+			page, err := store.Store.ListDueGates(ctx, req)
+			if err != nil {
+				t.Fatalf("listing shard %d's due gates: %v", shard, err)
+			}
+			remnants = append(remnants, page.Remnants...)
+			if page.NextCursor == "" {
+				break
+			}
+			req = sessionstore.ListDueGatesRequest{Shard: shard, Limit: 100, Cursor: page.NextCursor}
+		}
+	}
+	return remnants
+}
