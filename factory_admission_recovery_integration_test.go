@@ -724,11 +724,38 @@ func TestI12LostHostLinkRepliesAndRedeliveryApplyOnce(t *testing.T) {
 		t.Logf("posting %q answered %s after %v", id, body, time.Since(began).Round(time.Millisecond))
 		return decodeCommandStatus(t, body)
 	}
-	// Redelivered before settlement, through both replicas.
-	firstAnswer := post(replicaA, command, word)
-	for _, served := range []*orchestrationtest.PooledFactory{replicaB, replicaA, replicaB} {
-		if again := post(served, command, word); again.AcceptedOrder != firstAnswer.AcceptedOrder {
-			t.Fatalf("a redelivery was answered order %d, the first %d", again.AcceptedOrder, firstAnswer.AcceptedOrder)
+	// Delivered and REdelivered CONCURRENTLY through both replicas, so the
+	// redeliveries reach the Host while the first delivery is still being
+	// applied rather than after it settled. (Sequential posts would not:
+	// each answer waits out a lost reply's RPC bound, and the command
+	// settles inside the first one.)
+	concurrent := []*orchestrationtest.PooledFactory{replicaA, replicaB, replicaA, replicaB}
+	early := make([]sessionwire.CommandStatus, len(concurrent))
+	var wg sync.WaitGroup
+	start := make(chan struct{})
+	for i, served := range concurrent {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			<-start
+			status, body, err := served.PostRaw(ctx, admissionTenant, inputPath(session), admissionInput(command, session, word))
+			if err != nil || status != http.StatusOK {
+				t.Errorf("concurrent post %d answered %d %s: %v", i, status, body, err)
+				return
+			}
+			if err := json.Unmarshal(body, &early[i]); err != nil {
+				t.Errorf("concurrent post %d: undecodable %s: %v", i, body, err)
+			}
+		}()
+	}
+	close(start)
+	wg.Wait()
+	if t.Failed() {
+		t.FailNow()
+	}
+	for i, answer := range early {
+		if answer.AcceptedOrder != early[0].AcceptedOrder || answer.CommandID != command {
+			t.Fatalf("concurrent post %d was answered %+v, post 0 %+v", i, answer, early[0])
 		}
 	}
 	orchestrationtest.PooledWait(t, "the redelivered input settled applied", 120*time.Second, func() bool {
@@ -754,7 +781,15 @@ func TestI12LostHostLinkRepliesAndRedeliveryApplyOnce(t *testing.T) {
 				dropped++
 			}
 		}
-		t.Logf("the Host received %q %d times over %d HostLinks; %d replies were deleted", command, ours, len(conns), dropped)
+		settledAt := mustCommand(t, ctx, world, session, command).Record.Outcome.SettledAt
+		beforeSettlement := 0
+		for _, delivery := range dropper.Deliveries() {
+			if delivery.CommandID == command && delivery.At.Before(settledAt) {
+				beforeSettlement++
+			}
+		}
+		t.Logf("the Host received %q %d times over %d HostLinks, %d of them before it settled; %d replies were deleted",
+			command, ours, len(conns), beforeSettlement, dropped)
 		if ours < 2 {
 			t.Fatalf("the Host received %q %d times; the case needs a REdelivery", command, ours)
 		}

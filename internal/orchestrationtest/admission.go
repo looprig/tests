@@ -299,6 +299,8 @@ type ObservedDelivery struct {
 	Channel      string
 	CommandID    sessionwire.CommandID
 	ReplyDropped bool
+	// At is when the delivery reached the Host's side of the wire.
+	At time.Time
 }
 
 // NewReplyDropper returns a dropper that has seen nothing.
@@ -421,7 +423,7 @@ func (c *droppingConn) observeClient(p []byte) {
 			c.dropper.mu.Lock()
 			c.pending[command.ID] = len(c.dropper.deliveries)
 			c.dropper.deliveries = append(c.dropper.deliveries, ObservedDelivery{
-				Conn: c.id, RPCID: command.ID, Channel: command.RPC.Method, CommandID: delivery.CommandID,
+				Conn: c.id, RPCID: command.ID, Channel: command.RPC.Method, CommandID: delivery.CommandID, At: time.Now(),
 			})
 			c.dropper.mu.Unlock()
 		}
