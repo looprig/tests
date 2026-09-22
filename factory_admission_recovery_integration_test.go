@@ -25,6 +25,7 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"sort"
@@ -398,6 +399,12 @@ func (w *orderWatch) observe(commands []sessionstore.DispositionInboxEntry) {
 	w.maxSeen = pageMax
 }
 
+func (w *orderWatch) readCount() int {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return w.reads
+}
+
 // TestI12DistinctCommandsRacedThroughTwoFactoriesKeepOneOrder races distinct
 // commands for one session through two replicas while a reader watches the
 // stream, then proves the runtime applied them in exactly that order.
@@ -465,9 +472,26 @@ func TestI12DistinctCommandsRacedThroughTwoFactoriesKeepOneOrder(t *testing.T) {
 	}
 	close(start)
 	wg.Wait()
-	// Keep watching a little after the last admission is visible, so a late
-	// lower order has somewhere to show up.
-	time.Sleep(300 * time.Millisecond)
+	// Keep watching until the stream has been read at least
+	// watchReadsAfterAdmission more times after the last admission answered,
+	// so a late lower order has somewhere to show up and the watcher's
+	// concurrent-read density does not collapse to a token floor under
+	// -race (measured 6-37 reads/run there, against ~600 without race). A
+	// fixed sleep gave no such guarantee. Bounded by watchTimeout so a
+	// stalled watcher still fails loudly instead of hanging the test.
+	const (
+		watchReadsAfterAdmission = 20
+		watchTimeout             = 30 * time.Second
+	)
+	readsAtLastAdmission := watch.readCount()
+	deadline := time.Now().Add(watchTimeout)
+	for watch.readCount()-readsAtLastAdmission < watchReadsAfterAdmission {
+		if time.Now().After(deadline) {
+			t.Fatalf("the order watcher made only %d reads (want %d) in the %s after the last admission answered",
+				watch.readCount()-readsAtLastAdmission, watchReadsAfterAdmission, watchTimeout)
+		}
+		time.Sleep(2 * time.Millisecond)
+	}
 	close(stopWatch)
 	if err := <-watched; err != nil {
 		t.Fatalf("the order watcher failed to read the stream: %v", err)
@@ -483,8 +507,9 @@ func TestI12DistinctCommandsRacedThroughTwoFactoriesKeepOneOrder(t *testing.T) {
 		violations, reads := append([]string(nil), watch.violations...), watch.reads
 		watch.mu.Unlock()
 		t.Logf("the watcher made %d concurrent reads of the stream", reads)
-		if reads < 2 {
-			t.Fatalf("the watcher read the stream %d times; the property was not observed concurrently", reads)
+		if reads < watchReadsAfterAdmission {
+			t.Fatalf("the watcher read the stream %d times, want at least %d; the property was not observed concurrently",
+				reads, watchReadsAfterAdmission)
 		}
 		if len(violations) != 0 {
 			t.Fatalf("the acceptance order was violated as observed:\n%s", strings.Join(violations, "\n"))
@@ -799,6 +824,36 @@ func TestI12LostHostLinkRepliesAndRedeliveryApplyOnce(t *testing.T) {
 		if dropped == 0 {
 			t.Fatalf("no reply to a delivery of %q was deleted; the fault did not fire", command)
 		}
+		// The interesting half of this case is a redelivery racing the FIRST
+		// application, not one arriving after the command already settled: the
+		// two posts issued after PooledWait (line ~765-766) are guaranteed
+		// redeliveries, but they prove nothing about a race.
+		//
+		// beforeSettlement >= 2 would prove TWO independent deliveries raced
+		// the first application concurrently (the reviewer measured exactly 2
+		// in 20/20 runs under -race). That floor was tried here and is NOT
+		// reliable in this environment: one -race run of this case produced
+		// beforeSettlement == 1 (1 of 4 deliveries before settlement), so a
+		// >= 2 requirement flakes rather than pinning a real invariant. The
+		// assertion is therefore beforeSettlement >= 1: at least one
+		// redelivery reached the Host before the command settled, which still
+		// proves a redelivery raced (or immediately preceded) the first
+		// application rather than arriving only after it was already durable.
+		// If this starts failing (beforeSettlement == 0), either the race
+		// genuinely stopped happening, or a Factory change moved delivery off
+		// the request path -- e.g. a queued, asynchronously-woken delivery
+		// such as the factory v0.7.1 design -- in which case this case's
+		// premise needs to be re-derived against that Factory's actual
+		// delivery timing when tests bumps its factory pin.
+		if beforeSettlement < 1 {
+			t.Fatalf("no delivery of %q happened before settlement (0 of %d); this case needs at least one "+
+				"redelivery racing the FIRST application rather than every delivery arriving only after it was "+
+				"already durable -- otherwise it silently stops exercising a redelivery racing the first "+
+				"application. (A stronger beforeSettlement >= 2 would additionally prove two independent "+
+				"deliveries raced it concurrently, but that floor measured as low as 1 under -race in this "+
+				"environment and would flake.)",
+				command, ours)
+		}
 	})
 
 	t.Run("the application prefix correlates public and runtime ids exactly once", func(t *testing.T) {
@@ -926,10 +981,20 @@ func TestI12OpaqueCommandIDRoundTripsThroughBothReplicasAndTheProvider(t *testin
 					sessionwire.CommandID(strings.ReplaceAll(string(command), "/", "%2F")),
 					sessionwire.CommandID(strings.ReplaceAll(string(command), ":", "_")),
 				} {
-					if _, err := world.Store.GetDispositionCommand(ctx, sessionstore.GetDispositionCommandRequest{
+					_, err := world.Store.GetDispositionCommand(ctx, sessionstore.GetDispositionCommandRequest{
 						TenantID: admissionTenant, SessionID: session, CommandID: near,
-					}); err == nil {
+					})
+					if err == nil {
 						t.Fatalf("the provider answered a record for %q, a different id than %q", near, command)
+					}
+					// A provider or key-encoding failure on a near-miss id (for
+					// example a NATS subject problem with "%") must not be
+					// mistaken for "no such record": pin the specific
+					// not-found code so this stays a proof of absence rather
+					// than a proof of any error at all.
+					var inboxErr *sessionstore.InboxError
+					if !errors.As(err, &inboxErr) || inboxErr.Code != sessionstore.InboxErrorNotFound {
+						t.Fatalf("looking up near-miss %q: want *sessionstore.InboxError{Code: InboxErrorNotFound}, got %v", near, err)
 					}
 				}
 			})
