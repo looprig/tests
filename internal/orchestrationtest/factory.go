@@ -159,6 +159,13 @@ type FactorySeams struct {
 	// which is the only kind a Host can take residency on.
 	SessionBindingID      string
 	SessionBindingVersion string
+
+	// Verifier authenticates actors. Nil takes a FixedBearerVerifier that
+	// accepts KitActorCredential for the fixture's tenant alone. A case that
+	// needs actors in MANY tenants -- the tenant-count axis of a sweep --
+	// composes a MultiTenantVerifier here, so work in every tenant is
+	// admitted through Factory rather than written around it.
+	Verifier identity.Verifier
 }
 
 // NewFactoryFixtureWithSeams composes a Factory over chosen collaborators.
@@ -225,8 +232,12 @@ func NewFactoryFixtureWithSeams(tb TB, store *StoreFixture, clock *Clock, seams 
 	}
 	loopbackOrigin := "http://" + listener.Addr().String()
 
+	var verifier identity.Verifier = &FixedBearerVerifier{Tenant: store.Tenant, Credential: KitActorCredential, Clock: clock}
+	if seams.Verifier != nil {
+		verifier = seams.Verifier
+	}
 	options := []factory.Option{
-		factory.WithCredentialVerifier(&FixedBearerVerifier{Tenant: store.Tenant, Credential: KitActorCredential, Clock: clock}),
+		factory.WithCredentialVerifier(verifier),
 		factory.WithAuthorizer(authorizer),
 		factory.WithSessionReader(reader),
 		factory.WithCommands(commands),
