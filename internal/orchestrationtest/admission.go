@@ -21,6 +21,7 @@ import (
 	sessionwire "github.com/looprig/core/sessionwire/v1"
 	"github.com/looprig/core/uuid"
 	"github.com/looprig/factory"
+	"github.com/looprig/harness/pkg/event"
 	"github.com/looprig/harness/pkg/journal"
 	"github.com/looprig/harness/pkg/runtimecommand"
 	harnessstore "github.com/looprig/harness/pkg/sessionstore"
@@ -175,9 +176,19 @@ type CommandEvidence struct {
 	Applications []JournalApplication
 	Dispositions []JournalDisposition
 
-	// causedBy counts enduring events by the runtime command id in their
-	// cause, which is how harness correlates an EFFECT to its command.
-	causedBy map[uuid.UUID]int
+	// effectsBy counts the DURABLE EFFECT events -- event.TurnStarted and
+	// event.TurnFoldedInto -- caused by the runtime command id, which is how
+	// harness correlates an applied input actually reaching a turn.
+	//
+	// TurnRejected and InputCancelled are also Enduring Reply events caused
+	// by a command (harness's resolution of a queued input resolves to
+	// exactly one of TurnStarted/TurnFoldedInto/TurnRejected/InputCancelled),
+	// but neither is an EFFECT: a command settled `applied` whose input was
+	// then rejected or cancelled must not be counted as "has an effect", so
+	// they are tracked separately and EffectsOf deliberately excludes them.
+	effectsBy   map[uuid.UUID]int
+	rejectedBy  map[uuid.UUID]int
+	cancelledBy map[uuid.UUID]int
 }
 
 // ApplicationsOf returns every application prefix naming command.
@@ -202,8 +213,22 @@ func (e CommandEvidence) DispositionsOf(command sessionwire.CommandID) []Journal
 	return out
 }
 
-// EffectsOf counts the enduring events caused by one runtime command.
-func (e CommandEvidence) EffectsOf(runtimeCommand uuid.UUID) int { return e.causedBy[runtimeCommand] }
+// EffectsOf counts the DURABLE EFFECT events -- TurnStarted and
+// TurnFoldedInto -- caused by one runtime command. It deliberately excludes a
+// caused TurnRejected or InputCancelled; see RejectedOf and CancelledOf.
+func (e CommandEvidence) EffectsOf(runtimeCommand uuid.UUID) int { return e.effectsBy[runtimeCommand] }
+
+// RejectedOf reports whether the runtime command caused a TurnRejected --
+// harness refused the queued input rather than starting or folding a turn.
+func (e CommandEvidence) RejectedOf(runtimeCommand uuid.UUID) bool {
+	return e.rejectedBy[runtimeCommand] > 0
+}
+
+// CancelledOf reports whether the runtime command caused an InputCancelled --
+// the queued input left the loop's queue without ever resolving to a turn.
+func (e CommandEvidence) CancelledOf(runtimeCommand uuid.UUID) bool {
+	return e.cancelledBy[runtimeCommand] > 0
+}
 
 // ReadCommandEvidence walks one runtime session's harness journal from the
 // beginning.
@@ -220,7 +245,11 @@ func ReadCommandEvidence(tb TB, world *PooledWorld, tenant sessionwire.TenantID,
 		return CommandEvidence{}
 	}
 	defer func() { _ = cursor.Close() }()
-	evidence := CommandEvidence{causedBy: map[uuid.UUID]int{}}
+	evidence := CommandEvidence{
+		effectsBy:   map[uuid.UUID]int{},
+		rejectedBy:  map[uuid.UUID]int{},
+		cancelledBy: map[uuid.UUID]int{},
+	}
 	for {
 		record, seq, err := cursor.Next(context.Background())
 		if errors.Is(err, io.EOF) {
@@ -238,8 +267,23 @@ func ReadCommandEvidence(tb TB, world *PooledWorld, tenant sessionwire.TenantID,
 		case journal.CommandDispositionRecord:
 			evidence.Dispositions = append(evidence.Dispositions, JournalDisposition{Seq: seq, Disposition: typed.Disposition()})
 		case journal.EventRecord:
-			if cause := typed.Event().EventHeader().Cause.CommandID; !cause.IsZero() {
-				evidence.causedBy[cause]++
+			ev := typed.Event()
+			cause := ev.EventHeader().Cause.CommandID
+			if cause.IsZero() {
+				continue
+			}
+			// A queued input resolves to exactly one of TurnStarted,
+			// TurnFoldedInto, TurnRejected or InputCancelled. Only the first
+			// two are a durable EFFECT; a rejection or cancellation is
+			// tracked separately so a caller can fail loud on it instead of
+			// mistaking "no effect yet" for "no effect ever".
+			switch ev.(type) {
+			case event.TurnStarted, event.TurnFoldedInto:
+				evidence.effectsBy[cause]++
+			case event.TurnRejected:
+				evidence.rejectedBy[cause]++
+			case event.InputCancelled:
+				evidence.cancelledBy[cause]++
 			}
 		}
 	}

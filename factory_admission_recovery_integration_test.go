@@ -142,8 +142,21 @@ func mustCommand(t *testing.T, ctx context.Context, world *orchestrationtest.Poo
 // assertAppliedExactlyOnce is the exactly-once claim, read from the runtime's
 // own journal: ONE application prefix names the public CommandID, it carries
 // exactly the runtime command UUID the inbox record's winning admission
-// minted, ONE disposition frame says applied, and the effect -- enduring events
-// caused by that runtime command -- exists.
+// minted, ONE disposition frame says applied, and the effect -- a durable
+// TurnStarted or TurnFoldedInto caused by that runtime command -- exists.
+//
+// harness writes the `applied` disposition, and Host settles the SessionStore
+// record from it, BEFORE the loop's effect is durable:
+// runtimecommand.DispositionApplied means only "durably accepted into the
+// execution path", not "the effect is durable" (harness@v0.36.0
+// internal/sessionruntime/runtime_command.go; see
+// docs/plans/2026-08-29-factory-host-orchestration-implementation/CLAUDE_DEBUG_I12_CASE1.md).
+// A single journal read taken right after the record settles therefore races
+// that append -- measured to flake under -race. This polls for the effect
+// (bounded, so a genuinely missing effect still fails) and re-reads the
+// journal on every attempt, so the exactly-one-prefix and
+// exactly-one-disposition checks below run against the FINAL read and still
+// catch a late duplicate prefix.
 func assertAppliedExactlyOnce(t *testing.T, ctx context.Context, world *orchestrationtest.PooledWorld, session sessionwire.SessionID, command sessionwire.CommandID) (orchestrationtest.CommandEvidence, uuid.UUID) {
 	t.Helper()
 	entry := mustCommand(t, ctx, world, session, command)
@@ -157,7 +170,22 @@ func assertAppliedExactlyOnce(t *testing.T, ctx context.Context, world *orchestr
 			command, entry.Record.Descriptor.RuntimeCommandID, err)
 	}
 	runtimeSession := world.RuntimeSessionID(t, ctx, admissionTenant, session)
-	evidence := orchestrationtest.ReadCommandEvidence(t, world, admissionTenant, runtimeSession)
+
+	var evidence orchestrationtest.CommandEvidence
+	orchestrationtest.PooledWait(t, fmt.Sprintf(
+		"%q's runtime id %s causing a durable effect (TurnStarted/TurnFoldedInto) or a terminal TurnRejected/InputCancelled",
+		command, runtimeCommand,
+	), 30*time.Second, func() bool {
+		evidence = orchestrationtest.ReadCommandEvidence(t, world, admissionTenant, runtimeSession)
+		// A rejection or cancellation is terminal for this runtime command:
+		// no later read will ever produce an effect, so stop waiting and let
+		// the explicit checks below fail loudly with the specific reason
+		// rather than exhausting the timeout on "applied with no effect".
+		if evidence.RejectedOf(runtimeCommand) || evidence.CancelledOf(runtimeCommand) {
+			return true
+		}
+		return evidence.EffectsOf(runtimeCommand) > 0
+	})
 
 	applications := evidence.ApplicationsOf(command)
 	if len(applications) != 1 {
@@ -178,8 +206,14 @@ func assertAppliedExactlyOnce(t *testing.T, ctx context.Context, world *orchestr
 	if d := dispositions[0].Disposition; d.RuntimeCommandID != runtimeCommand || d.Disposition != runtimecommand.DispositionApplied {
 		t.Fatalf("the disposition frame for %q is %+v, want applied under runtime id %s", command, d, runtimeCommand)
 	}
+	if evidence.RejectedOf(runtimeCommand) {
+		t.Fatalf("%q's runtime id %s caused a TurnRejected: the record settled applied but the input was refused, not applied", command, runtimeCommand)
+	}
+	if evidence.CancelledOf(runtimeCommand) {
+		t.Fatalf("%q's runtime id %s caused an InputCancelled: the record settled applied but the input left the loop's queue without ever starting or folding into a turn", command, runtimeCommand)
+	}
 	if evidence.EffectsOf(runtimeCommand) == 0 {
-		t.Fatalf("no enduring event in the runtime journal is caused by %q's runtime id %s: applied with no effect", command, runtimeCommand)
+		t.Fatalf("no durable effect (TurnStarted/TurnFoldedInto) in the runtime journal is caused by %q's runtime id %s: applied with no effect", command, runtimeCommand)
 	}
 	return evidence, runtimeCommand
 }
