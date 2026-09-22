@@ -52,8 +52,20 @@ import (
 
 // brokerFamilies are the client families a brokerless deployment must not
 // wire. It is a denylist of FAMILIES, matched against import paths, not a list
-// of packages this case expects to find.
-var brokerFamilies = regexp.MustCompile(`(?i)(redis|rueidis|nats-io|/nats\b|natsstore|kafka|sarama|amqp|rabbitmq|memcache|groupcache|ristretto|bigcache|freecache|pulsar|nsqio|zeromq|/zmq|etcd|consul|/nsq\b)`)
+// of packages this case expects to find. The spec names "cache/notifier/
+// broker"; alongside the broker clients this also denies the common
+// SHARED/distributed cache and notifier families -- jackc/pgx and lib/pq
+// (the two Go Postgres drivers LISTEN/NOTIFY runs over) and golang-lru /
+// go-cache used as a shared cache -- but NOT a plain in-process, unshared
+// cache library, which is not the hazard this case exists to catch. None of
+// these newer families is organically present in the graph this test derives
+// (only Centrifuge's bundled rueidis is, and none is a dependency of this
+// module at all), so there is no positive control INSIDE this test for them
+// the way "brokers" has one for rueidis below. Each was instead verified
+// directly against this regexp with representative import paths (each family
+// matches; unrelated paths such as github.com/looprig/storage and
+// golang.org/x/sync/errgroup do not) before being added here.
+var brokerFamilies = regexp.MustCompile(`(?i)(redis|rueidis|nats-io|/nats\b|natsstore|kafka|sarama|amqp|rabbitmq|memcache|groupcache|ristretto|bigcache|freecache|pulsar|nsqio|zeromq|/zmq|etcd|consul|/nsq\b|jackc/pgx|lib/pq|hashicorp/golang-lru|patrickmn/go-cache)`)
 
 // brokerSeams are the identifiers through which a Centrifuge node is given a
 // broker or presence manager. Naming none of them keeps the in-memory broker.

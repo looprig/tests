@@ -7,6 +7,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"log/slog"
 	"net"
@@ -430,11 +431,36 @@ func StartTappedPooledHost(tb TB, ctx context.Context, world *PooledWorld, id se
 
 // TappedAttach is one hostlink.attach RPC a Factory sent, and whether the Host
 // accepted it.
+//
+// Accepted is best-effort: it is only true when the tap has ALSO recorded the
+// Host's reply to this exact RPC by the time a caller reads it. A placement
+// pass is bounded (200ms as of factory v0.6.0), so under load the reply can
+// legitimately arrive after the pass has already moved on -- residency still
+// took effect, but Accepted reads false and ReplySeen reads false. Judge
+// duplicate placement by counting attach REQUESTS (and Host launches), not by
+// counting accepted replies; treat Accepted/ReplySeen as informational.
 type TappedAttach struct {
 	Conn     int
 	Token    string
 	Request  sessionwire.HostLinkAttachRequest
 	Accepted bool
+	// ReplySeen reports whether the tap recorded any reply to this attach by
+	// the time it was read. RawReply is that reply's raw JSON, or "no reply
+	// observed" when ReplySeen is false.
+	ReplySeen bool
+	RawReply  string
+}
+
+// String reports the attach and its raw reply, so a %v/%+v of a
+// []TappedAttach prints exactly what a triager needs on a failed row: no
+// assembly required at the call site.
+func (a TappedAttach) String() string {
+	reply := a.RawReply
+	if !a.ReplySeen {
+		reply = "no reply observed"
+	}
+	return fmt.Sprintf("{conn:%d token:%q session:%s accepted:%t reply:%s}",
+		a.Conn, a.Token, a.Request.SessionID, a.Accepted, reply)
 }
 
 // TappedLink is one HostLink connection attempt: the credential presented,
@@ -511,9 +537,15 @@ func TappedAttaches(tb TB, tap *HostLinkTap) []TappedAttach {
 				return nil
 			}
 			attach := TappedAttach{Conn: conn.ID, Token: token, Request: request}
-			if reply, ok := ReplyTo(replies, command.ID); ok && reply.Error == nil && reply.RPC != nil {
-				var refusal sessionwire.HostLinkError
-				attach.Accepted = refusal.UnmarshalJSON(reply.RPC.Data) != nil
+			if reply, ok := ReplyTo(replies, command.ID); ok {
+				attach.ReplySeen = true
+				if reply.Error == nil && reply.RPC != nil {
+					var refusal sessionwire.HostLinkError
+					attach.Accepted = refusal.UnmarshalJSON(reply.RPC.Data) != nil
+				}
+				if raw, err := json.Marshal(reply); err == nil {
+					attach.RawReply = string(raw)
+				}
 			}
 			out = append(out, attach)
 		}

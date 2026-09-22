@@ -778,6 +778,14 @@ func TestFactoryDispositionSweepVisitsEveryShardInBoundedPages(t *testing.T) {
 		// id -- which is what placement claims under -- this sweep would
 		// "extend" a claim placement holds mid-attach, reject, and RELEASE it,
 		// letting a second replica attach the same session (Factory's B5 N1).
+		//
+		// THIS ROW ONLY DRIVES THE STRING, NOT THE HAZARD: it asserts holder
+		// identity by string equality on Factory's unexported "/dispositions"
+		// suffix. It does not construct the contended scenario above -- the
+		// disposition sweep actually racing placement's live attach claim on
+		// one session -- so the extend-and-release hazard itself is never
+		// exercised here. A holder-string regression is caught; the
+		// behavioural hazard it exists to prevent is not.
 		want := w.replica.ReplicaID + dispositionHolderSfx
 		requests := w.commands.ClaimRequests()
 		if len(requests) < len(first) {
@@ -855,11 +863,18 @@ func TestFactoryDispositionSweepVisitsEveryShardInBoundedPages(t *testing.T) {
 	t.Run("case 2: the sweep visits every shard, one bounded page per pass, whatever the tenant count", func(t *testing.T) {
 		resumedTwo := assertBoundedRotation(t, "phase two", phaseTwo)
 		// The per-pass shape is compared, not merely bounded: one query of
-		// exactly Limit rows per pass with one tenant and with twenty-one. And
-		// the request NAMES no tenant at all -- ListDueDispositionCommandsRequest
-		// has no tenant member -- so the tenant count cannot enter the query;
-		// what it could change is how many rows a shard holds, which is what
-		// the resumed passes absorb.
+		// exactly Limit rows per pass with one tenant and with twenty-one.
+		//
+		// Two different things make that true, and only one is DRIVEN here.
+		// The driven half: rotation and page shape are measured identically
+		// across 1 and 21 tenants (above), which is real evidence Factory's
+		// sweep does not change behaviour with tenant count. The structural
+		// half: the request itself NAMES no tenant at all --
+		// ListDueDispositionCommandsRequest has no tenant member -- so the
+		// tenant count cannot enter the query by construction; what it could
+		// change is how many rows a shard holds, which is what the resumed
+		// passes absorb. That structural fact is not something this row
+		// exercises; it is read from the request's own shape.
 		t.Logf("phase one: %d passes (%d resumed) for %d commands in 1 tenant; phase two: %d passes (%d resumed) for %d commands in %d tenants",
 			len(phaseOne), resumedOne, len(first), len(phaseTwo), resumedTwo, len(second), len(tenantsSeen))
 		byShard := map[int]int{}
@@ -1091,6 +1106,13 @@ func TestFactoryGateSweepRetiresStaleIntents(t *testing.T) {
 	})
 
 	t.Run("case 4: retired gates do not accumulate in due pages", func(t *testing.T) {
+		// STORE PROPERTY, not a Factory behaviour: the ten history gates are
+		// tombstoned by the store's own ResolveGate, not retired by Factory's
+		// sweep (that is the row above, over RetireGateDeadlineIntent
+		// remnants). This row is evidence that sessionstore's own due view
+		// does not re-surface a resolved gate's tombstone as a row a page
+		// pays for -- Factory never touches these ten.
+		//
 		// History is made on purpose: historyGates more gates opened and resolved
 		// cleanly, each leaving a tombstone. The due view must still examine
 		// exactly the three open gates -- tombstones are not rows a page pays
