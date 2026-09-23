@@ -135,19 +135,16 @@ func TestDedicatedPlacementInDisposableNamespace(t *testing.T) {
 
 		const foreign = sessionwire.SessionID("d31-not-the-fixed-session")
 		reply, refusal, transportErr := attach(foreign, "d31-probe-foreign")
-		switch {
-		case refusal != nil:
-			lane.Log("attach for a non-fixed session refused with Core code %s: %s", refusal.Code, reply)
-		case transportErr != nil:
-			// host v0.6.0: the residency manager refuses runtime_mismatch
-			// WITHOUT the runtime_compatibility_id Core's HostLinkError
-			// requires for that code, so the body cannot be marshalled and the
-			// refusal reaches the wire as Centrifuge 107 "bad request". The
-			// control above proves the request itself is well formed.
-			lane.Log("attach for a non-fixed session refused at the transport: %v (Core body unpublishable; booked against host)", transportErr)
-		default:
+		if transportErr != nil {
+			t.Fatalf("the refusal failed at the transport (%v); host >= v0.7.1 must publish a Core HostLinkError", transportErr)
+		}
+		if refusal == nil {
 			t.Fatalf("a dedicated Host fixed to %s ACCEPTED an attach for %s: %s", placed, foreign, reply)
 		}
+		if refusal.Code != sessionwire.HostLinkErrorRuntimeMismatch || refusal.RuntimeCompatibilityID == "" {
+			t.Fatalf("refusal %+v, want runtime_mismatch naming this Host's build", *refusal)
+		}
+		lane.Log("attach for a non-fixed session refused: code=%s runtime_compatibility_id=%q body=%s", refusal.Code, refusal.RuntimeCompatibilityID, reply)
 		if _, err := lane.Owner(ctx, foreign); err == nil {
 			t.Fatalf("the foreign session %s has a Host registration after the refused attach", foreign)
 		}

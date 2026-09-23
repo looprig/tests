@@ -18,7 +18,6 @@ package tests
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"net/http"
@@ -78,6 +77,7 @@ func TestDedicatedDrainInDisposableNamespace(t *testing.T) {
 		if watch.seen("replacement pod (new uid) under the same name") {
 			t.Fatal("a Pod was recreated under the released workload's name")
 		}
+		lane.requireOneControllerDelete(pod.Metadata.Name, pod.Metadata.UID)
 		termination := watch.termination
 		if termination.Kind != sessionstore.PlacementTerminationGraceful || termination.Generation != 1 ||
 			termination.LeaseEpoch != owner.Registration.LeaseEpoch {
@@ -111,20 +111,9 @@ func TestDedicatedDrainInDisposableNamespace(t *testing.T) {
 		if status != http.StatusOK && status != http.StatusAccepted {
 			t.Fatalf("restore answered %d: %s", status, body)
 		}
-		// FINDING (factory v0.7.1 + controller v0.2.0): Factory's pending
-		// placement hands EnsureWorkload the STORED intent, and after release
-		// that intent is the deletion desire's zero workload, which the adapter
-		// refuses (unsupported payload version). Nothing in Factory writes the
-		// launch template's workload back, so an admitted restore of a released
-		// dedicated session is never placed. Observed for a bounded window, then
-		// the desire is re-expressed the way Factory's create path writes it.
-		time.Sleep(30 * time.Second)
-		if state := lane.CommandState(ctx, released, "d31-released-restore"); state == sessionstore.InboxStateApplied {
-			lane.Log("Factory re-placed the released session on its own (the gap is closed)")
-		} else {
-			lane.Log("30s after admission the restore is %q and the session has %d pods: Factory did not re-place a released dedicated session", state, len(lane.SessionPods(released)))
-			lane.writeTemplateDesire(ctx, released)
-		}
+		// factory >= v0.8.0 revives a released dedicated session on a pending
+		// RESTORE: a new desired generation carrying the create-time workload.
+		// Nothing here writes desire.
 		took := lane.AwaitApplied(ctx, released, "d31-released-restore", 5*time.Minute)
 		lane.Input(ctx, released, "d31-released-after", "after the restore")
 		lane.AwaitApplied(ctx, released, "d31-released-after", 3*time.Minute)
@@ -133,9 +122,14 @@ func TestDedicatedDrainInDisposableNamespace(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
+		if after.Record.DesiredGeneration <= entry.Record.DesiredGeneration || len(after.Record.DesiredWorkload.Payload) == 0 {
+			t.Fatalf("desire after restore: generation %d (was %d), workload %d bytes; want a new generation with a workload",
+				after.Record.DesiredGeneration, entry.Record.DesiredGeneration, len(after.Record.DesiredWorkload.Payload))
+		}
 		if after.Record.Binding.RuntimeSessionID != runtimeID {
 			t.Fatalf("runtime session id changed %s -> %s", runtimeID, after.Record.Binding.RuntimeSessionID)
 		}
+		lane.Log("Factory revived the session: desired generation %d -> %d, idempotency key %q", entry.Record.DesiredGeneration, after.Record.DesiredGeneration, after.Record.DesiredIdempotencyKey)
 		lane.Log("restore applied %s after admission on pod %s (generation label %s, desired generation %d); same runtime session %s; a later input applied",
 			took.Round(time.Millisecond), pod.Metadata.Name, pod.Metadata.Labels[controllerk8s.LabelGeneration], after.Record.DesiredGeneration, runtimeID)
 	})
@@ -178,6 +172,9 @@ func TestDedicatedDrainInDisposableNamespace(t *testing.T) {
 		}
 		lane.Log("SIGTERM->exit %s measured by the Host (grace %s = drain ceiling %s + commit margin %s; HOST_DRAIN_GRACE %s): exit code %d, termination message %q; unused grace %s",
 			exit, grace, kindDrainCeiling, kindCommitMargin, kindHostDrainGrace, watch.exitCode, watch.exitMessage, grace-exit)
+		if deletes, ok := lane.podDeletes(pod.Metadata.Name); ok {
+			lane.Log("audit: deletes of %s during the platform deletion: %+v", pod.Metadata.Name, deletes)
+		}
 		// Desire still names generation 1: record what the controller does next.
 		time.Sleep(10 * time.Second)
 		lane.Log("after the forced termination the session has pods %v", podUIDs(lane.SessionPods(evicted)))
@@ -206,6 +203,7 @@ func TestDedicatedDrainInDisposableNamespace(t *testing.T) {
 		if watch.termination.Generation != 1 {
 			t.Fatalf("termination %+v, want generation 1", watch.termination)
 		}
+		lane.requireOneControllerDelete(pod.Metadata.Name, pod.Metadata.UID)
 		lane.Log("termination after restart: kind=%s reason=%q generation=%d", watch.termination.Kind, watch.termination.ForcedReason, watch.termination.Generation)
 	})
 }
@@ -237,30 +235,6 @@ func (l *kindLane) writeDeletionDesire(ctx context.Context, s sessionwire.Sessio
 		l.t.Fatalf("writing deletion desire for %s: %v", s, err)
 	}
 	l.Log("deletion desire written for %s: desired generation %d -> %d, zero workload", s, entry.Record.DesiredGeneration, updated.Record.DesiredGeneration)
-}
-
-// writeTemplateDesire re-expresses dedicated desire with the launch template's
-// workload, exactly the bytes Factory's create path stores.
-func (l *kindLane) writeTemplateDesire(ctx context.Context, s sessionwire.SessionID) {
-	l.t.Helper()
-	entry, err := l.Store.GetCatalogEntry(ctx, sessionstore.GetCatalogEntryRequest{TenantID: kindlane.Tenant, SessionID: s})
-	if err != nil {
-		l.t.Fatal(err)
-	}
-	payload, err := json.Marshal(l.payload())
-	if err != nil {
-		l.t.Fatal(err)
-	}
-	updated, err := l.Store.UpdateCatalogDesiredState(ctx, sessionstore.UpdateCatalogDesiredStateRequest{
-		TenantID: kindlane.Tenant, SessionID: s, ExpectedRevision: entry.Revision,
-		IdempotencyKey: "d31-redesire-" + string(s), DesiredPlacement: sessionwire.HostPlacementDedicated,
-		RuntimeCompatibilityID: string(orchestrationtest.PooledCompatibility),
-		DesiredWorkload:        sessionstore.DesiredWorkload{PayloadVersion: controllerk8s.PayloadVersionV1, Payload: payload},
-	})
-	if err != nil {
-		l.t.Fatalf("re-expressing dedicated desire for %s: %v", s, err)
-	}
-	l.Log("dedicated desire re-expressed for %s: desired generation %d -> %d with the template workload", s, entry.Record.DesiredGeneration, updated.Record.DesiredGeneration)
 }
 
 // teardownWatch polls the Pod object, the Host registry and the termination
@@ -438,4 +412,78 @@ func truncate(s string, n int) string {
 		return s
 	}
 	return s[:n] + "..."
+}
+
+// auditDelete is one Pod delete as the API server's audit log recorded it.
+type auditDelete struct {
+	User            string
+	PreconditionUID string
+	ResponseCode    int
+	RequestReceived string
+}
+
+// podDeletes reads the control-plane's audit log (scripts/kind-d31.sh
+// enables it) for every delete of one Pod. ok is false when no audit log is
+// available on this cluster.
+func (l *kindLane) podDeletes(pod string) (deletes []auditDelete, ok bool) {
+	l.t.Helper()
+	node := envOr("KIND_AUDIT_NODE", "looprig-d31-control-plane")
+	out, err := exec.Command("docker", "exec", node, "cat", "/var/log/kubernetes/audit.log").Output()
+	if err != nil {
+		return nil, false
+	}
+	for _, line := range strings.Split(string(out), "\n") {
+		if !strings.Contains(line, pod) || !strings.Contains(line, `"verb":"delete"`) {
+			continue
+		}
+		var event struct {
+			Stage     string                    `json:"stage"`
+			User      struct{ Username string } `json:"user"`
+			ObjectRef struct {
+				Name      string `json:"name"`
+				Namespace string `json:"namespace"`
+			} `json:"objectRef"`
+			RequestObject struct {
+				Preconditions struct {
+					UID string `json:"uid"`
+				} `json:"preconditions"`
+			} `json:"requestObject"`
+			ResponseStatus struct {
+				Code int `json:"code"`
+			} `json:"responseStatus"`
+			RequestReceivedTimestamp string `json:"requestReceivedTimestamp"`
+		}
+		if jsonUnmarshal([]byte(line), &event) != nil || event.Stage != "ResponseComplete" ||
+			event.ObjectRef.Name != pod || event.ObjectRef.Namespace != l.Namespace {
+			continue
+		}
+		deletes = append(deletes, auditDelete{
+			User: event.User.Username, PreconditionUID: event.RequestObject.Preconditions.UID,
+			ResponseCode: event.ResponseStatus.Code, RequestReceived: event.RequestReceivedTimestamp,
+		})
+	}
+	return deletes, true
+}
+
+// requireOneControllerDelete asserts the audit log holds exactly one delete
+// of pod by the controller's ServiceAccount, preconditioned on uid.
+func (l *kindLane) requireOneControllerDelete(pod, uid string) {
+	l.t.Helper()
+	deletes, ok := l.podDeletes(pod)
+	if !ok {
+		l.Log("no API-server audit log on this cluster; the UID precondition was not observed")
+		return
+	}
+	controller := "system:serviceaccount:" + l.Namespace + ":looprig-controller"
+	var mine []auditDelete
+	for _, d := range deletes {
+		if d.User == controller {
+			mine = append(mine, d)
+		}
+	}
+	if len(mine) != 1 || mine[0].PreconditionUID != uid || mine[0].ResponseCode != 200 {
+		l.t.Fatalf("audit: controller deletes of %s = %+v (all deletes %+v), want exactly one preconditioned on uid %s answered 200", pod, mine, deletes, uid)
+	}
+	l.Log("audit: exactly one delete of %s by %s, DeleteOptions.preconditions.uid=%s, response %d at %s (all deletes of this name: %d)",
+		pod, controller, mine[0].PreconditionUID, mine[0].ResponseCode, mine[0].RequestReceived, len(deletes))
 }

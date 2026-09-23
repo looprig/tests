@@ -25,6 +25,20 @@ up)
 	docker inspect "$REGISTRY" >/dev/null 2>&1 ||
 		docker run -d --restart=no -p 127.0.0.1:5001:5000 --name "$REGISTRY" registry:2 >/dev/null
 	config=$(mktemp)
+	# API-server audit: every Pod delete/update at Request level (the body
+	# carries DeleteOptions.preconditions.uid), written on the control-plane
+	# node at /var/log/kubernetes/audit.log. The lane reads it (D3.1 F3).
+	auditdir=$(mktemp -d)
+	cat >"$auditdir/policy.yaml" <<YAML
+apiVersion: audit.k8s.io/v1
+kind: Policy
+omitStages: [RequestReceived]
+rules:
+  - level: Request
+    verbs: [delete, update]
+    resources: [{group: "", resources: [pods]}]
+  - level: None
+YAML
 	cat >"$config" <<YAML
 kind: Cluster
 apiVersion: kind.x-k8s.io/v1alpha4
@@ -35,6 +49,19 @@ containerdConfigPatches:
       config_path = "/etc/containerd/certs.d"
 nodes:
   - role: control-plane
+    extraMounts:
+      - {hostPath: "$auditdir/policy.yaml", containerPath: /etc/kubernetes/audit/policy.yaml, readOnly: true}
+    kubeadmConfigPatches:
+      - |
+        kind: ClusterConfiguration
+        apiServer:
+          extraArgs:
+            audit-policy-file: /etc/kubernetes/audit/policy.yaml
+            audit-log-path: /var/log/kubernetes/audit.log
+            audit-log-maxsize: "100"
+          extraVolumes:
+            - {name: audit-policy, hostPath: /etc/kubernetes/audit, mountPath: /etc/kubernetes/audit, readOnly: true, pathType: DirectoryOrCreate}
+            - {name: audit-log, hostPath: /var/log/kubernetes, mountPath: /var/log/kubernetes, readOnly: false, pathType: DirectoryOrCreate}
   - role: worker
     extraPortMappings:
       - {containerPort: 30422, hostPort: 30422, listenAddress: "127.0.0.1"}
