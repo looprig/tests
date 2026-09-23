@@ -6,7 +6,7 @@ require (
 	github.com/centrifugal/centrifuge v0.38.0
 	github.com/centrifugal/centrifuge-go v0.12.0
 	github.com/looprig/classifiers v0.2.1
-	github.com/looprig/controller v0.1.1
+	github.com/looprig/controller v0.2.0
 	github.com/looprig/core v0.11.0
 	github.com/looprig/credentials v0.2.0
 	github.com/looprig/eval v0.2.1
@@ -14,7 +14,7 @@ require (
 	github.com/looprig/foreignloops v0.3.1
 	github.com/looprig/fsstore v0.5.1
 	github.com/looprig/harness v0.36.0
-	github.com/looprig/host v0.5.0
+	github.com/looprig/host v0.6.0
 	github.com/looprig/inference v0.12.1
 	github.com/looprig/llm v0.14.1
 	github.com/looprig/mcp v0.7.1
