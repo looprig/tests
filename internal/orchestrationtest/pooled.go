@@ -1155,6 +1155,10 @@ type PooledWorldOptions struct {
 	// world shares. Nil takes a fresh memstore. The harness journals are
 	// unaffected: they are a different module's keyspace.
 	Backend *storage.Composite
+	// JournalBackends, when set, supplies each tenant's harness journal
+	// backend. A missing tenant takes a fresh memstore. The kind lane uses it
+	// to put the journal on a provider that outlives a Host Pod.
+	JournalBackends map[sessionwire.TenantID]*storage.Composite
 }
 
 // NewPooledWorld opens the shared durable plane and one harness journal per
@@ -1186,7 +1190,11 @@ func NewPooledWorld(tb TB, ctx context.Context, options PooledWorldOptions) *Poo
 		world.AskTool = &PooledAskTool{}
 	}
 	for _, tenant := range tenants {
-		journalStore, err := harnessstore.Open(memstore.New(), harnessstore.WithTenant(tenant))
+		journalBackend := options.JournalBackends[tenant]
+		if journalBackend == nil {
+			journalBackend = memstore.New()
+		}
+		journalStore, err := harnessstore.Open(journalBackend, harnessstore.WithTenant(tenant))
 		if err != nil {
 			tb.Fatalf("orchestrationtest: opening the harness journal for %q: %v", tenant, err)
 			return nil
@@ -1354,6 +1362,74 @@ func startHostWrapped(tb TB, ctx context.Context, world *PooledWorld, id session
 	listener := &pooledTrackingListener{Listener: raw}
 	base := sessionwire.InternalEndpoint("ws://" + listener.Addr().String())
 
+	blueprint, product := world.hostComposition(tb, id, generation, fixed, base)
+	service, err := host.Compose(ctx, blueprint)
+	if err != nil {
+		_ = listener.Close()
+		tb.Fatalf("orchestrationtest: composing pooled host %q: %v", id, err)
+		return nil
+	}
+	if err := service.Start(ctx); err != nil {
+		_ = listener.Close()
+		tb.Fatalf("orchestrationtest: starting pooled host %q: %v", id, err)
+		return nil
+	}
+
+	pooled := &PooledHost{Service: service, Rig: product, ID: id, Base: base, tracker: listener}
+	routes := service.Routes()
+	handler := http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		if request.Header.Get("Upgrade") != "" {
+			pooled.mu.Lock()
+			// THE ESCAPED PATH, which is what was on the wire. url.URL.Path is
+			// the DECODED form, so a tenant needing escaping would compare
+			// equal to a concatenating derivation that never escaped anything
+			// -- the exact HM5 mutant this lane is supposed to kill. Host's own
+			// router reads the decoded Path; what is recorded here is the
+			// request, not Host's reading of it.
+			pooled.paths = append(pooled.paths, request.URL.EscapedPath())
+			pooled.mu.Unlock()
+		}
+		routes.ServeHTTP(writer, request)
+	})
+	var served http.Handler = handler
+	if wrap != nil {
+		served = wrap(served)
+	}
+	server := &httptest.Server{Listener: listener, Config: &http.Server{
+		Handler:           served,
+		ReadHeaderTimeout: 10 * time.Second,
+	}}
+	server.Start()
+	pooled.server = server
+
+	var once sync.Once
+	pooled.stop = func() {
+		once.Do(func() {
+			stopCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+			defer cancel()
+			if _, err := service.Stop(stopCtx); err != nil {
+				tb.Logf("orchestrationtest: pooled host %q Stop: %v", id, err)
+			}
+			server.CloseClientConnections()
+			server.Close()
+		})
+	}
+	tb.Cleanup(pooled.stop)
+	return pooled
+}
+
+// DedicatedHostComposition is the composition StartDedicatedHost serves,
+// returned instead of started so a product main (the kind lane's in-cluster
+// Host) can hand it to host.Run behind its own listener and signal handling.
+// The caller may override Options tuning, Link, Drain, CompatibilityTimeout,
+// WorkPoll and Collaborators.Logger; the collaborators are the world's.
+func DedicatedHostComposition(tb TB, world *PooledWorld, id sessionwire.HostID, generation uint64, fixed sessionwire.SessionID, base sessionwire.InternalEndpoint) (host.Composition, *PooledRig) {
+	tb.Helper()
+	return world.hostComposition(tb, id, generation, fixed, base)
+}
+
+func (world *PooledWorld) hostComposition(tb TB, id sessionwire.HostID, generation uint64, fixed sessionwire.SessionID, base sessionwire.InternalEndpoint) (host.Composition, *PooledRig) {
+	tb.Helper()
 	// A dedicated Host is pinned to one session and must have capacity
 	// exactly one; a pooled one REFUSES a fixed session id. Host validates
 	// both, so the two arms travel different composition branches.
@@ -1414,59 +1490,7 @@ func startHostWrapped(tb TB, ctx context.Context, world *PooledWorld, id session
 			},
 		},
 	}
-	service, err := host.Compose(ctx, blueprint)
-	if err != nil {
-		_ = listener.Close()
-		tb.Fatalf("orchestrationtest: composing pooled host %q: %v", id, err)
-		return nil
-	}
-	if err := service.Start(ctx); err != nil {
-		_ = listener.Close()
-		tb.Fatalf("orchestrationtest: starting pooled host %q: %v", id, err)
-		return nil
-	}
-
-	pooled := &PooledHost{Service: service, Rig: product, ID: id, Base: base, tracker: listener}
-	routes := service.Routes()
-	handler := http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
-		if request.Header.Get("Upgrade") != "" {
-			pooled.mu.Lock()
-			// THE ESCAPED PATH, which is what was on the wire. url.URL.Path is
-			// the DECODED form, so a tenant needing escaping would compare
-			// equal to a concatenating derivation that never escaped anything
-			// -- the exact HM5 mutant this lane is supposed to kill. Host's own
-			// router reads the decoded Path; what is recorded here is the
-			// request, not Host's reading of it.
-			pooled.paths = append(pooled.paths, request.URL.EscapedPath())
-			pooled.mu.Unlock()
-		}
-		routes.ServeHTTP(writer, request)
-	})
-	var served http.Handler = handler
-	if wrap != nil {
-		served = wrap(served)
-	}
-	server := &httptest.Server{Listener: listener, Config: &http.Server{
-		Handler:           served,
-		ReadHeaderTimeout: 10 * time.Second,
-	}}
-	server.Start()
-	pooled.server = server
-
-	var once sync.Once
-	pooled.stop = func() {
-		once.Do(func() {
-			stopCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-			defer cancel()
-			if _, err := service.Stop(stopCtx); err != nil {
-				tb.Logf("orchestrationtest: pooled host %q Stop: %v", id, err)
-			}
-			server.CloseClientConnections()
-			server.Close()
-		})
-	}
-	tb.Cleanup(pooled.stop)
-	return pooled
+	return blueprint, product
 }
 
 // Stop drains this Host and closes its listener. It is idempotent.
@@ -1641,11 +1665,67 @@ func StartDedicatedFactory(tb TB, ctx context.Context, world *PooledWorld, repli
 
 func startPooledFactory(tb TB, ctx context.Context, world *PooledWorld, cfg PooledFactoryConfig, placement sessionwire.HostPlacement, workloads factory.WorkloadController) *PooledFactory {
 	tb.Helper()
-	replica, logs := cfg.Replica, cfg.Logs
+	replica := cfg.Replica
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		tb.Fatalf("orchestrationtest: opening the pooled factory listener: %v", err)
+		return nil
+	}
+	base := "http://" + listener.Addr().String()
+	opts, directory := pooledFactoryOptions(tb, world, cfg, placement, workloads, base)
+	if opts == nil {
+		_ = listener.Close()
+		return nil
+	}
+	server, err := factory.New(opts...)
+	if err != nil {
+		_ = listener.Close()
+		tb.Fatalf("orchestrationtest: composing pooled factory %s: %v", replica, err)
+		return nil
+	}
+	if err := server.Start(ctx); err != nil {
+		_ = listener.Close()
+		tb.Fatalf("orchestrationtest: starting pooled factory %s: %v", replica, err)
+		return nil
+	}
+	served := make(chan error, 1)
+	go func() { served <- server.Serve(listener) }()
+	var once sync.Once
+	stop := func() {
+		once.Do(func() {
+			stopCtx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+			defer cancel()
+			_ = server.Stop(stopCtx)
+			<-served
+		})
+	}
+	tb.Cleanup(stop)
+	return &PooledFactory{
+		Server:    server,
+		BaseURL:   base,
+		Directory: directory,
+		client:    &http.Client{Timeout: 15 * time.Second},
+		stop:      stop,
+	}
+}
+
+// DedicatedFactoryOptions are the options StartDedicatedFactory composes a
+// replica with, for a product main (the kind lane's in-cluster Factory) that
+// serves the Factory itself. origin is the replica's own base URL, trusted by
+// the CSRF guard. cfg.Workload, when set, replaces the kit's placeholder
+// dedicated payload with a real platform payload.
+func DedicatedFactoryOptions(tb TB, world *PooledWorld, cfg PooledFactoryConfig, workloads factory.WorkloadController, origin string) []factory.Option {
+	tb.Helper()
+	opts, _ := pooledFactoryOptions(tb, world, cfg, sessionwire.HostPlacementDedicated, workloads, origin)
+	return opts
+}
+
+func pooledFactoryOptions(tb TB, world *PooledWorld, cfg PooledFactoryConfig, placement sessionwire.HostPlacement, workloads factory.WorkloadController, base string) ([]factory.Option, factory.Directory) {
+	tb.Helper()
 	storeDirectory, err := factory.NewStoreDirectory(world.Store, factory.DefaultDirectoryLimits())
 	if err != nil {
 		tb.Fatalf("orchestrationtest: factory.NewStoreDirectory: %v", err)
-		return nil
+		return nil, nil
 	}
 	var directory factory.Directory = storeDirectory
 	if cfg.Directory != nil {
@@ -1654,15 +1734,10 @@ func startPooledFactory(tb TB, ctx context.Context, world *PooledWorld, cfg Pool
 	service, err := identity.NewPrincipal(world.tenants[0], "orchestrationtest-sweeper", identity.KindService)
 	if err != nil {
 		tb.Fatalf("orchestrationtest: minting the sweeper identity: %v", err)
-		return nil
+		return nil, nil
 	}
-	listener, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		tb.Fatalf("orchestrationtest: opening the pooled factory listener: %v", err)
-		return nil
-	}
-	base := "http://" + listener.Addr().String()
 
+	replica, logs := cfg.Replica, cfg.Logs
 	reconcile := factory.DefaultReconcileLimits()
 	reconcile.Interval = ReconcileSweepInterval
 	reconcile.ClaimTTL = ReconcileClaimTTL
@@ -1693,6 +1768,9 @@ func startPooledFactory(tb TB, ctx context.Context, world *PooledWorld, cfg Pool
 	}}
 	if placement == sessionwire.HostPlacementDedicated {
 		template.Workload = sessionstore.DesiredWorkload{PayloadVersion: "orchestrationtest/v1", Payload: []byte(`{"replicas":1}`)}
+		if cfg.Workload != nil {
+			template.Workload = *cfg.Workload
+		}
 	}
 	var commands factory.Commands = world.Store
 	if cfg.Commands != nil {
@@ -1738,36 +1816,7 @@ func startPooledFactory(tb TB, ctx context.Context, world *PooledWorld, cfg Pool
 	if workloads != nil {
 		opts = append(opts, factory.WithWorkloadController(workloads))
 	}
-	server, err := factory.New(opts...)
-	if err != nil {
-		_ = listener.Close()
-		tb.Fatalf("orchestrationtest: composing pooled factory %s: %v", replica, err)
-		return nil
-	}
-	if err := server.Start(ctx); err != nil {
-		_ = listener.Close()
-		tb.Fatalf("orchestrationtest: starting pooled factory %s: %v", replica, err)
-		return nil
-	}
-	served := make(chan error, 1)
-	go func() { served <- server.Serve(listener) }()
-	var once sync.Once
-	stop := func() {
-		once.Do(func() {
-			stopCtx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
-			defer cancel()
-			_ = server.Stop(stopCtx)
-			<-served
-		})
-	}
-	tb.Cleanup(stop)
-	return &PooledFactory{
-		Server:    server,
-		BaseURL:   base,
-		Directory: directory,
-		client:    &http.Client{Timeout: 15 * time.Second},
-		stop:      stop,
-	}
+	return opts, directory
 }
 
 // Stop stops this replica: its HTTP surface, its ClientLinks, its sweeps and

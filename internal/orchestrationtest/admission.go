@@ -81,6 +81,10 @@ type PooledFactoryConfig struct {
 	// lifetime. Zero takes ReconcileSweepInterval and ReconcileClaimTTL.
 	Interval time.Duration
 	ClaimTTL time.Duration
+
+	// Workload, when set on a dedicated replica, is the launch template's
+	// platform payload in place of the kit's placeholder.
+	Workload *sessionstore.DesiredWorkload
 }
 
 // StartPooledFactoryWith composes, starts and serves a real pooled Factory
