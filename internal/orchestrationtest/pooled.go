@@ -137,6 +137,27 @@ type PooledLLM struct {
 	turns    []PooledTurn
 	next     int
 	requests []inference.Request
+	// respond, when set, chooses every turn from the request itself and the
+	// script is ignored. See Respond.
+	respond func(inference.Request) PooledTurn
+}
+
+// Respond makes the model choose each turn FROM THE REQUEST rather than from
+// the global script queue. A shared queue is only meaningful while one session
+// talks at a time: with many sessions interleaving, the queue hands one
+// session's scripted tool call to whichever session happened to ask next.
+func (l *PooledLLM) Respond(respond func(inference.Request) PooledTurn) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	l.respond = respond
+}
+
+// ForgetRequests drops the recorded requests. A long-running case that never
+// reads them would otherwise hold every conversation it ever sent.
+func (l *PooledLLM) ForgetRequests() {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	l.requests = nil
 }
 
 // NewPooledLLM returns a model that answers with plain text forever.
@@ -165,7 +186,11 @@ func (l *PooledLLM) Stream(_ context.Context, request inference.Request) (*strea
 	}
 	l.next++
 	call := l.next
+	respond := l.respond
 	l.mu.Unlock()
+	if respond != nil {
+		turn = respond(request)
+	}
 
 	chunks := []content.Chunk{}
 	if turn.ToolName != "" {
@@ -285,6 +310,34 @@ type PooledAskTool struct {
 	calls   int
 	answers []string
 	lastErr error
+
+	// fenced and active implement Fence; see there.
+	fenced bool
+	active int
+}
+
+// Fence stops the tool raising NEW gates: while fenced, an invocation returns
+// at once without asking. Active counts invocations that got past the fence
+// check and have not yet returned -- a parked gate is one of them.
+//
+// It exists for one documented obligation: a Host that drains with a gate
+// open MUST EXIT (host v0.4.0), because the parked runtime is uncancelled and
+// keeps renewing its journal lease. An in-process Host cannot exit, so a case
+// that restarts one fences the tool, waits for Active to reach zero -- every
+// open gate answered -- and only then drains. The count is taken under the
+// same lock as the fence check, so an invocation either sees the fence or is
+// counted: there is no window in which a gate can open unseen.
+func (t *PooledAskTool) Fence(on bool) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	t.fenced = on
+}
+
+// Active reports invocations past the fence check that have not returned.
+func (t *PooledAskTool) Active() int {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	return t.active
 }
 
 // Calls reports how many times the tool ran.
@@ -334,7 +387,17 @@ func (t *PooledAskTool) InvokableRun(ctx context.Context, _ string) (*tool.ToolR
 	t.mu.Lock()
 	t.calls++
 	question := t.Question
+	if t.fenced {
+		t.mu.Unlock()
+		return tool.TextResult("the user is unavailable"), nil
+	}
+	t.active++
 	t.mu.Unlock()
+	defer func() {
+		t.mu.Lock()
+		t.active--
+		t.mu.Unlock()
+	}()
 	if question == "" {
 		question = "orchestrationtest: what should I do?"
 	}
@@ -439,6 +502,26 @@ type PooledTails struct {
 	subs      []pooledTailKey
 	dropped   int
 	notes     []string
+
+	// timeline records, per session, when each sequence was committed and
+	// when each Host subscription was opened -- the evidence a gap report
+	// needs to say which side of a subscribe an event fell on.
+	timeline map[pooledTailKey][]string
+}
+
+// Timeline reports one session's commits and subscriptions in order, each
+// stamped with its wall-clock time.
+func (t *PooledTails) Timeline(tenant sessionwire.TenantID, s sessionwire.SessionID) []string {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	return append([]string(nil), t.timeline[pooledTailKey{tenant, s}]...)
+}
+
+func (t *PooledTails) note(key pooledTailKey, what string) {
+	if t.timeline == nil {
+		t.timeline = map[pooledTailKey][]string{}
+	}
+	t.timeline[key] = append(t.timeline[key], time.Now().Format("15:04:05.000000")+" "+what)
 }
 
 // bridgeNote records one bridge lifecycle observation.
@@ -469,6 +552,7 @@ func (t *PooledTails) subscribe(key pooledTailKey) chan sessionwire.EnduringPubl
 	ch := make(chan sessionwire.EnduringPublication, 1024)
 	t.current[key] = append(t.current[key], ch)
 	t.subs = append(t.subs, key)
+	t.note(key, fmt.Sprintf("host subscribed (subscriber %d, tip %d)", len(t.current[key]), t.committed[key]))
 	return ch
 }
 
@@ -506,6 +590,7 @@ func (t *PooledTails) Emit(key pooledTailKey, n int) {
 			Body:           json.RawMessage(fmt.Sprintf(`{"tenant":%q,"seq":%d}`, key.tenant, seq)),
 		}
 		subscribers := t.current[key]
+		t.note(key, fmt.Sprintf("committed E%d to %d subscribers", seq, len(subscribers)))
 		if len(subscribers) == 0 {
 			t.dropped++
 			continue
@@ -1346,6 +1431,21 @@ func startHost(tb TB, ctx context.Context, world *PooledWorld, id sessionwire.Ho
 // the Host's real Routes(). A nil wrap serves Routes() as they are.
 func startHostWrapped(tb TB, ctx context.Context, world *PooledWorld, id sessionwire.HostID, generation uint64, fixed sessionwire.SessionID, wrap func(http.Handler) http.Handler) *PooledHost {
 	tb.Helper()
+	return startHostTuned(tb, ctx, world, id, generation, fixed, wrap, pooledHostTuning{})
+}
+
+// pooledHostTuning overrides the pooled Host's sizing and warm-release bound.
+// Every zero field keeps the value the lanes above were written against.
+type pooledHostTuning struct {
+	capacity           uint64
+	warmTTL            time.Duration
+	maxBindingsPerLink int
+	maxBindings        int
+	commandQueueSize   int
+}
+
+func startHostTuned(tb TB, ctx context.Context, world *PooledWorld, id sessionwire.HostID, generation uint64, fixed sessionwire.SessionID, wrap func(http.Handler) http.Handler, tuning pooledHostTuning) *PooledHost {
+	tb.Helper()
 	raw, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		tb.Fatalf("orchestrationtest: opening the pooled host listener: %v", err)
@@ -1358,8 +1458,24 @@ func startHostWrapped(tb TB, ctx context.Context, world *PooledWorld, id session
 	// exactly one; a pooled one REFUSES a fixed session id. Host validates
 	// both, so the two arms travel different composition branches.
 	placement, capacity := sessionwire.HostPlacementPooled, uint64(8)
+	if tuning.capacity > 0 {
+		capacity = tuning.capacity
+	}
 	if fixed != "" {
 		placement, capacity = sessionwire.HostPlacementDedicated, 1
+	}
+	warmTTL, perLink, bindings, queue := 90*time.Second, 16, 32, 16
+	if tuning.warmTTL > 0 {
+		warmTTL = tuning.warmTTL
+	}
+	if tuning.maxBindingsPerLink > 0 {
+		perLink = tuning.maxBindingsPerLink
+	}
+	if tuning.maxBindings > 0 {
+		bindings = tuning.maxBindings
+	}
+	if tuning.commandQueueSize > 0 {
+		queue = tuning.commandQueueSize
 	}
 	recorder := &pooledRecorder{}
 	rigs := map[sessionwire.TenantID]*rig.Rig{}
@@ -1382,17 +1498,17 @@ func startHostWrapped(tb TB, ctx context.Context, world *PooledWorld, id session
 			Placement:         placement,
 			Capacity:          capacity,
 			FixedSessionID:    fixed,
-			WarmTTL:           90 * time.Second,
+			WarmTTL:           warmTTL,
 			RegistryHeartbeat: 2 * time.Second,
 			RegistryExpiry:    10 * time.Second,
 			ClaimTTL:          5 * time.Second,
 			ApplyDeadline:     60 * time.Second,
-			CommandQueueSize:  16,
+			CommandQueueSize:  queue,
 			ReconcileInterval: 200 * time.Millisecond,
 			ReconcileBatch:    32,
 		},
 		Generation:           generation,
-		Link:                 host.LinkOptions{MaxBindingsPerLink: 16, MaxBindings: 32, MaxTenantLinks: 4},
+		Link:                 host.LinkOptions{MaxBindingsPerLink: perLink, MaxBindings: bindings, MaxTenantLinks: 4},
 		Drain:                host.DrainOptions{Grace: 10 * time.Second, IdleBoundary: 5 * time.Second, PublishBound: 2 * time.Second},
 		CompatibilityTimeout: 20 * time.Second,
 		WorkPoll:             time.Second,
@@ -1954,6 +2070,15 @@ type PooledViewer struct {
 	mu      sync.Mutex
 	records []string
 	strays  []string
+	// arrived stamps each record with its arrival time, index for index.
+	arrived []string
+}
+
+// Arrivals reports each record with the wall-clock time it arrived.
+func (v *PooledViewer) Arrivals() []string {
+	v.mu.Lock()
+	defer v.mu.Unlock()
+	return append([]string(nil), v.arrived...)
 }
 
 // ConnectPooledViewer opens a ClientLink connection as tenant.
