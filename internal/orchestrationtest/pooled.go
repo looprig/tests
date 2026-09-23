@@ -12,6 +12,7 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"path/filepath"
 	"strings"
 	"sync"
 	"time"
@@ -124,6 +125,10 @@ type PooledTurn struct {
 	// instead. The turn AFTER a tool call is the model's reply to the result.
 	ToolName  string
 	ToolInput string
+
+	// Hold, when set, keeps the model's answer back until it is closed: the
+	// turn is MID-WAY for as long as the case wants it to be.
+	Hold <-chan struct{}
 }
 
 // PooledLLM is the harness's inference client: a queue of scripted turns, with
@@ -156,7 +161,7 @@ func (*PooledLLM) Invoke(context.Context, inference.Request) (*inference.Respons
 }
 
 // Stream satisfies inference.Client.
-func (l *PooledLLM) Stream(_ context.Context, request inference.Request) (*stream.StreamReader[content.Chunk], error) {
+func (l *PooledLLM) Stream(ctx context.Context, request inference.Request) (*stream.StreamReader[content.Chunk], error) {
 	l.mu.Lock()
 	l.requests = append(l.requests, request)
 	var turn PooledTurn
@@ -166,6 +171,13 @@ func (l *PooledLLM) Stream(_ context.Context, request inference.Request) (*strea
 	l.next++
 	call := l.next
 	l.mu.Unlock()
+	if turn.Hold != nil {
+		select {
+		case <-turn.Hold:
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		}
+	}
 
 	chunks := []content.Chunk{}
 	if turn.ToolName != "" {
@@ -610,6 +622,10 @@ type PooledRig struct {
 	creates       []PooledLaunch
 	restores      []PooledLaunch
 	refuseCreates bool
+	// live is the latest runtime launched for each session on this Host.
+	live map[pooledTailKey]*pooledSession
+	// workspaceRoots is the WorkspaceRoot Host handed each launch, in order.
+	workspaceRoots []string
 }
 
 // RefuseCreates makes this Host's runtime refuse every create AFTER Host has
@@ -655,7 +671,7 @@ func (p *PooledRig) NewSession(ctx context.Context, req department.RigCreateRequ
 	p.mu.Lock()
 	p.creates = append(p.creates, PooledLaunch{req.TenantID, req.RigSessionID})
 	p.mu.Unlock()
-	return p.adapt(controller, pooledTailKey{req.TenantID, req.SessionID}), nil
+	return p.adapt(controller, pooledTailKey{req.TenantID, req.SessionID}, req.WorkspaceRoot), nil
 }
 
 // RestoreSession satisfies department.Rig.
@@ -671,16 +687,22 @@ func (p *PooledRig) RestoreSession(ctx context.Context, id uuid.UUID, req depart
 	p.mu.Lock()
 	p.restores = append(p.restores, PooledLaunch{req.TenantID, id})
 	p.mu.Unlock()
-	return p.adapt(controller, pooledTailKey{req.TenantID, req.SessionID}), nil
+	return p.adapt(controller, pooledTailKey{req.TenantID, req.SessionID}, req.WorkspaceRoot), nil
 }
 
 // adapt wraps one launched harness session as Host's department.RigSession,
 // starting the committed-event bridge when this world needs one.
-func (p *PooledRig) adapt(controller session.SessionController, key pooledTailKey) department.RigSession {
+func (p *PooledRig) adapt(controller session.SessionController, key pooledTailKey, workspaceRoot string) department.RigSession {
 	adapted := &pooledSession{controller: controller, recorder: p.recorder, tails: p.tails, key: key, rig: p, bridged: p.bridge}
 	if p.bridge {
 		adapted.startBridge()
 	}
+	p.mu.Lock()
+	if p.live != nil {
+		p.live[key] = adapted
+	}
+	p.workspaceRoots = append(p.workspaceRoots, workspaceRoot)
+	p.mu.Unlock()
 	return adapted
 }
 
@@ -1143,6 +1165,20 @@ type PooledWorld struct {
 
 	tenants []sessionwire.TenantID
 	gated   bool
+
+	// journalBackends are the backends under Journals, kept so a Host whose
+	// process can die opens its OWN harness store over a view of the same
+	// bytes. See PooledHostConfig.Mortal.
+	journalBackends map[sessionwire.TenantID]*storage.Composite
+
+	// workspaces, when non-nil, is the DURABLE workspace snapshot plane every
+	// Host's rig checkpoints into and restores from. See WithWorkspace.
+	workspaces *storage.Composite
+	// workspaceBase is the ONE physical workspace base path every Host uses.
+	// See WipeWorkspaceDisk for why it is shared.
+	workspaceBase string
+	// WorkspaceTools is the agent's file tools, when WithWorkspace is set.
+	WorkspaceTools *PooledWorkspaceTools
 }
 
 // PooledWorldOptions chooses what a case's agent can do.
@@ -1151,6 +1187,11 @@ type PooledWorldOptions struct {
 	Tenants []sessionwire.TenantID
 	// WithAskTool gives the agent the tool that raises a real ask_user gate.
 	WithAskTool bool
+	// WithWorkspace gives every session a REAL harness workspace: a
+	// per-session root under each Host's own physical workspace directory,
+	// snapshotted into one durable plane every Host shares, and two file tools
+	// the agent can write and read it with. See PooledWorkspaceTools.
+	WithWorkspace bool
 	// Backend is the SessionStore provider every Host and Factory in this
 	// world shares. Nil takes a fresh memstore. The harness journals are
 	// unaffected: they are a different module's keyspace.
@@ -1178,15 +1219,24 @@ func NewPooledWorld(tb TB, ctx context.Context, options PooledWorldOptions) *Poo
 		Backend:  backend,
 		Journals: map[sessionwire.TenantID]*harnessstore.Store{},
 		LLM:      NewPooledLLM(),
-		Tails:    NewPooledTails(),
-		tenants:  tenants,
-		gated:    options.WithAskTool,
+
+		journalBackends: map[sessionwire.TenantID]*storage.Composite{},
+		Tails:           NewPooledTails(),
+		tenants:         tenants,
+		gated:           options.WithAskTool,
 	}
 	if options.WithAskTool {
 		world.AskTool = &PooledAskTool{}
 	}
+	if options.WithWorkspace {
+		world.workspaces = memstore.New()
+		world.WorkspaceTools = &PooledWorkspaceTools{}
+		world.workspaceBase = filepath.Join(NewTempWorkspaces(tb).Root, "workspaces")
+	}
 	for _, tenant := range tenants {
-		journalStore, err := harnessstore.Open(memstore.New(), harnessstore.WithTenant(tenant))
+		journalBackend := memstore.New()
+		world.journalBackends[tenant] = journalBackend
+		journalStore, err := harnessstore.Open(journalBackend, harnessstore.WithTenant(tenant))
 		if err != nil {
 			tb.Fatalf("orchestrationtest: opening the harness journal for %q: %v", tenant, err)
 			return nil
@@ -1226,15 +1276,22 @@ func PooledModel() model.Model {
 	)
 }
 
-func (w *PooledWorld) defineRig(tb TB, tenant sessionwire.TenantID) *rig.Rig {
+func (w *PooledWorld) defineRig(tb TB, tenant sessionwire.TenantID, journal *harnessstore.Store, workspaceDurable *storage.Composite, workspaceBase string) *rig.Rig {
 	tb.Helper()
 	loopOptions := []loop.Option{
 		loop.WithName("orchestrationtest-agent"),
 		loop.WithInference(w.LLM, PooledModel()),
 	}
+	var tools []tool.Definition
 	if w.gated {
+		tools = append(tools, pooledAskDefinition(w.AskTool))
+	}
+	if w.workspaces != nil {
+		tools = append(tools, w.WorkspaceTools.definitions()...)
+	}
+	if len(tools) > 0 {
 		loopOptions = append(loopOptions,
-			loop.WithTools(pooledAskDefinition(w.AskTool)),
+			loop.WithTools(tools...),
 			loop.WithAccessGate(pooledAllowAll(tb)),
 			// An access gate obliges a policy revision: loop.Define refuses
 			// missing_policy_revision otherwise.
@@ -1246,11 +1303,15 @@ func (w *PooledWorld) defineRig(tb TB, tenant sessionwire.TenantID) *rig.Rig {
 		tb.Fatalf("orchestrationtest: loop.Define: %v", err)
 		return nil
 	}
-	defined, err := rig.Define(
+	rigOptions := []rig.Option{
 		rig.WithLoops(definition),
 		rig.WithPrimers("orchestrationtest-agent"),
-		rig.WithSessionStore(w.Journals[tenant]),
-	)
+		rig.WithSessionStore(journal),
+	}
+	if w.workspaces != nil {
+		rigOptions = append(rigOptions, pooledWorkspaceOptions(tb, workspaceDurable, workspaceBase, tenant)...)
+	}
+	defined, err := rig.Define(rigOptions...)
 	if err != nil {
 		tb.Fatalf("orchestrationtest: rig.Define for %q: %v", tenant, err)
 		return nil
@@ -1273,6 +1334,10 @@ type PooledHost struct {
 	tracker *pooledTrackingListener
 	server  *httptest.Server
 	stop    func()
+
+	// process is this Host's durable-plane view when it is MORTAL, nil
+	// otherwise. See Kill.
+	process *HostProcess
 
 	mu    sync.Mutex
 	paths []string
@@ -1346,6 +1411,13 @@ func startHost(tb TB, ctx context.Context, world *PooledWorld, id sessionwire.Ho
 // the Host's real Routes(). A nil wrap serves Routes() as they are.
 func startHostWrapped(tb TB, ctx context.Context, world *PooledWorld, id sessionwire.HostID, generation uint64, fixed sessionwire.SessionID, wrap func(http.Handler) http.Handler) *PooledHost {
 	tb.Helper()
+	return startHostConfigured(tb, ctx, world, id, generation, fixed, wrap, PooledHostConfig{})
+}
+
+// startHostConfigured is startHostWrapped with the lifecycle knobs a case may
+// turn. A zero config is exactly the Host every earlier lane composes.
+func startHostConfigured(tb TB, ctx context.Context, world *PooledWorld, id sessionwire.HostID, generation uint64, fixed sessionwire.SessionID, wrap func(http.Handler) http.Handler, cfg PooledHostConfig) *PooledHost {
+	tb.Helper()
 	raw, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		tb.Fatalf("orchestrationtest: opening the pooled host listener: %v", err)
@@ -1364,12 +1436,60 @@ func startHostWrapped(tb TB, ctx context.Context, world *PooledWorld, id session
 	recorder := &pooledRecorder{}
 	rigs := map[sessionwire.TenantID]*rig.Rig{}
 	journals := map[host.EvidenceKey]sessionstore.DispositionEvidenceReader{}
-	for _, tenant := range world.tenants {
-		rigs[tenant] = world.defineRig(tb, tenant)
-		journals[host.EvidenceKey{TenantID: tenant, StorageBindingID: PooledBinding}] =
-			PooledEvidence{Store: world.Journals[tenant]}
+	workspaces := NewTempWorkspaces(tb)
+	backend := world.Backend
+	var process *HostProcess
+	if cfg.Mortal {
+		process = &HostProcess{}
+		backend = process.View(tb, PlaneStore, world.Backend)
 	}
-	product := &PooledRig{rigs: rigs, recorder: recorder, tails: world.Tails, bridge: world.gated}
+	for _, tenant := range world.tenants {
+		journal := world.Journals[tenant]
+		if process != nil {
+			// A MORTAL Host opens its own harness store over a view of the
+			// shared journal bytes, so its death can lapse the journal lease
+			// its runtime holds -- which is what a dead process's lease does.
+			opened, err := harnessstore.Open(process.View(tb, PlaneJournal, world.journalBackends[tenant]), harnessstore.WithTenant(tenant))
+			if err != nil {
+				_ = listener.Close()
+				tb.Fatalf("orchestrationtest: opening %s's harness journal for %q: %v", id, tenant, err)
+				return nil
+			}
+			journal = opened
+		}
+		// Every Host uses the world's ONE physical workspace base path; see
+		// PooledWorld.WipeWorkspaceDisk for why.
+		durable := world.workspaces
+		if process != nil && durable != nil {
+			durable = process.View(tb, PlaneWorkspace, durable)
+		}
+		base := world.workspaceBase
+		if cfg.WorkspaceBase != "" {
+			base = cfg.WorkspaceBase
+		}
+		rigs[tenant] = world.defineRig(tb, tenant, journal, durable, base)
+		journals[host.EvidenceKey{TenantID: tenant, StorageBindingID: PooledBinding}] =
+			PooledEvidence{Store: journal}
+	}
+	product := &PooledRig{rigs: rigs, recorder: recorder, tails: world.Tails, bridge: world.gated, live: map[pooledTailKey]*pooledSession{}}
+	var checkpointer host.Checkpointer = pooledCheckpointer{rig: product, workspaces: world.workspaces != nil}
+	if cfg.WrapCheckpointer != nil {
+		checkpointer = cfg.WrapCheckpointer(checkpointer)
+	}
+	warmTTL, workPoll, reconcile := 90*time.Second, time.Second, 200*time.Millisecond
+	if cfg.WarmTTL > 0 {
+		warmTTL = cfg.WarmTTL
+	}
+	if cfg.WorkPoll > 0 {
+		workPoll = cfg.WorkPoll
+	}
+	if cfg.ReconcileInterval > 0 {
+		reconcile = cfg.ReconcileInterval
+	}
+	drain := host.DrainOptions{Grace: 10 * time.Second, IdleBoundary: 5 * time.Second, PublishBound: 2 * time.Second}
+	if cfg.Drain != nil {
+		drain = *cfg.Drain
+	}
 
 	blueprint := host.Composition{
 		Options: host.Options{
@@ -1382,22 +1502,22 @@ func startHostWrapped(tb TB, ctx context.Context, world *PooledWorld, id session
 			Placement:         placement,
 			Capacity:          capacity,
 			FixedSessionID:    fixed,
-			WarmTTL:           90 * time.Second,
+			WarmTTL:           warmTTL,
 			RegistryHeartbeat: 2 * time.Second,
 			RegistryExpiry:    10 * time.Second,
 			ClaimTTL:          5 * time.Second,
 			ApplyDeadline:     60 * time.Second,
 			CommandQueueSize:  16,
-			ReconcileInterval: 200 * time.Millisecond,
+			ReconcileInterval: reconcile,
 			ReconcileBatch:    32,
 		},
 		Generation:           generation,
 		Link:                 host.LinkOptions{MaxBindingsPerLink: 16, MaxBindings: 32, MaxTenantLinks: 4},
-		Drain:                host.DrainOptions{Grace: 10 * time.Second, IdleBoundary: 5 * time.Second, PublishBound: 2 * time.Second},
+		Drain:                drain,
 		CompatibilityTimeout: 20 * time.Second,
-		WorkPoll:             time.Second,
+		WorkPoll:             workPoll,
 		Collaborators: host.Collaborators{
-			Backend:       world.Backend,
+			Backend:       backend,
 			JournalStores: journals,
 			Registrar: host.RegistrarFunc(func(context.Context) ([]department.Registration, error) {
 				target, err := department.NewRigTarget(product, PooledCompatibility, KitCapabilities())
@@ -1406,9 +1526,9 @@ func startHostWrapped(tb TB, ctx context.Context, world *PooledWorld, id session
 				}
 				return []department.Registration{{AgentID: PooledAgent, Target: target}}, nil
 			}),
-			Checkpointer: inertCheckpointer{},
+			Checkpointer: checkpointer,
 			Auth:         pooledAuth{},
-			Workspaces:   NewTempWorkspaces(tb),
+			Workspaces:   workspaces,
 			NamespaceLayout: func(tenant sessionwire.TenantID, s sessionwire.SessionID) string {
 				return string(tenant) + "/" + string(s)
 			},
@@ -1426,7 +1546,7 @@ func startHostWrapped(tb TB, ctx context.Context, world *PooledWorld, id session
 		return nil
 	}
 
-	pooled := &PooledHost{Service: service, Rig: product, ID: id, Base: base, tracker: listener}
+	pooled := &PooledHost{Service: service, Rig: product, ID: id, Base: base, tracker: listener, process: process}
 	routes := service.Routes()
 	handler := http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
 		if request.Header.Get("Upgrade") != "" {
