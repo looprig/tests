@@ -20,20 +20,30 @@
 //	        repairs, and holds every record; two peers behind the same
 //	        HostBinding are never closed, never reset, never repair past their
 //	        join, and hold every record live.
-//	case 2  "Force HostBinding failure; every DeliveryBinding for that
+//	case 2  "Force HostBinding queue failure; every DeliveryBinding for that
 //	        HostBinding repairs independently while a session on another Host
 //	        continues." Two Hosts, placed by capacity: tenant-a's session on
-//	        Host X, tenant-b's on Host Y. Two HostBinding failures on X:
-//	        (a) a record Factory's relay REFUSES, injected on X's HostLink (a
-//	        session.reset, which only Factory may author) -- this is the relay's
-//	        own HostBinding repair arm, the one a queue overflow also takes; the
-//	        queue itself cannot be overflowed from outside, because the plane
-//	        drains each session on one goroutine, Receive then Pump, into a
-//	        channel-wide publisher that never answers ErrWouldBlock; and
-//	        (b) the transport under X's HostLinks, severed at TCP. After each,
-//	        every browser of a is reset by Factory at a tip Factory read (never
-//	        the forged one) and holds every record; the browser of b on Host Y
-//	        sees nothing at all.
+//	        Host X, tenant-b's on Host Y. THREE HostBinding failures on X, the
+//	        first of them the queue failure itself:
+//	        (a) A GENUINE QUEUE OVERFLOW. The composed HostBinding bound is the
+//	        live-tail plane's per-session mailbox (MailboxLimit =
+//	        routing.DefaultRepairLimits().HostBindingQueue = 1024 frames), and
+//	        a burst of 8,192 frames injected on X's HostLink -- with the
+//	        product committing enduring records through it -- overflows it:
+//	        Factory drops the queued backlog, fences the tail's generation and
+//	        repairs. Measured: several Factory-authored resets per browser, and
+//	        some of the burst's enduring records reach browsers only through
+//	        the repair. (An earlier draft of this header claimed the queue
+//	        "cannot be overflowed from outside". That was wrong: a review
+//	        overflowed it with this kit's own injector.)
+//	        (b) a record Factory's relay REFUSES, injected on X's HostLink (a
+//	        session.reset, which only Factory may author), which takes the same
+//	        HostLinkClosed -> repair path without the dropped backlog; and
+//	        (c) the transport under X's HostLinks, severed at TCP.
+//	        After each, every browser of a is reset by Factory at a tip at or
+//	        above the one before the failure (never the forged one) and holds
+//	        every record exactly; the browser of b on Host Y sees nothing but
+//	        its own live records.
 //	case 3  the SELECTED Centrifuge slow-consumer threshold, and whether it
 //	        closes a subscription or the physical link. MEASURED, in
 //	        TestCentrifugeSlowConsumerThresholdAndItsBlastRadius: a real
@@ -179,6 +189,28 @@ func TestRealtimeFailureBlastRadiusIsBoundedByTheSession(t *testing.T) {
 	}
 	allHold(t, "every browser holds its create")
 
+	// awaitLive commits enduring records to session a until one reaches b
+	// LIVE, which is how a case knows a repair has finished and the live path
+	// is back before it measures the next thing.
+	awaitLive := func(tb *testing.T, b *orchestrationtest.PooledBrowser) {
+		tb.Helper()
+		world.Tails.Hint(tenantA, sessionA)
+		probe := world.Tails.Committed(tenantA, sessionA)
+		probeSeq := probe[len(probe)-1].JournalSeq
+		orchestrationtest.PooledWait(tb, "a record arrives live again", 60*time.Second, func() bool {
+			for _, event := range b.LiveEnduring() {
+				if event.JournalSeq == probeSeq {
+					return true
+				}
+			}
+			world.Tails.Hint(tenantA, sessionA)
+			probe = world.Tails.Committed(tenantA, sessionA)
+			probeSeq = probe[len(probe)-1].JournalSeq
+			return false
+		})
+		allHold(tb, "every browser holds through the probe")
+	}
+
 	// onYUntouched is the other-Host half of every case: the browser of the
 	// session on Host Y never closes, is never reset, never repairs past its
 	// join, and holds every record of its session.
@@ -224,6 +256,82 @@ func TestRealtimeFailureBlastRadiusIsBoundedByTheSession(t *testing.T) {
 	})
 
 	t.Run("case 2: a HostBinding failure repairs every DeliveryBinding; the session on another Host continues", func(t *testing.T) {
+		// FAILURE ONE, A GENUINE HOSTBINDING OVERFLOW. In composition the
+		// HostBinding's inbound bound is the live-tail plane's per-session
+		// MAILBOX, MailboxLimit = routing.DefaultRepairLimits().HostBindingQueue
+		// = 1024 frames (factory compose.go). A burst the session's single
+		// drainer cannot keep up with fills it; the plane then DROPS the
+		// queued backlog, fences the tail's generation so later frames are
+		// dropped too, and queues the repair (evLost -> Relay.HostLinkClosed).
+		// The burst is ephemeral records -- the only records a Host can send
+		// faster than the product commits -- with the product committing
+		// enduring records THROUGH it, so the dropped backlog can hold
+		// enduring frames that only the repair can give back.
+		const burst = slowConsumerMailboxBurst
+		committedBurst := world.Tails.Committed(tenantA, sessionA)
+		tipBeforeBurst := committedBurst[len(committedBurst)-1].JournalSeq
+		resetsBeforeBurst := map[*orchestrationtest.PooledBrowser]int{}
+		ephemeralBefore := map[*orchestrationtest.PooledBrowser]int{}
+		liveBefore := map[*orchestrationtest.PooledBrowser]int{}
+		for _, b := range onA {
+			resetsBeforeBurst[b] = len(b.Resets())
+			ephemeralBefore[b] = len(b.Ephemeral())
+			liveBefore[b] = len(b.LiveEnduring())
+		}
+		yBefore := len(onY.Log())
+		for n := 1; n <= burst; n++ {
+			record, err := orchestrationtest.EphemeralRecord(tenantA, sessionA, []byte(fmt.Sprintf(`{"n":%d}`, slowConsumerBurstBase+n)))
+			if err != nil {
+				t.Fatalf("encoding burst record %d: %v", n, err)
+			}
+			if _, err := injector.Push(tenantA, sessionA, record); err != nil {
+				t.Fatalf("injecting burst record %d: %v", n, err)
+			}
+			if n%(burst/8) == 0 {
+				world.Tails.Hint(tenantA, sessionA)
+			}
+		}
+		world.Tails.Hint(tenantA, sessionA)
+		world.Tails.Hint(tenantB, sessionB)
+		allHold(t, "every browser holds through the mailbox overflow")
+		committedAfter := world.Tails.Committed(tenantA, sessionA)
+		for i, b := range onA {
+			resets := b.Resets()[resetsBeforeBurst[b]:]
+			if len(resets) == 0 {
+				t.Fatalf("browser %d of the overflowed HostBinding received no reset: the %d-frame burst did not repair it (log tail %v)",
+					i, burst, b.Log()[max(0, len(b.Log())-12):])
+			}
+			for _, r := range resets {
+				if r.Tip < tipBeforeBurst {
+					t.Fatalf("browser %d was reset to %v, below the tip %d before the burst", i, r, tipBeforeBurst)
+				}
+			}
+			assertHoldsAll(t, fmt.Sprintf("browser %d after the mailbox overflow", i), b, committedAfter)
+			got := b.Ephemeral()[ephemeralBefore[b]:]
+			assertBoundedEphemeral(t, fmt.Sprintf("browser %d's burst", i), got, slowConsumerBurstBase+1, slowConsumerBurstBase+burst)
+			// What the overflow cost this browser, measured: burst frames it
+			// never saw, and enduring records it got from the repair rather
+			// than live.
+			liveNew := 0
+			for _, event := range b.LiveEnduring()[liveBefore[b]:] {
+				if event.JournalSeq > tipBeforeBurst {
+					liveNew++
+				}
+			}
+			t.Logf("case 2 overflow: browser %d got %d resets (%v), %d of %d burst frames, %d of %d new enduring records live",
+				i, len(resets), resets, len(got), burst, liveNew, len(committedAfter)-len(committedBurst))
+		}
+		for _, entry := range onY.Log()[yBefore:] {
+			if entry.Kind != "E" {
+				t.Fatalf("the session on Host Y saw %v during X's mailbox overflow", entry)
+			}
+		}
+		onYUntouched(t)
+
+		// The overflow's repair is complete before the next arm is measured:
+		// a record must arrive LIVE again, so no reset still in flight from
+		// the burst can be credited to the refused record.
+		awaitLive(t, peer)
 		committedA := world.Tails.Committed(tenantA, sessionA)
 		tipBefore := committedA[len(committedA)-1].JournalSeq
 		resetsBefore := map[*orchestrationtest.PooledBrowser]int{}
@@ -231,7 +339,7 @@ func TestRealtimeFailureBlastRadiusIsBoundedByTheSession(t *testing.T) {
 			resetsBefore[b] = len(b.Resets())
 		}
 
-		// FAILURE ONE, the relay's own HostBinding repair: Host X's HostLink
+		// FAILURE TWO, the relay's own refusal: Host X's HostLink
 		// carries a record Factory's relay must refuse -- a session.reset,
 		// which only Factory may author -- and the live-tail plane repairs
 		// the session's HostBinding exactly as for a lost link.
@@ -264,7 +372,7 @@ func TestRealtimeFailureBlastRadiusIsBoundedByTheSession(t *testing.T) {
 		t.Logf("case 2: a refused Host record reset every browser of a: %v / %v / %v",
 			slow.Resets()[resetsBefore[slow]:], peer.Resets()[resetsBefore[peer]:], peer2.Resets()[resetsBefore[peer2]:])
 
-		// FAILURE TWO, the transport under X's HostBindings, severed at TCP.
+		// FAILURE THREE, the transport under X's HostBindings, severed at TCP.
 		t.Logf("case 2: severed %d TCP connections to Host X", hostX.Sever())
 		for range 3 {
 			world.Tails.Hint(tenantA, sessionA)
@@ -312,20 +420,15 @@ func TestRealtimeFailureBlastRadiusIsBoundedByTheSession(t *testing.T) {
 		// injected: a HostLink open again, and an enduring record arriving on
 		// it LIVE rather than by repair.
 		orchestrationtest.PooledWait(t, "Factory re-opened a HostLink to Host X", 60*time.Second, func() bool { return injector.Live() > 0 })
-		world.Tails.Hint(tenantA, sessionA)
-		probe := world.Tails.Committed(tenantA, sessionA)
-		probeSeq := probe[len(probe)-1].JournalSeq
-		orchestrationtest.PooledWait(t, "a record arrives live again", 60*time.Second, func() bool {
-			for _, event := range peer.LiveEnduring() {
-				if event.JournalSeq == probeSeq {
-					return true
-				}
-			}
-			world.Tails.Hint(tenantA, sessionA)
-			probe = world.Tails.Committed(tenantA, sessionA)
-			probeSeq = probe[len(probe)-1].JournalSeq
-			return false
-		})
+		awaitLive(t, peer)
+
+		// Case 4 counts only its own ephemeral records: case 2's burst came
+		// before it on the same browsers.
+		epStart := map[*orchestrationtest.PooledBrowser]int{}
+		for _, b := range onA {
+			epStart[b] = len(b.Ephemeral())
+		}
+		ephemeralOf := func(b *orchestrationtest.PooledBrowser) []uint64 { return b.Ephemeral()[epStart[b]:] }
 
 		// A: interleaved with enduring records, at a pace every browser keeps.
 		const interleaved = 64
@@ -336,7 +439,7 @@ func TestRealtimeFailureBlastRadiusIsBoundedByTheSession(t *testing.T) {
 			}
 		}
 		for i, b := range onA {
-			got := b.Ephemeral()
+			got := ephemeralOf(b)
 			assertBoundedEphemeral(t, fmt.Sprintf("browser %d", i), got, 1, interleaved)
 			t.Logf("case 4: browser %d received %d of %d interleaved ephemeral records", i, len(got), interleaved)
 		}
@@ -355,10 +458,10 @@ func TestRealtimeFailureBlastRadiusIsBoundedByTheSession(t *testing.T) {
 		slow.Release()
 		allHold(t, "every browser holds through the flood")
 		for i, b := range onA {
-			assertBoundedEphemeral(t, fmt.Sprintf("browser %d after the flood", i), b.Ephemeral(), 1, interleaved+flood)
+			assertBoundedEphemeral(t, fmt.Sprintf("browser %d after the flood", i), ephemeralOf(b), 1, interleaved+flood)
 		}
 		t.Logf("case 4: under the flood the stalled browser received %d ephemeral records and saw %v; the fast peers received %d and %d",
-			len(slow.Ephemeral()), blastCloses(slow)[closesBefore[slow]:], len(peer.Ephemeral()), len(peer2.Ephemeral()))
+			len(ephemeralOf(slow)), blastCloses(slow)[closesBefore[slow]:], len(ephemeralOf(peer)), len(ephemeralOf(peer2)))
 		if !blastSawSlowCloseAfter(slow, closesBefore[slow]) {
 			t.Fatalf("the stalled browser saw %v under the flood, want the budget's DisconnectSlow (3008) close", blastCloses(slow)[closesBefore[slow]:])
 		}
@@ -366,14 +469,14 @@ func TestRealtimeFailureBlastRadiusIsBoundedByTheSession(t *testing.T) {
 			if got := blastCloses(b)[closesBefore[b]:]; len(got) != 0 {
 				t.Fatalf("fast peer %d was closed by the flood: %v", i, got)
 			}
-			if got := len(b.Ephemeral()); got != interleaved+flood {
+			if got := len(ephemeralOf(b)); got != interleaved+flood {
 				t.Fatalf("fast peer %d received %d of %d ephemeral records", i, got, interleaved+flood)
 			}
 		}
 		// The flood is bounded by the budget: the stalled browser was closed
 		// (again) rather than queued without limit, and did not receive the
 		// whole flood.
-		if got := len(slow.Ephemeral()); got >= interleaved+flood {
+		if got := len(ephemeralOf(slow)); got >= interleaved+flood {
 			t.Fatalf("the stalled browser received all %d ephemeral records: nothing bounded its queue", got)
 		}
 
@@ -461,6 +564,13 @@ const (
 	slowConsumerTightBudget = 512 << 10
 	slowConsumerLooseBudget = 256 << 20
 	slowConsumerReadBuffer  = 4 << 10
+
+	// slowConsumerMailboxBurst is I1.4 case 2's overflow: well above the
+	// live-tail mailbox Factory composes (1024 frames), small-bodied so the
+	// ClientLink budget is not what it measures. Burst records are numbered
+	// from slowConsumerBurstBase so they cannot be read as case 4's.
+	slowConsumerMailboxBurst = 8192
+	slowConsumerBurstBase    = 1_000_000
 )
 
 // TestCentrifugeSlowConsumerThresholdAndItsBlastRadius is I1.4 CASE 3,
