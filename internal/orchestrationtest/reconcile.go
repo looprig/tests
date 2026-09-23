@@ -9,8 +9,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"log/slog"
-	"net"
 	"net/http"
 	"sync"
 	"time"
@@ -266,7 +264,7 @@ type ReconcileReplicaOptions struct {
 }
 
 // ReconcileReplica is a running pooled Factory composed from options, with the
-// bounds its demand plane was composed with.
+// bounds its demand plane was composed with. Its Stop is PooledFactory's.
 type ReconcileReplica struct {
 	*PooledFactory
 	ID string
@@ -276,15 +274,11 @@ type ReconcileReplica struct {
 	OwnershipPollInterval time.Duration
 	// DemandTimeout bounds one demand poll.
 	DemandTimeout time.Duration
-
-	stop func()
 }
 
-// Stop stops the replica and waits for Serve to return. It is idempotent.
-func (r *ReconcileReplica) Stop() { r.stop() }
-
 // ReconcileSweepInterval and ReconcileClaimTTL are the pooled replicas' sweep
-// cadence and claim lifetime -- the same numbers startPooledFactory composes.
+// cadence and claim lifetime -- the numbers startPooledFactory composes by
+// default.
 const (
 	ReconcileSweepInterval = 200 * time.Millisecond
 	ReconcileClaimTTL      = 2 * time.Second
@@ -292,127 +286,43 @@ const (
 )
 
 // StartReconcileReplica composes, starts and serves a real pooled Factory over
-// the world. It is startPooledFactory with the reconciliation seams chosen by
-// the case; the composition is otherwise identical.
+// the world. It is StartPooledFactoryWith with the reconciliation seams chosen
+// by the case -- ONE Factory builder, so a reconciliation replica and an
+// admission replica cannot drift apart in composition.
 func StartReconcileReplica(tb TB, ctx context.Context, world *PooledWorld, options ReconcileReplicaOptions) *ReconcileReplica {
 	tb.Helper()
-	storeDirectory, err := factory.NewStoreDirectory(world.Store, factory.DefaultDirectoryLimits())
-	if err != nil {
-		tb.Fatalf("orchestrationtest: factory.NewStoreDirectory: %v", err)
-		return nil
+	cfg := PooledFactoryConfig{
+		Replica:                options.Replica,
+		Logs:                   options.Logs,
+		WithoutPendingCommands: options.WithoutPendingCommands,
+		Directory:              options.Directory,
+		ServiceToken:           options.ServiceToken,
+		DemandTimeout:          options.DemandTimeout,
+		Interval:               options.Interval,
+		ClaimTTL:               options.ClaimTTL,
 	}
-	var directory factory.Directory = storeDirectory
-	if options.Directory != nil {
-		directory = options.Directory(storeDirectory)
+	if cfg.DemandTimeout == 0 {
+		cfg.DemandTimeout = 2 * time.Second
 	}
-	service, err := identity.NewPrincipal(world.tenants[0], "orchestrationtest-sweeper", identity.KindService)
-	if err != nil {
-		tb.Fatalf("orchestrationtest: minting the sweeper identity: %v", err)
-		return nil
-	}
-	listener, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		tb.Fatalf("orchestrationtest: opening the replica listener: %v", err)
-		return nil
-	}
-	base := "http://" + listener.Addr().String()
-
-	reconcile := factory.DefaultReconcileLimits()
-	reconcile.Interval = ReconcileSweepInterval
-	reconcile.ClaimTTL = ReconcileClaimTTL
-	if options.Interval > 0 {
-		reconcile.Interval = options.Interval
-	}
-	if options.ClaimTTL > 0 {
-		reconcile.ClaimTTL = options.ClaimTTL
-	}
-	clientLink := factory.DefaultClientLinkLimits()
-	clientLink.DemandReleaseDebounce = reconcileDebounce
-	clientLink.DemandTimeout = options.DemandTimeout
-	if clientLink.DemandTimeout == 0 {
-		clientLink.DemandTimeout = 2 * time.Second
-	}
-	logs := options.Logs
-	if logs == nil {
-		logs = io.Discard
-	}
-	token := options.ServiceToken
-	if token == "" {
-		token = PooledServiceToken
-	}
-	var commands factory.Commands = world.Store
-	var pending factory.PendingCommands = world.Store
 	if options.Commands != nil {
-		commands = options.Commands
-		pending = options.Commands
+		// Assigned only when set: a nil *ReplicaCommands in an interface is
+		// not a nil interface.
+		cfg.Commands = options.Commands
+		cfg.Pending = options.Commands
 	}
-	template := factory.LaunchTemplate{Key: sessionstore.HostTargetKey{
-		AgentID: PooledAgent, RuntimeCompatibilityID: string(PooledCompatibility), Placement: sessionwire.HostPlacementPooled,
-	}}
-	opts := []factory.Option{
-		factory.WithCredentialVerifier(pooledVerifier{}),
-		factory.WithAuthorizer(pooledAuthorizer{}),
-		factory.WithSessionReader(pooledTipReader{Store: world.Store, tails: world.Tails}),
-		factory.WithCommands(commands),
-		factory.WithDirectory(directory),
-		factory.WithCatalog(world.Store),
-		factory.WithGates(world.Store),
-		factory.WithHostTargets(world.Store),
-		factory.WithHostLinkCredential(fixedToken(token)),
-		factory.WithServiceIdentity(service),
-		factory.WithReplicaID(options.Replica),
-		factory.WithCSRF(identity.CSRFConfig{
-			SharedKey:      make([]byte, identity.MinCSRFSharedKeyBytes),
-			TokenTTL:       time.Hour,
-			TrustedOrigins: []string{PooledOrigin, base},
-		}),
-		factory.WithReconcileLimits(reconcile),
-		factory.WithClientLinkLimits(clientLink),
-		factory.WithDepartment(template),
-		factory.WithSessionBinding(PooledBinding, PooledBindingVersion),
-		factory.WithPublicCreates(world.Store),
-		factory.WithObjectStoreResolver(func(context.Context, sessionstore.SessionBinding) (factory.ObjectReader, error) {
-			return nil, ErrObjectNotPermitted
-		}),
-		factory.WithLogger(slog.New(slog.NewJSONHandler(logs, nil))),
+	interval := cfg.Interval
+	if interval == 0 {
+		interval = ReconcileSweepInterval
 	}
-	if !options.WithoutPendingCommands {
-		opts = append(opts, factory.WithPendingCommands(pending))
-	}
-	server, err := factory.New(opts...)
-	if err != nil {
-		_ = listener.Close()
-		tb.Fatalf("orchestrationtest: composing replica %s: %v", options.Replica, err)
+	pooled := StartPooledFactoryWith(tb, ctx, world, cfg)
+	if pooled == nil {
 		return nil
 	}
-	if err := server.Start(ctx); err != nil {
-		_ = listener.Close()
-		tb.Fatalf("orchestrationtest: starting replica %s: %v", options.Replica, err)
-		return nil
-	}
-	served := make(chan error, 1)
-	go func() { served <- server.Serve(listener) }()
-	var once sync.Once
-	stop := func() {
-		once.Do(func() {
-			stopCtx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
-			defer cancel()
-			_ = server.Stop(stopCtx)
-			<-served
-		})
-	}
-	tb.Cleanup(stop)
 	return &ReconcileReplica{
-		PooledFactory: &PooledFactory{
-			Server:    server,
-			BaseURL:   base,
-			Directory: directory,
-			client:    &http.Client{Timeout: 15 * time.Second},
-		},
+		PooledFactory:         pooled,
 		ID:                    options.Replica,
-		OwnershipPollInterval: clientLink.DemandReleaseDebounce + reconcile.Interval,
-		DemandTimeout:         clientLink.DemandTimeout,
-		stop:                  stop,
+		OwnershipPollInterval: reconcileDebounce + interval,
+		DemandTimeout:         cfg.DemandTimeout,
 	}
 }
 

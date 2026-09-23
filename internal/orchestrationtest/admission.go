@@ -58,6 +58,29 @@ type PooledFactoryConfig struct {
 	// ApplyDeadline, when positive, overrides ReconcileLimits.ApplyDeadline,
 	// the bound this replica stamps on every command it admits.
 	ApplyDeadline time.Duration
+
+	// Pending is the pending-command reader placement sweeps. Nil composes
+	// the real Store.
+	Pending factory.PendingCommands
+
+	// Directory, when set, wraps the replica's real store directory (latency
+	// injection, observation). The wrapped value is what PooledFactory
+	// reports as its Directory.
+	Directory func(factory.Directory) factory.Directory
+
+	// ServiceToken is the HostLink credential this replica presents. Empty
+	// takes PooledServiceToken, which the world's Hosts accept; anything else
+	// is refused by every Host.
+	ServiceToken string
+
+	// DemandTimeout bounds one subscriber-demand poll. Zero takes Factory's
+	// default.
+	DemandTimeout time.Duration
+
+	// Interval and ClaimTTL override the sweep cadence and the claim
+	// lifetime. Zero takes ReconcileSweepInterval and ReconcileClaimTTL.
+	Interval time.Duration
+	ClaimTTL time.Duration
 }
 
 // StartPooledFactoryWith composes, starts and serves a real pooled Factory

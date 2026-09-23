@@ -1604,10 +1604,6 @@ func (pooledAuthorizer) AuthorizeSubscribe(context.Context, identity.Principal, 
 
 func (pooledAuthorizer) AuthorizeServiceSweep(context.Context, identity.Principal) error { return nil }
 
-type pooledCredential struct{}
-
-func (pooledCredential) ServiceToken(context.Context) (string, error) { return PooledServiceToken, nil }
-
 // pooledTipReader is the Store, except that a session's journal tip is the
 // product runtime's committed sequence.
 //
@@ -1646,10 +1642,14 @@ func StartDedicatedFactory(tb TB, ctx context.Context, world *PooledWorld, repli
 func startPooledFactory(tb TB, ctx context.Context, world *PooledWorld, cfg PooledFactoryConfig, placement sessionwire.HostPlacement, workloads factory.WorkloadController) *PooledFactory {
 	tb.Helper()
 	replica, logs := cfg.Replica, cfg.Logs
-	directory, err := factory.NewStoreDirectory(world.Store, factory.DefaultDirectoryLimits())
+	storeDirectory, err := factory.NewStoreDirectory(world.Store, factory.DefaultDirectoryLimits())
 	if err != nil {
 		tb.Fatalf("orchestrationtest: factory.NewStoreDirectory: %v", err)
 		return nil
+	}
+	var directory factory.Directory = storeDirectory
+	if cfg.Directory != nil {
+		directory = cfg.Directory(storeDirectory)
 	}
 	service, err := identity.NewPrincipal(world.tenants[0], "orchestrationtest-sweeper", identity.KindService)
 	if err != nil {
@@ -1664,13 +1664,26 @@ func startPooledFactory(tb TB, ctx context.Context, world *PooledWorld, cfg Pool
 	base := "http://" + listener.Addr().String()
 
 	reconcile := factory.DefaultReconcileLimits()
-	reconcile.Interval = 200 * time.Millisecond
-	reconcile.ClaimTTL = 2 * time.Second
+	reconcile.Interval = ReconcileSweepInterval
+	reconcile.ClaimTTL = ReconcileClaimTTL
+	if cfg.Interval > 0 {
+		reconcile.Interval = cfg.Interval
+	}
+	if cfg.ClaimTTL > 0 {
+		reconcile.ClaimTTL = cfg.ClaimTTL
+	}
 	if cfg.ApplyDeadline > 0 {
 		reconcile.ApplyDeadline = cfg.ApplyDeadline
 	}
 	clientLink := factory.DefaultClientLinkLimits()
-	clientLink.DemandReleaseDebounce = 200 * time.Millisecond
+	clientLink.DemandReleaseDebounce = reconcileDebounce
+	if cfg.DemandTimeout > 0 {
+		clientLink.DemandTimeout = cfg.DemandTimeout
+	}
+	token := cfg.ServiceToken
+	if token == "" {
+		token = PooledServiceToken
+	}
 
 	if logs == nil {
 		logs = io.Discard
@@ -1685,6 +1698,10 @@ func startPooledFactory(tb TB, ctx context.Context, world *PooledWorld, cfg Pool
 	if cfg.Commands != nil {
 		commands = cfg.Commands
 	}
+	var pending factory.PendingCommands = world.Store
+	if cfg.Pending != nil {
+		pending = cfg.Pending
+	}
 	opts := []factory.Option{
 		factory.WithCredentialVerifier(pooledVerifier{}),
 		factory.WithAuthorizer(pooledAuthorizer{}),
@@ -1694,7 +1711,7 @@ func startPooledFactory(tb TB, ctx context.Context, world *PooledWorld, cfg Pool
 		factory.WithCatalog(world.Store),
 		factory.WithGates(world.Store),
 		factory.WithHostTargets(world.Store),
-		factory.WithHostLinkCredential(pooledCredential{}),
+		factory.WithHostLinkCredential(fixedToken(token)),
 		factory.WithServiceIdentity(service),
 		factory.WithReplicaID(replica),
 		factory.WithCSRF(identity.CSRFConfig{
@@ -1716,7 +1733,7 @@ func startPooledFactory(tb TB, ctx context.Context, world *PooledWorld, cfg Pool
 		// WITHOUT THIS NOTHING IS EVER PLACED. WithPendingCommands is what
 		// triggers pooled placement: a deployment that omits it logs a WARN at
 		// Start and every session waits forever with no other symptom.
-		opts = append(opts, factory.WithPendingCommands(world.Store))
+		opts = append(opts, factory.WithPendingCommands(pending))
 	}
 	if workloads != nil {
 		opts = append(opts, factory.WithWorkloadController(workloads))
@@ -1724,12 +1741,12 @@ func startPooledFactory(tb TB, ctx context.Context, world *PooledWorld, cfg Pool
 	server, err := factory.New(opts...)
 	if err != nil {
 		_ = listener.Close()
-		tb.Fatalf("orchestrationtest: composing the pooled factory: %v", err)
+		tb.Fatalf("orchestrationtest: composing pooled factory %s: %v", replica, err)
 		return nil
 	}
 	if err := server.Start(ctx); err != nil {
 		_ = listener.Close()
-		tb.Fatalf("orchestrationtest: starting the pooled factory: %v", err)
+		tb.Fatalf("orchestrationtest: starting pooled factory %s: %v", replica, err)
 		return nil
 	}
 	served := make(chan error, 1)
