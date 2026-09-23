@@ -3,8 +3,12 @@ module github.com/looprig/tests
 go 1.26.8
 
 require (
+	github.com/aws/aws-sdk-go-v2 v1.45.1
+	github.com/aws/aws-sdk-go-v2/config v1.33.2
+	github.com/aws/aws-sdk-go-v2/service/s3 v1.110.0
 	github.com/centrifugal/centrifuge v0.38.0
 	github.com/centrifugal/centrifuge-go v0.12.0
+	github.com/jackc/pgx/v5 v5.10.0
 	github.com/looprig/classifiers v0.2.1
 	github.com/looprig/controller v0.2.0
 	github.com/looprig/core v0.11.0
@@ -13,16 +17,18 @@ require (
 	github.com/looprig/factory v0.8.1
 	github.com/looprig/foreignloops v0.3.1
 	github.com/looprig/fsstore v0.5.1
-	github.com/looprig/harness v0.37.1
-	github.com/looprig/host v0.7.1
+	github.com/looprig/harness v0.38.0
+	github.com/looprig/host v0.8.0
 	github.com/looprig/inference v0.12.1
 	github.com/looprig/llm v0.14.1
 	github.com/looprig/mcp v0.7.1
 	github.com/looprig/natsstore v0.5.1
+	github.com/looprig/pgstore v0.2.0
+	github.com/looprig/s3store v0.2.0
 	github.com/looprig/sandbox v0.9.0
 	github.com/looprig/secrets v0.2.0
 	github.com/looprig/sessionstore v0.13.0
-	github.com/looprig/storage v0.6.0
+	github.com/looprig/storage v0.6.1
 	k8s.io/client-go v0.37.0
 )
 
@@ -34,6 +40,22 @@ require (
 	github.com/FZambia/eagle v0.2.0 // indirect
 	github.com/anthropics/anthropic-sdk-go v1.62.0 // indirect
 	github.com/antithesishq/antithesis-sdk-go v0.7.2 // indirect
+	github.com/aws/aws-sdk-go-v2/aws/protocol/eventstream v1.7.20 // indirect
+	github.com/aws/aws-sdk-go-v2/credentials v1.20.2 // indirect
+	github.com/aws/aws-sdk-go-v2/feature/ec2/imds v1.19.1 // indirect
+	github.com/aws/aws-sdk-go-v2/feature/s3/transfermanager v0.4.2 // indirect
+	github.com/aws/aws-sdk-go-v2/internal/configsources v1.5.1 // indirect
+	github.com/aws/aws-sdk-go-v2/internal/endpoints/v2 v2.8.1 // indirect
+	github.com/aws/aws-sdk-go-v2/internal/v4a v1.5.1 // indirect
+	github.com/aws/aws-sdk-go-v2/service/internal/accept-encoding v1.13.19 // indirect
+	github.com/aws/aws-sdk-go-v2/service/internal/checksum v1.11.1 // indirect
+	github.com/aws/aws-sdk-go-v2/service/internal/presigned-url v1.14.1 // indirect
+	github.com/aws/aws-sdk-go-v2/service/internal/s3shared v1.20.1 // indirect
+	github.com/aws/aws-sdk-go-v2/service/signin v1.8.0 // indirect
+	github.com/aws/aws-sdk-go-v2/service/sso v1.36.0 // indirect
+	github.com/aws/aws-sdk-go-v2/service/ssooidc v1.41.0 // indirect
+	github.com/aws/aws-sdk-go-v2/service/sts v1.48.0 // indirect
+	github.com/aws/smithy-go v1.28.1 // indirect
 	github.com/bahlo/generic-list-go v0.2.0 // indirect
 	github.com/beorn7/perks v1.0.1 // indirect
 	github.com/buger/jsonparser v1.6.1 // indirect
@@ -77,6 +99,9 @@ require (
 	github.com/gookit/color v1.6.1 // indirect
 	github.com/gorilla/websocket v1.5.4-0.20250319132907-e064f32e3674 // indirect
 	github.com/invopop/jsonschema v0.14.0 // indirect
+	github.com/jackc/pgpassfile v1.0.0 // indirect
+	github.com/jackc/pgservicefile v0.0.0-20240606120523-5a60cdf6a761 // indirect
+	github.com/jackc/puddle/v2 v2.2.2 // indirect
 	github.com/josharian/intern v1.0.0 // indirect
 	github.com/jpillora/backoff v1.0.0 // indirect
 	github.com/json-iterator/go v1.1.12 // indirect

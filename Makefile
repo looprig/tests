@@ -1,4 +1,4 @@
-.PHONY: test live-network sessionwire-goldens fmt fmt-check vet staticcheck lint vuln secure dependency-boundary root-layout check mod-check release-check
+.PHONY: cloud cloud-bouncer test live-network sessionwire-goldens fmt fmt-check vet staticcheck lint vuln secure dependency-boundary root-layout check mod-check release-check
 
 # Module's own package dirs. This module is a single package at its root, but
 # go list is used (rather than hardcoding ".") to match the go-list idiom the
@@ -73,6 +73,20 @@ mod-check:
 	@sh scripts/check-release-modfile.sh go.mod
 	@test -z "$$(GOWORK=off go mod tidy -diff)" || (echo 'go.mod is not tidy' >&2; GOWORK=off go mod tidy -diff; exit 1)
 	GOWORK=off go mod verify
+
+# The P3.1 cloud composition lane (runbook 07): released pgstore + s3store
+# under a real Factory and pooled Hosts, against LOCAL digest-pinned
+# PostgreSQL, PgBouncer and MinIO containers that scripts/cloud-up.sh starts
+# and scripts/cloud-down.sh removes on exit. Needs Docker; never contacts a
+# cloud. `cloud-bouncer` routes every pgstore pool through PgBouncer in
+# transaction mode.
+CLOUD_TEST = GOWORK=off go test -count=1 -tags 'integration cloud' -race -timeout 40m -run '^(TestCloud|TestSessionStore)' .
+
+cloud:
+	@env_file=$$(sh scripts/cloud-up.sh) && trap 'sh scripts/cloud-down.sh' EXIT && . "$$env_file" && $(CLOUD_TEST)
+
+cloud-bouncer:
+	@env_file=$$(sh scripts/cloud-up.sh) && trap 'sh scripts/cloud-down.sh' EXIT && . "$$env_file" && LOOPRIG_CLOUD_PG_VIA=bouncer $(CLOUD_TEST)
 
 release-check:
 	$(MAKE) mod-check

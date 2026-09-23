@@ -937,6 +937,26 @@ func (s *pooledSession) ReleaseResidency(ctx context.Context) error {
 	return s.controller.(session.Releaser).ReleaseResidency(ctx)
 }
 
+// PersistenceFaulted, PersistenceFault and AbandonResidency are host
+// v0.8.0's optional department.PersistenceFaults capability, forwarded to
+// harness v0.38.0's session.PersistenceFaultReporter and
+// session.ResidencyAbandoner. Without them Host cannot see a latched journal
+// fault and keeps a dead runtime resident, which wedges the session's whole
+// command stream after a storage outage (the P3.1 cloud lane's D3).
+func (s *pooledSession) PersistenceFaulted() <-chan struct{} {
+	return s.controller.(session.PersistenceFaultReporter).PersistenceFaulted()
+}
+
+func (s *pooledSession) PersistenceFault() error {
+	return s.controller.(session.PersistenceFaultReporter).PersistenceFault()
+}
+
+func (s *pooledSession) AbandonResidency(ctx context.Context) error {
+	return s.controller.(session.ResidencyAbandoner).AbandonResidency(ctx)
+}
+
+var _ department.PersistenceFaults = (*pooledSession)(nil)
+
 func (s *pooledSession) LeaseEpoch() (uint64, bool) {
 	return s.controller.(session.LeaseEpochReporter).LeaseEpoch()
 }
@@ -1312,8 +1332,12 @@ type PooledWorld struct {
 	// Nil otherwise.
 	ProductJournal *sessionstore.Store
 
-	tenants []sessionwire.TenantID
-	gated   bool
+	tenants  []sessionwire.TenantID
+	gated    bool
+	hostLogs io.Writer
+	// journalOptions are appended after the tenant to every harness journal
+	// Open, a Mortal Host's own included. See PooledWorldOptions.JournalOptions.
+	journalOptions []harnessstore.Option
 
 	// journalBackends are the backends under Journals, kept so a Host whose
 	// process can die opens its OWN harness store over a view of the same
@@ -1368,6 +1392,15 @@ type PooledWorldOptions struct {
 	// backend. A missing tenant takes a fresh memstore. The kind lane uses it
 	// to put the journal on a provider that outlives a Host Pod.
 	JournalBackends map[sessionwire.TenantID]*storage.Composite
+	// JournalOptions are appended to every harness journal's Open, after the
+	// tenant -- a Mortal Host's own store included, so a Host that reopens the
+	// journal does so with the same options. The cloud lane uses it to lower
+	// the offload threshold so the runtime's own records reach the Blobs
+	// provider.
+	JournalOptions []harnessstore.Option
+	// HostLogs, when set, receives every composed Host's operator
+	// diagnostics as JSON lines. Nil leaves Host's logger unset.
+	HostLogs io.Writer
 }
 
 // NewPooledWorld opens the shared durable plane and one harness journal per
@@ -1396,6 +1429,8 @@ func NewPooledWorld(tb TB, ctx context.Context, options PooledWorldOptions) *Poo
 		Tails:           NewPooledTails(),
 		tenants:         tenants,
 		gated:           options.WithAskTool,
+		hostLogs:        options.HostLogs,
+		journalOptions:  options.JournalOptions,
 	}
 	if options.WithAskTool {
 		world.AskTool = &PooledAskTool{}
@@ -1411,7 +1446,7 @@ func NewPooledWorld(tb TB, ctx context.Context, options PooledWorldOptions) *Poo
 			journalBackend = memstore.New()
 		}
 		world.journalBackends[tenant] = journalBackend
-		journalStore, err := harnessstore.Open(journalBackend, harnessstore.WithTenant(tenant))
+		journalStore, err := harnessstore.Open(journalBackend, world.journalOpenOptions(tenant)...)
 		if err != nil {
 			tb.Fatalf("orchestrationtest: opening the harness journal for %q: %v", tenant, err)
 			return nil
@@ -1463,6 +1498,20 @@ func NewPooledWorld(tb TB, ctx context.Context, options PooledWorldOptions) *Poo
 		})
 	}
 	return world
+}
+
+// journalOpenOptions are the options every harness journal for tenant is
+// opened with: the tenant, then the world's JournalOptions.
+func (w *PooledWorld) journalOpenOptions(tenant sessionwire.TenantID) []harnessstore.Option {
+	return append([]harnessstore.Option{harnessstore.WithTenant(tenant)}, w.journalOptions...)
+}
+
+// hostLogger is the Host operator logger the world was configured with, or nil.
+func (w *PooledWorld) hostLogger() *slog.Logger {
+	if w.hostLogs == nil {
+		return nil
+	}
+	return slog.New(slog.NewJSONHandler(w.hostLogs, nil))
 }
 
 // PooledModel is the model every pooled loop runs on.
@@ -1745,7 +1794,7 @@ func (world *PooledWorld) hostComposition(tb TB, id sessionwire.HostID, generati
 			// A MORTAL Host opens its own harness store over a view of the
 			// shared journal bytes, so its death can lapse the journal lease
 			// its runtime holds -- which is what a dead process's lease does.
-			opened, err := harnessstore.Open(process.View(tb, PlaneJournal, world.journalBackends[tenant]), harnessstore.WithTenant(tenant))
+			opened, err := harnessstore.Open(process.View(tb, PlaneJournal, world.journalBackends[tenant]), world.journalOpenOptions(tenant)...)
 			if err != nil {
 				tb.Fatalf("orchestrationtest: opening %s's harness journal for %q: %v", id, tenant, err)
 				return host.Composition{}, nil, nil
@@ -1821,6 +1870,7 @@ func (world *PooledWorld) hostComposition(tb TB, id sessionwire.HostID, generati
 				}
 				return []department.Registration{{AgentID: PooledAgent, Target: target}}, nil
 			}),
+			Logger:       world.hostLogger(),
 			Checkpointer: checkpointer,
 			Auth:         pooledAuth{},
 			Workspaces:   workspaces,
