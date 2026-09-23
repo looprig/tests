@@ -703,9 +703,13 @@ func TestDrainingAPooledHostParkedAtAGateIsCrashEquivalentAndBounded(t *testing.
 			return turnsCarrying(t, world, tenant, runtimeID, "my answer is") == 1 &&
 				orchestrationtest.CountJournalEvents[event.TurnDone](t, world, tenant, runtimeID) >= 2
 		})
-		// THE DOCUMENTED BEHAVIOUR (harness ask_user after failover is still
-		// booked): restore closes the open ask_user gate as unavailable and
-		// interrupts its turn, so the tool never receives an answer.
+		// THE NON-REPLAY-SAFE HALF, deliberately kept: this world's ask tool
+		// does not declare tool.UserInputReplaySafe, and for such a tool
+		// harness v0.39.0 keeps the old closure -- restore closes the open
+		// ask_user gate restore_unavailable and interrupts its turn, so the
+		// tool never receives an answer. The replay-safe half, where the gate
+		// survives and the answer reaches the tool, is
+		// TestAReplaySafeAskUserGateSurvivesACrashAndADrainAndTheAnswerReachesTheTool.
 		resolved := orchestrationtest.JournalEvents[event.GateResolved](t, world, tenant, runtimeID)
 		if len(resolved) != 1 || resolved[0].Reason != gate.CloseRestoreUnavailable {
 			t.Fatalf("the journal resolved gates %+v, want the one ask_user gate closed restore_unavailable", resolved)
