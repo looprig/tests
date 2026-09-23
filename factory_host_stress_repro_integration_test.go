@@ -125,7 +125,7 @@ func TestAViewerOnAnotherReplicaIsToldOfEveryRecordAcrossAWarmRelease(t *testing
 			return world.CommandState(ctx, tenant, session, command) == sessionstore.InboxStateApplied
 		})
 		time.Sleep(500 * time.Millisecond)
-		if _, err := orchestrationtest.PooledCoveredThroughFrom(viewer.Records(), start); err != nil {
+		if _, err := world.CoveredThrough(t, ctx, tenant, session, viewer.Records(), start); err != nil {
 			t.Fatalf("cycle %d: the browser that joined at %d saw %v\n  browser: %v\n  tail: %v",
 				cycle, start, err, viewer.Arrivals(), world.Tails.Timeline(tenant, session))
 		}

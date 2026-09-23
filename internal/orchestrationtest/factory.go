@@ -282,6 +282,20 @@ func NewFactoryFixtureWithSeams(tb TB, store *StoreFixture, clock *Clock, seams 
 	if seams.PendingCommands != nil {
 		options = append(options, factory.WithPendingCommands(seams.PendingCommands))
 	}
+	if seams.SessionBindingID != "" || seams.SessionBindingVersion != "" || seams.PendingCommands != nil {
+		// factory v0.9.0 REFUSES a replica that creates or places Host
+		// sessions with no journal resolver: a Host session's journal is its
+		// runtime's, and this fixture's runtime journal is store.Journal's.
+		runtime := store.RuntimeJournal
+		options = append(options, factory.WithJournalResolver(journalResolver(
+			seams.SessionBindingID, seams.SessionBindingVersion,
+			func(tenant sessionwire.TenantID) factory.JournalReader {
+				if tenant != store.Tenant || runtime == nil {
+					return nil
+				}
+				return runtime
+			})))
+	}
 
 	server, err := factory.New(options...)
 	if err != nil {

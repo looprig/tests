@@ -350,8 +350,14 @@ func assertHoldsExactly(t *testing.T, who string, got, want []orchestrationtest.
 // after the sequence after.
 func assertStoreJournalHolds(t *testing.T, ctx context.Context, world *orchestrationtest.PooledWorld, tenant sessionwire.TenantID, session sessionwire.SessionID, after uint64, want []orchestrationtest.PooledCommitted) {
 	t.Helper()
+	// The product journal is keyed by the session's RUNTIME id -- the id
+	// Factory's journal resolver reads it under -- never by the public one.
+	runtime := world.Tails.RuntimeSessionID(tenant, session)
+	if runtime == "" {
+		t.Fatalf("%s/%s never launched a runtime", tenant, session)
+	}
 	page, err := world.ProductJournal.ReadPublicJournal(ctx, sessionstore.ReadPublicJournalRequest{
-		TenantID: tenant, SessionID: session, FromSeq: after + 1,
+		TenantID: tenant, SessionID: runtime, FromSeq: after + 1,
 	})
 	if err != nil {
 		t.Fatalf("reading the store's journal after %d: %v", after, err)

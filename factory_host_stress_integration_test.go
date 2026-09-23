@@ -1609,6 +1609,18 @@ func (s *stress) verifyViewers() {
 	epochs := append([]*stressEpoch(nil), s.epochs...)
 	s.epochMu.Unlock()
 
+	// The public positions of each session's runtime journal, read through
+	// the resolver's own read: a skip over private-only positions is not a gap.
+	public := map[sessionwire.SessionID][]uint64{}
+	for _, session := range s.sessions {
+		session.mu.Lock()
+		created := session.created
+		session.mu.Unlock()
+		if created {
+			public[session.id] = s.world.PublicJournalSeqs(s.t, s.ctx, session.tenant, session.id)
+		}
+	}
+
 	// V1 and V2 over EVERY connection any viewer ever had.
 	gaps := 0
 	for _, epoch := range epochs {
@@ -1617,7 +1629,7 @@ func (s *stress) verifyViewers() {
 			s.t.Errorf("V1: a viewer of %s/%s via %s received records naming another tenant or session: %v",
 				epoch.session.tenant, epoch.session.id, epoch.replica.name, strays)
 		}
-		if _, err := orchestrationtest.PooledCoveredThroughFrom(records, epoch.start); err != nil {
+		if _, err := orchestrationtest.PooledCoveredThroughPublic(records, epoch.start, public[epoch.session.id]); err != nil {
 			gaps++
 			if gaps <= 10 {
 				s.t.Errorf("V2: a viewer of %s via %s (joined at %d) saw a silent gap: %v in %v",
@@ -1654,10 +1666,28 @@ func (s *stress) verifyViewers() {
 	// journal's last event, of which the viewer was told by a tip hint. See
 	// observeTrailing.
 	final := s.finalEpochs()
+	// The target is the RUNTIME JOURNAL's last public position, read through
+	// the same resolver read Factory uses -- not the highest position the
+	// Hosts relayed, which a record committed after the tail stopped (the
+	// trailing release) sits above. before is the public position in front of
+	// the last one: where a viewer one release short stands.
 	targets := map[sessionwire.SessionID]uint64{}
+	before := map[sessionwire.SessionID]uint64{}
 	releasedLast := map[sessionwire.SessionID]bool{}
 	for _, session := range s.sessions {
-		targets[session.id] = s.world.Tails.Tip(session.tenant, session.id)
+		session.mu.Lock()
+		created := session.created
+		session.mu.Unlock()
+		if !created {
+			continue
+		}
+		seqs := s.world.PublicJournalSeqs(s.t, s.ctx, session.tenant, session.id)
+		if n := len(seqs); n > 0 {
+			targets[session.id] = seqs[n-1]
+			if n > 1 {
+				before[session.id] = seqs[n-2]
+			}
+		}
 		releasedLast[session.id] = s.lastEventIsRelease(session)
 	}
 	deadline := time.Now().Add(60 * time.Second)
@@ -1666,11 +1696,11 @@ func (s *stress) verifyViewers() {
 		trailing, hinted := 0, 0
 		for _, epoch := range final {
 			records := epoch.viewer.Records()
-			covered, err := orchestrationtest.PooledCoveredThroughFrom(records, epoch.start)
+			covered, err := orchestrationtest.PooledCoveredThroughPublic(records, epoch.start, public[epoch.session.id])
 			target := targets[epoch.session.id]
 			switch {
 			case err != nil || covered >= target:
-			case covered+1 == target && releasedLast[epoch.session.id]:
+			case covered >= before[epoch.session.id] && releasedLast[epoch.session.id]:
 				trailing++
 				if stressHintedThrough(records) >= target {
 					hinted++

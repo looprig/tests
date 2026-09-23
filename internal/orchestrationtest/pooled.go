@@ -102,8 +102,10 @@ const (
 	PooledOrigin = "https://app.orchestrationtest.invalid"
 
 	// PooledPublicationsPerInput is how many EnduringPublications the product
-	// runtime commits for each applied create or input. It is 3 rather than 1
-	// so a case can tell "the stream continued" from "one more record arrived".
+	// runtime commits for each applied create or input IN A DurableTail WORLD.
+	// It is 3 rather than 1 so a case can tell "the stream continued" from "one
+	// more record arrived". In the default world the stream is harness's own
+	// and its count is whatever the turn committed.
 	PooledPublicationsPerInput = 3
 )
 
@@ -505,9 +507,9 @@ type pooledTailKey struct {
 	session sessionwire.SessionID
 }
 
-// PooledTails is the product runtime's committed publication stream, one
-// sequence per session, shared across Hosts so a restored session CONTINUES its
-// numbering rather than starting over.
+// PooledTails is the product runtime's committed publication stream, per
+// session, shared across Hosts so a restored session CONTINUES its numbering
+// rather than starting over.
 //
 // IT FANS OUT TO EVERY LIVE SUBSCRIBER, which is not an optimisation: Host
 // calls SubscribeCommitted once per live link, and it re-subscribes after a
@@ -517,9 +519,32 @@ type pooledTailKey struct {
 // measured here, and the same defect host v0.4.0 fixed in its own live-link
 // fixture (regate dd9b479). The released adapter fans out; so does this.
 //
-// A Host relays what its runtime's SubscribeCommitted yields. Harness's own
-// event stream is not a sessionwire publication stream, so the product supplies
-// one -- which is exactly what a real product does.
+// # Where the stream comes from, and why it must be the journal Factory reads
+//
+// factory v0.9.0 reads a Host session's journal -- /journal, the journal_tip
+// hint, and the tip every live-tail repair resets to -- from the RUNTIME
+// journal its WithJournalResolver answers, under the binding's
+// RuntimeSessionID. Every sequence this stream publishes must therefore be a
+// position in THAT journal, or a repair resets a viewer to a tip that does not
+// describe what it was sent. There are two worlds, and each keeps the two in
+// step by construction:
+//
+//   - The default world RELAYS the harness session's own committed public
+//     events (session.CommittedPublicEventProvider), exactly as host's
+//     reference adapter does: each publication carries the JournalSeq and
+//     CoveredThrough harness's durable append assigned, and the resolver reads
+//     that same harness journal (OpenRuntimeJournal). Nothing in the kit
+//     numbers anything.
+//   - A DurableTail world commits the product's own events to its OWN real
+//     SessionStore journal (PooledWorld.ProductJournal), keyed by the
+//     session's RuntimeSessionID, and the resolver answers that journal. See
+//     PooledWorldOptions.DurableTail.
+//
+// The kit used to synthesise a stream numbered 1..n and have its SessionReader
+// report that number as the journal tip over an empty page. factory v0.9.0's
+// review found the substitution hid the very defect v0.9.0 fixes -- Factory
+// reading every Host session's journal at tip 0 -- so it is gone, and so is the
+// Hint that fed it.
 type PooledTails struct {
 	mu        sync.Mutex
 	committed map[pooledTailKey]uint64
@@ -529,9 +554,13 @@ type PooledTails struct {
 	notes     []string
 
 	// durable is set in a DurableTail world: every publication is first
-	// appended to SessionStore's own public journal and carries the sequence
-	// the STORE assigned. See PooledWorldOptions.DurableTail.
-	durable  *sessionstore.Store
+	// appended to the product's own SessionStore journal and carries the
+	// sequence the STORE assigned. See PooledWorldOptions.DurableTail.
+	durable *sessionstore.Store
+	// runtimes maps a public session to the RuntimeSessionID its runtime was
+	// launched under -- the id the product journal is keyed by, and the one
+	// Factory's resolver reads it under.
+	runtimes map[pooledTailKey]sessionwire.SessionID
 	writers  map[pooledTailKey]*sessionstore.JournalWriter
 	ordinals map[pooledTailKey]uint64
 	history  map[pooledTailKey][]PooledCommitted
@@ -585,6 +614,7 @@ func NewPooledTails() *PooledTails {
 	return &PooledTails{
 		committed: map[pooledTailKey]uint64{},
 		current:   map[pooledTailKey][]chan sessionwire.EnduringPublication{},
+		runtimes:  map[pooledTailKey]sessionwire.SessionID{},
 	}
 }
 
@@ -616,53 +646,89 @@ func (t *PooledTails) Dropped() int {
 	return t.dropped
 }
 
-// Emit commits n publications for one session.
-func (t *PooledTails) Emit(key pooledTailKey, n int) {
+// bindRuntime records the RuntimeSessionID a session's runtime launched under.
+func (t *PooledTails) bindRuntime(key pooledTailKey, runtime sessionwire.SessionID) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
-	for range n {
-		var publication sessionwire.EnduringPublication
-		if t.durable != nil {
-			committed, ok := t.commitDurable(key)
-			if !ok {
-				// Nothing was committed, so nothing is published: a live
-				// record the journal does not hold would be exactly the lie
-				// this mode exists to rule out. The failure is reported by
-				// DurableFailures.
-				continue
-			}
-			publication = committed
-		} else {
-			t.committed[key]++
-			seq := t.committed[key]
-			publication = sessionwire.EnduringPublication{
-				TenantID:       key.tenant,
-				SessionID:      key.session,
-				EventID:        sessionwire.EventID(fmt.Sprintf("event-%s-%d", key.session, seq)),
-				JournalSeq:     seq,
-				CoveredThrough: seq,
-				Body:           json.RawMessage(fmt.Sprintf(`{"tenant":%q,"seq":%d}`, key.tenant, seq)),
-			}
-		}
-		subscribers := t.current[key]
-		t.note(key, fmt.Sprintf("committed E%d to %d subscribers", publication.JournalSeq, len(subscribers)))
-		if len(subscribers) == 0 {
+	t.runtimes[key] = runtime
+}
+
+// publishLocked fans one committed publication out to every live subscriber.
+// Called with t.mu held.
+func (t *PooledTails) publishLocked(key pooledTailKey, publication sessionwire.EnduringPublication) {
+	if publication.JournalSeq > t.committed[key] {
+		t.committed[key] = publication.JournalSeq
+	}
+	subscribers := t.current[key]
+	t.note(key, fmt.Sprintf("committed E%d to %d subscribers", publication.JournalSeq, len(subscribers)))
+	if len(subscribers) == 0 {
+		t.dropped++
+		return
+	}
+	for _, ch := range subscribers {
+		select {
+		case ch <- publication:
+		default:
 			t.dropped++
-			continue
-		}
-		for _, ch := range subscribers {
-			select {
-			case ch <- publication:
-			default:
-				t.dropped++
-			}
 		}
 	}
 }
 
-// commitDurable appends the session's next product event to SessionStore's
-// public journal and returns the publication that carries it, under the
-// sequence THE STORE assigned. Called with t.mu held.
+// relay publishes one committed public event the harness runtime delivered,
+// under the sequence HARNESS'S durable append assigned. It is the default
+// world's only producer. A delivery that is not a committed publication
+// (event.Delivery.Committed) is skipped, which is host's own adapter's rule.
+func (t *PooledTails) relay(key pooledTailKey, delivery event.Delivery) {
+	if !delivery.Committed() {
+		return
+	}
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	t.publishLocked(key, sessionwire.EnduringPublication{
+		TenantID:       key.tenant,
+		SessionID:      key.session,
+		EventID:        sessionwire.EventID(delivery.EventID),
+		JournalSeq:     delivery.JournalSeq,
+		CoveredThrough: delivery.CoveredThrough,
+		Body:           json.RawMessage(delivery.PublicBody),
+	})
+}
+
+// emit commits n product events for one session in a DurableTail world.
+func (t *PooledTails) emit(key pooledTailKey, n int) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	for range n {
+		committed, ok := t.commitDurable(key)
+		if !ok {
+			// Nothing was committed, so nothing is published: a live record
+			// the journal does not hold would be exactly the lie this mode
+			// exists to rule out. The failure is reported by DurableFailures.
+			continue
+		}
+		t.publishLocked(key, committed)
+	}
+}
+
+// Commit makes the product commit ONE event for a session in a DurableTail
+// world: appended to the product journal first, then published. It is a
+// DurableTail-only operation -- in the default world the stream is harness's
+// own and nothing in the kit may add to it -- and it fails the world's
+// DurableFailures otherwise.
+func (t *PooledTails) Commit(tenant sessionwire.TenantID, s sessionwire.SessionID) {
+	key := pooledTailKey{tenant, s}
+	if t.productJournal() == nil {
+		t.mu.Lock()
+		t.failures = append(t.failures, fmt.Errorf("orchestrationtest: Commit(%s/%s) outside a DurableTail world", tenant, s))
+		t.mu.Unlock()
+		return
+	}
+	t.emit(key, 1)
+}
+
+// commitDurable appends the session's next product event to the product
+// journal, under the session's RUNTIME id, and returns the publication that
+// carries it under the sequence THE STORE assigned. Called with t.mu held.
 //
 // The order is the product's obligation and the whole point: an event is
 // durable BEFORE it is published, so a client that misses the live record can
@@ -675,9 +741,14 @@ func (t *PooledTails) commitDurable(key pooledTailKey) (sessionwire.EnduringPubl
 	defer cancel()
 	writer := t.writers[key]
 	if writer == nil {
-		opened, err := t.durable.OpenJournal(ctx, sessionstore.OpenJournalRequest{TenantID: key.tenant, SessionID: key.session})
+		runtime := t.runtimes[key]
+		if runtime == "" {
+			t.failures = append(t.failures, fmt.Errorf("the product journal for %s/%s: no runtime has launched, so there is no RuntimeSessionID to key it by", key.tenant, key.session))
+			return sessionwire.EnduringPublication{}, false
+		}
+		opened, err := t.durable.OpenJournal(ctx, sessionstore.OpenJournalRequest{TenantID: key.tenant, SessionID: runtime})
 		if err != nil {
-			t.failures = append(t.failures, fmt.Errorf("opening the product journal for %s/%s: %w", key.tenant, key.session, err))
+			t.failures = append(t.failures, fmt.Errorf("opening the product journal for %s/%s (runtime %s): %w", key.tenant, key.session, runtime, err))
 			return sessionwire.EnduringPublication{}, false
 		}
 		writer = opened
@@ -698,7 +769,6 @@ func (t *PooledTails) commitDurable(key pooledTailKey) (sessionwire.EnduringPubl
 		return sessionwire.EnduringPublication{}, false
 	}
 	t.ordinals[key] = ordinal
-	t.committed[key] = seq
 	t.history[key] = append(t.history[key], PooledCommitted{EventID: eventID, JournalSeq: seq})
 	return sessionwire.EnduringPublication{
 		TenantID:       key.tenant,
@@ -714,6 +784,14 @@ func (t *PooledTails) productJournal() *sessionstore.Store {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	return t.durable
+}
+
+// RuntimeSessionID reports the runtime id a session's runtime launched under,
+// or "" before its first launch.
+func (t *PooledTails) RuntimeSessionID(tenant sessionwire.TenantID, s sessionwire.SessionID) sessionwire.SessionID {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	return t.runtimes[pooledTailKey{tenant, s}]
 }
 
 // makeDurable switches this tail set to DurableTail mode over store.
@@ -760,33 +838,11 @@ func (t *PooledTails) DurableFailures() []error {
 	return append([]error(nil), t.failures...)
 }
 
-// Hint commits ONE publication for a session whose tail is driven by the
-// harness session's own committed events.
-//
-// It exists for a property of host v0.4.0 that is not obvious and cost a day to
-// find: HOST'S GATE PUBLISHER PASSES ONLY ON A HINT FROM THE RUNTIME'S
-// COMMITTED PUBLICATION STREAM. internal/gates' run loop subscribes to that
-// stream and folds the journal after every delivery; its only timer is a retry
-// for a FAILED subscription. So a runtime that opens a gate and then commits no
-// publication leaves the gate journaled, unprojected and invisible to Factory
-// for as long as the session stays quiet.
-//
-// A real product never notices, because its committed stream IS its session's
-// event stream and a gate opening is an event on it. This kit's stream is
-// synthetic -- three publications per applied command -- so the gated world
-// bridges the harness stream into hints explicitly. See pooledSession.
-//
-// In a BRIDGED world this is the ONLY thing that commits a publication:
-// ApplyCommand emits nothing, so the product's stream is one publication per
-// committed harness event, which is what a real product's stream is. In an
-// UNBRIDGED world nothing calls this and the stream is three publications per
-// applied command, which keeps a viewer's sequence numbers deterministic for
-// the cases that assert on them.
-func (t *PooledTails) Hint(tenant sessionwire.TenantID, s sessionwire.SessionID) {
-	t.Emit(pooledTailKey{tenant, s}, 1)
-}
-
-// Tip reports the highest committed sequence for one session.
+// Tip reports the highest sequence this stream has published for one session.
+// In the default world that is the highest harness journal position RELAYED,
+// which can sit below the journal's own tip: a record harness commits after a
+// runtime stops relaying (SessionResidencyReleased at a warm release) or a
+// private one never travels live.
 func (t *PooledTails) Tip(tenant sessionwire.TenantID, s sessionwire.SessionID) uint64 {
 	t.mu.Lock()
 	defer t.mu.Unlock()
@@ -842,8 +898,9 @@ type PooledRig struct {
 	rigs     map[sessionwire.TenantID]*rig.Rig
 	recorder *pooledRecorder
 	tails    *PooledTails
-	// bridge forwards the harness session's own committed public events into
-	// the product's tail as hints. See PooledTails.Hint.
+	// bridge relays the harness session's own committed public events as the
+	// product's stream. It is set in every world but a DurableTail one, whose
+	// stream is the product journal instead. See PooledTails.
 	bridge bool
 
 	mu            sync.Mutex
@@ -922,6 +979,9 @@ func (p *PooledRig) RestoreSession(ctx context.Context, id uuid.UUID, req depart
 // starting the committed-event bridge when this world needs one.
 func (p *PooledRig) adapt(controller session.SessionController, key pooledTailKey, workspaceRoot string) department.RigSession {
 	adapted := &pooledSession{controller: controller, recorder: p.recorder, tails: p.tails, key: key, rig: p, bridged: p.bridge}
+	// The runtime's id IS the binding's RuntimeSessionID: department refuses
+	// a launch whose ID() is not the one it requested.
+	p.tails.bindRuntime(key, sessionwire.SessionID(controller.SessionID().String()))
 	if p.bridge {
 		adapted.startBridge()
 	}
@@ -959,19 +1019,20 @@ type pooledSession struct {
 	rig        *PooledRig
 
 	// bridged reports which of the two tail disciplines this session runs
-	// under. They are exclusive, and mixing them would interleave two
-	// sequences into one stream.
+	// under: the harness runtime's own committed stream, or (DurableTail) the
+	// product journal. They are exclusive -- mixing them would interleave two
+	// journals' sequences into one stream.
 	bridged bool
 }
 
-// startBridge forwards every committed public event the harness session
-// produces into the product's tail as a hint.
+// startBridge relays every committed public event the harness session
+// produces as the product's stream, under harness's own JournalSeq -- what
+// host's reference adapter (internal/harnessadapter) publishes, and a
+// position in the very journal Factory's resolver reads.
 //
-// It is what makes a GATE visible. Host's gate publisher folds the journal only
-// when the runtime's committed stream delivers, so without this a gate opens,
-// is journaled, and is never projected -- measured. A real product gets this
-// for free because its committed stream is the session's own event stream; this
-// kit's is synthetic, so the bridge is explicit.
+// It is also what makes a GATE visible. Host's gate publisher folds the journal
+// only when the runtime's committed stream delivers, so without it a gate
+// opens, is journaled, and is never projected -- measured.
 //
 // A session whose persistence cannot report committed bytes reports the
 // capability as absent, and the bridge is simply not started: that is the
@@ -1003,8 +1064,7 @@ func (s *pooledSession) startBridge() {
 	go func() {
 		defer func() { _ = subscription.Close() }()
 		for delivery := range subscription.Events() {
-			s.tails.bridgeNote(fmt.Sprintf("delivery %T", delivery))
-			s.tails.Hint(s.key.tenant, s.key.session)
+			s.tails.relay(s.key, delivery)
 		}
 		s.tails.bridgeNote("bridge closed")
 	}()
@@ -1182,7 +1242,7 @@ func (s *pooledSession) ApplyCommand(ctx context.Context, cmd department.Runtime
 		return err
 	}
 	if !s.bridged && len(admitted.Blocks) > 0 {
-		s.tails.Emit(s.key, PooledPublicationsPerInput)
+		s.tails.emit(s.key, PooledPublicationsPerInput)
 	}
 	s.recorder.add(cmd)
 	return nil
@@ -1413,9 +1473,15 @@ type PooledWorld struct {
 
 	// ProductJournal is the product's own event journal in a DurableTail
 	// world: a real SessionStore every committed publication is appended to
-	// before it is published, and the store Factory's journal route reads.
-	// Nil otherwise.
+	// before it is published, keyed by the session's RuntimeSessionID, and
+	// the journal Factory's resolver answers. Nil otherwise.
 	ProductJournal *sessionstore.Store
+
+	// RuntimeJournals is, per tenant, the READ of the harness runtime journal
+	// the Hosts write (OpenRuntimeJournal over the tenant's journal backend):
+	// what every Factory's WithJournalResolver answers outside a DurableTail
+	// world.
+	RuntimeJournals map[sessionwire.TenantID]*sessionstore.Store
 
 	tenants  []sessionwire.TenantID
 	gated    bool
@@ -1510,6 +1576,8 @@ func NewPooledWorld(tb TB, ctx context.Context, options PooledWorldOptions) *Poo
 		Journals: map[sessionwire.TenantID]*harnessstore.Store{},
 		LLM:      NewPooledLLM(),
 
+		RuntimeJournals: map[sessionwire.TenantID]*sessionstore.Store{},
+
 		journalBackends: map[sessionwire.TenantID]*storage.Composite{},
 		Tails:           NewPooledTails(),
 		tenants:         tenants,
@@ -1537,6 +1605,7 @@ func NewPooledWorld(tb TB, ctx context.Context, options PooledWorldOptions) *Poo
 			return nil
 		}
 		world.Journals[tenant] = journalStore
+		world.RuntimeJournals[tenant] = OpenRuntimeJournal(tb, ctx, journalBackend, tenant)
 	}
 	store, err := sessionstore.Open(ctx, world.Backend)
 	if err != nil {
@@ -1551,6 +1620,13 @@ func NewPooledWorld(tb TB, ctx context.Context, options PooledWorldOptions) *Poo
 			tb.Errorf("orchestrationtest: closing the pooled store: %v", err)
 		}
 	})
+	if options.DurableTail && options.WithAskTool {
+		// A gate is projected only when the runtime's committed stream
+		// delivers, and a DurableTail world's stream is the product journal,
+		// not harness's: the two cannot be mixed into one stream.
+		tb.Fatalf("orchestrationtest: DurableTail and WithAskTool cannot be combined")
+		return nil
+	}
 	if options.DurableTail {
 		// The product journal is its OWN SessionStore, over its own backend.
 		// It cannot be world.Store: a session Factory created is bound to the
@@ -1558,7 +1634,7 @@ func NewPooledWorld(tb TB, ctx context.Context, options PooledWorldOptions) *Poo
 		// writer on it (catalog conflict (binding.protocol_mode)) -- measured.
 		// A real product's event journal is likewise its own keyspace (harness
 		// keeps its journal apart for the same reason), and Factory reaches it
-		// through the one seam it offers for this, WithSessionReader.
+		// through WithJournalResolver, under the RuntimeSessionID.
 		product, err := sessionstore.Open(ctx, memstore.New())
 		if err != nil {
 			tb.Fatalf("orchestrationtest: opening the product journal store: %v", err)
@@ -1900,7 +1976,7 @@ func (world *PooledWorld) hostComposition(tb TB, id sessionwire.HostID, generati
 		journals[host.EvidenceKey{TenantID: tenant, StorageBindingID: PooledBinding}] =
 			PooledEvidence{Store: journal}
 	}
-	product := &PooledRig{rigs: rigs, recorder: recorder, tails: world.Tails, bridge: world.gated, live: map[pooledTailKey]*pooledSession{}}
+	product := &PooledRig{rigs: rigs, recorder: recorder, tails: world.Tails, bridge: world.ProductJournal == nil, live: map[pooledTailKey]*pooledSession{}}
 	var checkpointer host.Checkpointer = pooledCheckpointer{rig: product, workspaces: world.workspaces != nil}
 	if cfg.WrapCheckpointer != nil {
 		checkpointer = cfg.WrapCheckpointer(checkpointer)
@@ -2112,33 +2188,21 @@ func (pooledAuthorizer) AuthorizeSubscribe(context.Context, identity.Principal, 
 
 func (pooledAuthorizer) AuthorizeServiceSweep(context.Context, identity.Principal) error { return nil }
 
-// pooledTipReader is the Store, except that a session's journal tip is the
-// product runtime's committed sequence.
-//
-// It exists because the harness journal is not the SessionStore journal: a
-// session.reset Factory builds must name a tip at or above what it already
-// delivered, and SessionStore holds no record of the product's own stream. It
-// is an adapter over the real Store, not a replacement for it.
-type pooledTipReader struct {
-	*sessionstore.Store
-	tails *PooledTails
-}
-
-func (r pooledTipReader) ReadPublicJournal(ctx context.Context, req sessionstore.ReadPublicJournalRequest) (sessionwire.JournalPage, error) {
-	if product := r.tails.productJournal(); product != nil {
-		// In a DurableTail world the product's stream lives in its own real
-		// SessionStore journal, and that store's answer is the whole answer:
-		// nothing is substituted or cleared.
-		return product.ReadPublicJournal(ctx, req)
-	}
-	page, err := r.Store.ReadPublicJournal(ctx, req)
-	if err != nil {
-		return page, err
-	}
-	if tip := r.tails.Tip(req.TenantID, req.SessionID); tip > page.CapturedTip {
-		page.CapturedTip, page.CoveredThrough, page.Events, page.NextCursor = tip, tip, nil, ""
-	}
-	return page, nil
+// JournalResolver is the factory.JournalResolver every Factory this world
+// starts is composed with -- factory v0.9.0 refuses one that creates or places
+// Host sessions without it. It answers the product journal in a DurableTail
+// world and the tenant's harness runtime journal otherwise, for this kit's one
+// storage binding only.
+func (world *PooledWorld) JournalResolver() factory.JournalResolver {
+	return journalResolver(PooledBinding, PooledBindingVersion, func(tenant sessionwire.TenantID) factory.JournalReader {
+		if world.ProductJournal != nil {
+			return world.ProductJournal
+		}
+		if runtime := world.RuntimeJournals[tenant]; runtime != nil {
+			return runtime
+		}
+		return nil
+	})
 }
 
 // StartPooledFactory composes, starts and serves a real Factory over the
@@ -2295,7 +2359,8 @@ func pooledFactoryOptions(tb TB, world *PooledWorld, cfg PooledFactoryConfig, pl
 	opts := []factory.Option{
 		factory.WithCredentialVerifier(pooledVerifier{}),
 		factory.WithAuthorizer(authorizer),
-		factory.WithSessionReader(pooledTipReader{Store: world.Store, tails: world.Tails}),
+		factory.WithSessionReader(world.Store),
+		factory.WithJournalResolver(world.JournalResolver()),
 		factory.WithCommands(commands),
 		factory.WithDirectory(directory),
 		factory.WithCatalog(world.Store),
@@ -2690,6 +2755,39 @@ func PooledCoveredThrough(records []string) (uint64, error) {
 // browser that came back at tip 6 received [E7 E8 E9], exactly once and in
 // order, with no reset, and the zero-anchored rule called it a gap.
 func PooledCoveredThroughFrom(records []string, start uint64) (uint64, error) {
+	return pooledCoveredThrough(records, start, func(after, before uint64) bool { return true })
+}
+
+// PooledCoveredThroughPublic is PooledCoveredThroughFrom over a stream whose
+// journal INTERLEAVES PRIVATE RECORDS with public ones -- a harness runtime
+// journal, which every default world's stream now is. public is every public
+// event's sequence in that journal, in order (PooledWorld.PublicJournalSeqs).
+//
+// A skip over positions the journal holds only private records at is not a
+// gap: nothing public was there to deliver, and factory v0.9.0 forwards such a
+// record after one bounded read. A skip over a PUBLIC position the client was
+// neither sent nor reset past is a silent gap, exactly as before.
+func PooledCoveredThroughPublic(records []string, start uint64, public []uint64) (uint64, error) {
+	return pooledCoveredThrough(records, start, func(after, before uint64) bool {
+		for _, seq := range public {
+			if seq > after && seq < before {
+				return true
+			}
+		}
+		return false
+	})
+}
+
+// CoveredThrough is PooledCoveredThroughPublic against the session's own
+// journal -- the one Factory's resolver reads.
+func (world *PooledWorld) CoveredThrough(tb TB, ctx context.Context, tenant sessionwire.TenantID, session sessionwire.SessionID, records []string, start uint64) (uint64, error) {
+	tb.Helper()
+	return PooledCoveredThroughPublic(records, start, world.PublicJournalSeqs(tb, ctx, tenant, session))
+}
+
+// pooledCoveredThrough walks records; publicBetween reports whether the
+// journal holds a public event strictly between two positions.
+func pooledCoveredThrough(records []string, start uint64, publicBetween func(after, before uint64) bool) (uint64, error) {
 	position := start
 	for _, record := range records {
 		var first, second uint64
@@ -2701,7 +2799,7 @@ func PooledCoveredThroughFrom(records []string, start uint64) (uint64, error) {
 			if first <= position {
 				continue
 			}
-			if first != position+1 {
+			if first != position+1 && publicBetween(position, first) {
 				return position, fmt.Errorf("silent gap: %s after %d", record, position)
 			}
 			position = first
@@ -2785,4 +2883,25 @@ func (a DenySessionAuthorizer) AuthorizeSubscribe(_ context.Context, _ identity.
 		return identity.ErrUnauthorized
 	}
 	return nil
+}
+
+// AwaitQuietTip waits until a session's relayed stream has moved past after and
+// then published nothing for a quiet window, and returns that tip: the highest
+// harness journal position the runtime's finished turn published live.
+//
+// It replaces the fixed "three publications per applied command" count the
+// synthetic stream had. The default world's stream is harness's own, so the
+// number of records one turn commits is harness's business; what a case may
+// hold a viewer to is the position the runtime actually reached.
+func (world *PooledWorld) AwaitQuietTip(tb TB, tenant sessionwire.TenantID, session sessionwire.SessionID, after uint64) uint64 {
+	tb.Helper()
+	const quiet = 750 * time.Millisecond
+	since, tip := time.Now(), world.Tails.Tip(tenant, session)
+	PooledWait(tb, fmt.Sprintf("%s/%s's stream moved past %d and went quiet", tenant, session, after), 60*time.Second, func() bool {
+		if now := world.Tails.Tip(tenant, session); now != tip {
+			since, tip = time.Now(), now
+		}
+		return tip > after && time.Since(since) >= quiet
+	})
+	return tip
 }

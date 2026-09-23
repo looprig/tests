@@ -690,6 +690,7 @@ spec:
             - {name: CONTROLLER_COMMIT_MARGIN, value: "{{.Margin}}"}
             - {name: CONTROLLER_HOSTLINK_TOKEN_FILE, value: /var/run/d31/controller/token}
             - {name: KIND_STORE_URL, value: "nats://nats-store:4222"}
+            - {name: KIND_JOURNAL_URL, value: "nats://nats-journal:4222"}
             - {name: KIND_FACTORY_LISTEN, value: ":8080"}
             - {name: KIND_FACTORY_ORIGIN, value: "http://127.0.0.1:{{.FactoryNode}}"}
             - {name: KIND_FACTORY_TOKEN_FILE, value: /var/run/d31/factory/token}

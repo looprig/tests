@@ -94,10 +94,9 @@ func TestFactorySubscriberDemandFindsATipAppliedElsewhere(t *testing.T) {
 	orchestrationtest.PooledWait(t, "replica B's create applied on the Host", 90*time.Second, func() bool {
 		return world.CommandState(ctx, tenant, session, "command-demand-create") == sessionstore.InboxStateApplied
 	})
-	orchestrationtest.PooledWait(t, "the Host committed the create's publications", 30*time.Second, func() bool {
-		return world.Tails.Tip(tenant, session) == orchestrationtest.PooledPublicationsPerInput
-	})
-	tip := world.Tails.Tip(tenant, session)
+	// The tip the create's turn reached in the runtime journal, as the Host
+	// relayed it -- the position replica A's hint must come to name.
+	tip := world.AwaitQuietTip(t, tenant, session, 0)
 
 	// THE BOUND IS FACTORY'S OWN COMPOSITION, restated from its inputs: the
 	// next poll is armed OwnershipPollInterval after the last one FINISHED, and

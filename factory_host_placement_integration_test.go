@@ -205,8 +205,14 @@ func TestFactoryPlacesTwoTenantsOnOnePooledHost(t *testing.T) {
 		}
 	})
 
+	// reached is the harness journal position each tenant's runtime last
+	// published live, the target every coverage wait below is held to.
+	reached := map[sessionwire.TenantID]uint64{}
 	t.Run("P2: each tenant's live output reaches only its own viewer", func(t *testing.T) {
 		for _, tenant := range tenants {
+			// The create's turn has finished before the input is sent, so the
+			// input's records are strictly above this.
+			reached[tenant] = world.AwaitQuietTip(t, tenant, sessions[tenant], 0)
 			status, body := served.Post(t, ctx, tenant, "/v1/sessions/"+string(sessions[tenant])+"/input", sessionwire.InputRequest{
 				CommandEnvelope: orchestrationtest.PooledEnvelope("input-1-" + string(tenant)),
 				SessionID:       sessions[tenant],
@@ -216,13 +222,14 @@ func TestFactoryPlacesTwoTenantsOnOnePooledHost(t *testing.T) {
 				t.Fatalf("the input for %s answered %d: %s", tenant, status, body)
 			}
 		}
-		// Six publications per session: three for the applied create and three
-		// for the applied input.
-		const throughInput = 2 * orchestrationtest.PooledPublicationsPerInput
 		for _, tenant := range tenants {
 			orchestrationtest.PooledWait(t, "the input of "+string(tenant)+" applied", 60*time.Second, func() bool {
 				return world.CommandState(ctx, tenant, sessions[tenant], sessionwire.CommandID("input-1-"+string(tenant))) == sessionstore.InboxStateApplied
 			})
+			// Through the input's turn: the position the runtime reached in
+			// its own journal, as the Host relayed it live.
+			throughInput := world.AwaitQuietTip(t, tenant, sessions[tenant], reached[tenant])
+			reached[tenant] = throughInput
 			viewer := viewers[tenant]
 			// COVERAGE, not a particular record. A client is covered through a
 			// sequence either by receiving each publication or by a
@@ -233,14 +240,14 @@ func TestFactoryPlacesTwoTenantsOnOnePooledHost(t *testing.T) {
 			// tenant's viewer was covered by [T0 ... R0/6] and the other's by
 			// [T0 T0 T0 R0/3 E4 E5 E6] in the same run.
 			orchestrationtest.PooledWait(t, string(tenant)+"'s viewer covered through "+fmt.Sprint(throughInput), 60*time.Second, func() bool {
-				through, err := orchestrationtest.PooledCoveredThrough(viewer.Records())
+				through, err := world.CoveredThrough(t, ctx, tenant, sessions[tenant], viewer.Records(), 0)
 				return err == nil && through >= throughInput
 			})
 			t.Logf("P2 %s viewer: %v", tenant, viewer.Records())
 
 			// And the absence of a SILENT gap, re-read once the wait is over.
 			// See PooledCoveredThrough.
-			through, err := orchestrationtest.PooledCoveredThrough(viewer.Records())
+			through, err := world.CoveredThrough(t, ctx, tenant, sessions[tenant], viewer.Records(), 0)
 			if err != nil || through < throughInput {
 				t.Fatalf("%s's viewer stream %v covers through %d (%v), want %d with no silent gap",
 					tenant, viewer.Records(), through, err, throughInput)
@@ -294,11 +301,14 @@ func TestFactoryPlacesTwoTenantsOnOnePooledHost(t *testing.T) {
 			}
 		}
 
-		const throughSecondInput = 3 * orchestrationtest.PooledPublicationsPerInput
 		for _, tenant := range tenants {
+			orchestrationtest.PooledWait(t, "the post-sever input of "+string(tenant)+" applied", 90*time.Second, func() bool {
+				return world.CommandState(ctx, tenant, sessions[tenant], sessionwire.CommandID("input-2-"+string(tenant))) == sessionstore.InboxStateApplied
+			})
+			throughSecondInput := world.AwaitQuietTip(t, tenant, sessions[tenant], reached[tenant])
 			viewer := viewers[tenant]
 			orchestrationtest.PooledWait(t, string(tenant)+"'s viewer covered through "+fmt.Sprint(throughSecondInput)+" after the sever", 90*time.Second, func() bool {
-				through, err := orchestrationtest.PooledCoveredThrough(viewer.Records())
+				through, err := world.CoveredThrough(t, ctx, tenant, sessions[tenant], viewer.Records(), 0)
 				return err == nil && through >= throughSecondInput
 			})
 			after := viewer.Records()[before[tenant]:]
@@ -316,7 +326,7 @@ func TestFactoryPlacesTwoTenantsOnOnePooledHost(t *testing.T) {
 			if !sawReset {
 				t.Fatalf("%s's viewer got %v after the sever, want a session.reset before the continued stream", tenant, after)
 			}
-			through, err := orchestrationtest.PooledCoveredThrough(viewer.Records())
+			through, err := world.CoveredThrough(t, ctx, tenant, sessions[tenant], viewer.Records(), 0)
 			if err != nil || through < throughSecondInput {
 				t.Fatalf("%s's viewer stream %v covers through %d (%v), want %d with no silent gap",
 					tenant, viewer.Records(), through, err, throughSecondInput)

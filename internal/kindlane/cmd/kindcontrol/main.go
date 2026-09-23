@@ -14,6 +14,8 @@
 // Configuration is the released cmd/controller's CONTROLLER_* variables plus:
 //
 //	KIND_STORE_URL           the SessionStore NATS URL
+//	KIND_JOURNAL_URL         the harness journal NATS URL the Host Pods write
+//	                         (Factory's journal resolver reads it)
 //	KIND_FACTORY_LISTEN      Factory's HTTP listen address
 //	KIND_FACTORY_ORIGIN      Factory's externally reached base URL (CSRF)
 //	KIND_FACTORY_TOKEN_FILE  Factory's HostLink service token
@@ -44,6 +46,7 @@ import (
 	"github.com/looprig/factory"
 	"github.com/looprig/natsstore"
 	"github.com/looprig/sessionstore"
+	"github.com/looprig/storage"
 	"github.com/looprig/tests/internal/kindlane"
 	"github.com/looprig/tests/internal/orchestrationtest"
 	k8s "k8s.io/client-go/kubernetes"
@@ -131,12 +134,21 @@ func run(log *slog.Logger) error {
 		return fmt.Errorf("open the session store backend: %w", err)
 	}
 	defer func() { _ = backend.Close(context.Background()) }()
+	// factory v0.9.0 reads a Host session's journal from its RUNTIME journal
+	// (WithJournalResolver), so Factory opens exactly the backend the Host
+	// Pods' harness writes -- the same NATS server kindhost's journal_url names.
+	journal, err := natsstore.Open(openCtx, natsstore.Options{URL: must("KIND_JOURNAL_URL")})
+	if err != nil {
+		return fmt.Errorf("open the harness journal backend: %w", err)
+	}
+	defer func() { _ = journal.Close(context.Background()) }()
 
 	tb := kindlane.NewProcessTB("kindcontrol-"+replica, log)
 	defer tb.RunCleanups()
 	world := orchestrationtest.NewPooledWorld(tb, ctx, orchestrationtest.PooledWorldOptions{
-		Tenants: []sessionwire.TenantID{kindlane.Tenant},
-		Backend: backend.Composite,
+		Tenants:         []sessionwire.TenantID{kindlane.Tenant},
+		Backend:         backend.Composite,
+		JournalBackends: map[sessionwire.TenantID]*storage.Composite{kindlane.Tenant: journal.Composite},
 	})
 
 	restConfig, err := rest.InClusterConfig()

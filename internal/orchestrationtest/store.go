@@ -54,6 +54,14 @@ type StoreFixture struct {
 	// deployment does not co-locate them.
 	Journal *harnessstore.Store
 
+	// JournalBackend is the backend under Journal, and RuntimeJournal is a
+	// plain SessionStore opened over it in harness's legacy single-tenant
+	// layout: the read factory v0.9.0's WithJournalResolver is composed over.
+	// A Host-owned session's journal is its runtime's, under the binding's
+	// RuntimeSessionID; Factory reads it here, never from Store.
+	JournalBackend *storage.Composite
+	RuntimeJournal *sessionstore.Store
+
 	tb TB
 }
 
@@ -84,12 +92,14 @@ func NewStoreFixture(tb TB, ctx context.Context, clock *Clock) *StoreFixture {
 		Clock:   clock,
 		tb:      tb,
 	}
-	journal, err := harnessstore.Open(memstore.New(), harnessstore.WithTenant(fixture.Tenant))
+	fixture.JournalBackend = memstore.New()
+	journal, err := harnessstore.Open(fixture.JournalBackend, harnessstore.WithTenant(fixture.Tenant))
 	if err != nil {
 		tb.Fatalf("orchestrationtest: opening the harness journal store: %v", err)
 		return nil
 	}
 	fixture.Journal = journal
+	fixture.RuntimeJournal = OpenRuntimeJournal(tb, ctx, fixture.JournalBackend, fixture.Tenant)
 	fixture.open(ctx)
 	tb.Cleanup(func() {
 		if fixture.Store == nil {

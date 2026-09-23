@@ -194,7 +194,7 @@ func TestRealtimeFailureBlastRadiusIsBoundedByTheSession(t *testing.T) {
 	// is back before it measures the next thing.
 	awaitLive := func(tb *testing.T, b *orchestrationtest.PooledBrowser) {
 		tb.Helper()
-		world.Tails.Hint(tenantA, sessionA)
+		world.Tails.Commit(tenantA, sessionA)
 		probe := world.Tails.Committed(tenantA, sessionA)
 		probeSeq := probe[len(probe)-1].JournalSeq
 		orchestrationtest.PooledWait(tb, "a record arrives live again", 60*time.Second, func() bool {
@@ -203,7 +203,7 @@ func TestRealtimeFailureBlastRadiusIsBoundedByTheSession(t *testing.T) {
 					return true
 				}
 			}
-			world.Tails.Hint(tenantA, sessionA)
+			world.Tails.Commit(tenantA, sessionA)
 			probe = world.Tails.Committed(tenantA, sessionA)
 			probeSeq = probe[len(probe)-1].JournalSeq
 			return false
@@ -230,9 +230,9 @@ func TestRealtimeFailureBlastRadiusIsBoundedByTheSession(t *testing.T) {
 		slow.Stall()
 		for sent := 0; sent < slowConsumerLoad; sent += slowConsumerBatch {
 			for range slowConsumerBatch {
-				world.Tails.Hint(tenantA, sessionA)
+				world.Tails.Commit(tenantA, sessionA)
 			}
-			world.Tails.Hint(tenantB, sessionB)
+			world.Tails.Commit(tenantB, sessionB)
 			orchestrationtest.PooledWait(t, "the fast peer kept up", 60*time.Second, holdsThrough(t, peer, tenantA, sessionA))
 		}
 		slow.Release()
@@ -288,11 +288,11 @@ func TestRealtimeFailureBlastRadiusIsBoundedByTheSession(t *testing.T) {
 				t.Fatalf("injecting burst record %d: %v", n, err)
 			}
 			if n%(burst/8) == 0 {
-				world.Tails.Hint(tenantA, sessionA)
+				world.Tails.Commit(tenantA, sessionA)
 			}
 		}
-		world.Tails.Hint(tenantA, sessionA)
-		world.Tails.Hint(tenantB, sessionB)
+		world.Tails.Commit(tenantA, sessionA)
+		world.Tails.Commit(tenantB, sessionB)
 		allHold(t, "every browser holds through the mailbox overflow")
 		committedAfter := world.Tails.Committed(tenantA, sessionA)
 		for i, b := range onA {
@@ -351,8 +351,8 @@ func TestRealtimeFailureBlastRadiusIsBoundedByTheSession(t *testing.T) {
 			t.Fatalf("injecting the refused record: %v", err)
 		}
 		for range 3 {
-			world.Tails.Hint(tenantA, sessionA)
-			world.Tails.Hint(tenantB, sessionB)
+			world.Tails.Commit(tenantA, sessionA)
+			world.Tails.Commit(tenantB, sessionB)
 		}
 		allHold(t, "every browser holds through the refused-record repair")
 		for i, b := range onA {
@@ -375,8 +375,8 @@ func TestRealtimeFailureBlastRadiusIsBoundedByTheSession(t *testing.T) {
 		// FAILURE THREE, the transport under X's HostBindings, severed at TCP.
 		t.Logf("case 2: severed %d TCP connections to Host X", hostX.Sever())
 		for range 3 {
-			world.Tails.Hint(tenantA, sessionA)
-			world.Tails.Hint(tenantB, sessionB)
+			world.Tails.Commit(tenantA, sessionA)
+			world.Tails.Commit(tenantB, sessionB)
 		}
 		allHold(t, "every browser holds through the sever")
 
@@ -413,7 +413,7 @@ func TestRealtimeFailureBlastRadiusIsBoundedByTheSession(t *testing.T) {
 			// An enduring record behind the burst, on the same link: once a
 			// browser holds it, every ephemeral before it has been delivered
 			// or dropped.
-			world.Tails.Hint(tenantA, sessionA)
+			world.Tails.Commit(tenantA, sessionA)
 		}
 
 		// The live path must be back after case 2's sever before anything is
@@ -697,10 +697,10 @@ func TestCentrifugeSlowConsumerThresholdAndItsBlastRadius(t *testing.T) {
 	slowLoose.Stall()
 	for sent := 0; sent < slowConsumerLoad; sent += slowConsumerBatch {
 		for range slowConsumerBatch {
-			world.Tails.Hint(tenant, session)
+			world.Tails.Commit(tenant, session)
 		}
 		// The other tenant's session keeps committing too, a little.
-		world.Tails.Hint(otherTenant, otherSession)
+		world.Tails.Commit(otherTenant, otherSession)
 		orchestrationtest.PooledWait(t, "the fast peer kept up with the load", 60*time.Second, holdsThrough(peer, tenant, session))
 	}
 	orchestrationtest.PooledWait(t, "the other session's browser kept up", 60*time.Second, holdsThrough(other, otherTenant, otherSession))
