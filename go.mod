@@ -21,7 +21,7 @@ require (
 	github.com/looprig/natsstore v0.5.1
 	github.com/looprig/sandbox v0.9.0
 	github.com/looprig/secrets v0.2.0
-	github.com/looprig/sessionstore v0.12.0
+	github.com/looprig/sessionstore v0.13.0
 	github.com/looprig/storage v0.6.0
 )
 

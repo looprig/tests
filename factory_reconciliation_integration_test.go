@@ -43,7 +43,6 @@ package tests
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"net/http"
 	"testing"
@@ -1136,26 +1135,27 @@ func TestFactoryGateSweepRetiresStaleIntents(t *testing.T) {
 	})
 }
 
-// TestFactoryGateSweepCannotRetireADispositionRemnant is I1.3 case 4 on the
-// sessions production actually gates on -- and it is a TRIP-WIRE, pinning a
-// sessionstore v0.12.0 defect this lane found rather than a behaviour anyone
-// wants.
+// TestFactoryGateSweepRetiresADispositionRemnant is I1.3 case 4 on the
+// sessions production actually gates on.
 //
 // Since host v0.4.0 every gate a Host publishes is on a DISPOSITION session,
 // written under a store-issued residency grant. A crash between OpenGate's
 // intent write and its projection write leaves a remnant there exactly as it
-// does on a legacy session. But sessionstore v0.12.0's RetireGateDeadlineIntent
-// reserves the LEGACY protocol mode before it deletes (shards.go, "Retirement
-// mutates legacy gate state"), so on a disposition-bound session it refuses
-// with `catalog conflict (binding.protocol_mode)` -- forever. Factory's sweep
-// classifies the refusal as an ordinary outcome and asks again every pass.
+// does on a legacy session.
 //
-// The remnant does not BLOCK the sweep -- the cursor steps past it, which the
-// legacy test above proves -- but it is never retired, so disposition remnants
-// accumulate in the due view for the life of the session. The fix is owed by
-// sessionstore; when it lands this row fails, and must be flipped to assert
-// retirement the way TestFactoryGateSweepRetiresStaleIntents does.
-func TestFactoryGateSweepCannotRetireADispositionRemnant(t *testing.T) {
+// THIS ROW WAS A TRIP-WIRE until the sessionstore v0.13.0 pin. v0.12.0's
+// RetireGateDeadlineIntent reserved the LEGACY protocol mode before deleting,
+// so on a disposition-bound session it refused `catalog conflict
+// (binding.protocol_mode)` forever, Factory's sweep asked again every pass, and
+// disposition remnants accumulated in the due view for the life of the session.
+//
+// v0.13.0 PARKS a disposition remnant instead of tombstoning it: the unchanged
+// intent bytes are re-filed NOT-DUE (so a later OpenGate can revive them). So
+// this row asserts what retirement means on a disposition session -- the
+// remnant LEFT THE DUE VIEW and the sweep STOPPED asking about it -- and
+// deliberately does NOT assert a tombstone: the parked row still exists, and a
+// retire of it again is an idempotent success that writes nothing.
+func TestFactoryGateSweepRetiresADispositionRemnant(t *testing.T) {
 	ctx := coldReadContext(t)
 	w := newDispositionWorld(t, ctx, 1)
 	created := w.create(t, ctx, orchestrationtest.KitActorCredential, "gate-disposition")
@@ -1177,37 +1177,46 @@ func TestFactoryGateSweepCannotRetireADispositionRemnant(t *testing.T) {
 		t.Fatalf("the open survived its projection write failing; the crash point was not reached")
 	}
 	faults.FailUpdates(false)
-	if !scanDueGates(t, ctx, w.store, w.clock.Now()).remnants[gate] {
+	var captured *sessionstore.RemnantGateIntent
+	for _, remnant := range scanDueGatesRemnants(t, ctx, w.store, w.clock.Now()) {
+		if remnant.GateID == gate {
+			captured = &remnant
+		}
+	}
+	if captured == nil {
 		t.Fatalf("the crash left no remnant on the disposition session; the fixture is wrong")
 	}
 
 	w.clock.Advance(sessionstore.MinGateIntentRemnantAge + time.Minute)
-	orchestrationtest.PooledWait(t, "Factory's sweep asked to retire the disposition remnant", 30*time.Second, func() bool {
+	orchestrationtest.PooledWait(t, "the disposition remnant left the due view", 30*time.Second, func() bool {
+		return !scanDueGates(t, ctx, w.store, w.clock.Now().Add(time.Hour)).remnants[gate]
+	})
+	asked := func() int {
+		n := 0
 		for _, req := range w.replica.Gates.Retired() {
 			if req.GateID == gate {
-				return true
+				n++
 			}
 		}
-		return false
-	})
-	// Several more passes, then the durable answer.
+		return n
+	}
+	if asked() == 0 {
+		t.Fatalf("the remnant left the due view but Factory's sweep never asked to retire it; something else retired it")
+	}
+	// Several more full passes: a retired remnant is no longer listed, so the
+	// sweep must stop asking. Under v0.12.0 this count grew every pass.
+	settled := asked()
 	awaitDueGates(t, w.replica.Gates, len(w.replica.Gates.DueRequests())+2*orchestrationtest.KitControlShards)
-	if !scanDueGates(t, ctx, w.store, w.clock.Now()).remnants[gate] {
-		t.Fatalf("TRIP-WIRE FIRED: the disposition remnant was retired. sessionstore now retires remnants on " +
-			"disposition sessions; flip this row to assert retirement and drop the owed item from the I1.3 record")
+	if again := asked(); again != settled {
+		t.Fatalf("the sweep asked to retire the remnant %d more time(s) after it left the due view", again-settled)
 	}
-	var refusal *sessionstore.CatalogError
-	for _, remnant := range scanDueGatesRemnants(t, ctx, w.store, w.clock.Now()) {
-		if remnant.GateID != gate {
-			continue
-		}
-		err := w.store.Store.RetireGateDeadlineIntent(ctx, sessionstore.RetireGateDeadlineIntentRequest(remnant))
-		if !errors.As(err, &refusal) || refusal.Code != sessionstore.CatalogErrorConflict || refusal.Field != "binding.protocol_mode" {
-			t.Fatalf("retiring the disposition remnant answered %v; the pinned defect is catalog conflict (binding.protocol_mode)", err)
-		}
+	if scanDueGates(t, ctx, w.store, w.clock.Now().Add(time.Hour)).remnants[gate] {
+		t.Fatalf("the disposition remnant returned to the due view")
 	}
-	if refusal == nil {
-		t.Fatalf("the remnant vanished between two reads")
+	// Parked, not tombstoned: retiring it again is the store's idempotent
+	// repeat case.
+	if err := w.store.Store.RetireGateDeadlineIntent(ctx, sessionstore.RetireGateDeadlineIntentRequest(*captured)); err != nil {
+		t.Fatalf("re-retiring the parked disposition remnant answered %v, want the idempotent success", err)
 	}
 }
 
