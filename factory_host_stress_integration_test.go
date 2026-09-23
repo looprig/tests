@@ -766,6 +766,16 @@ func (s *stress) input(rng *rand.Rand, session *stressSession, op int, ask bool)
 // tool ran -- is abandoned and counted; that is not a defect. A stale
 // projection answered 409 gate_resolved is likewise the correct refusal.
 func (s *stress) answerGates(rng *rand.Rand, session *stressSession, tag string, wait time.Duration) int {
+	// Do not read the gates of a session whose create is not acknowledged yet:
+	// restartHost's fence sweeps EVERY session, and one chaos event early in the
+	// case reaches a session still in its create stagger, which Factory rightly
+	// answers 404 session_not_found. It cannot hold a gate yet either.
+	session.mu.Lock()
+	created := session.created
+	session.mu.Unlock()
+	if !created {
+		return 0
+	}
 	deadline := time.Now().Add(wait)
 	var open []sessionwire.GateProjection
 	for {
