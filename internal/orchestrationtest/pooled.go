@@ -1522,6 +1522,13 @@ type PooledWorld struct {
 	workspaceBase string
 	// WorkspaceTools is the agent's file tools, when WithWorkspace is set.
 	WorkspaceTools *PooledWorkspaceTools
+
+	// toolResults is PooledWorldOptions.ToolResults.
+	toolResults *ToolResultRetention
+	// spillBases are the capture spill bases every rig in this world was
+	// composed with. See spillBase.
+	spillMu    sync.Mutex
+	spillBases []string
 }
 
 // PooledWorldOptions chooses what a case's agent can do.
@@ -1571,6 +1578,14 @@ type PooledWorldOptions struct {
 	// HostLogs, when set, receives every composed Host's operator
 	// diagnostics as JSON lines. Nil leaves Host's logger unset.
 	HostLogs io.Writer
+
+	// ToolResults, when set, gives the agent REAL Bash and read_tool_result
+	// (tools) under readable tool-result retention (harness
+	// rig.WithToolResultObjects over each tenant's own journal store), and
+	// composes every Factory's object route over the production evidence
+	// policy (package toolresultobjects). It needs WithWorkspace: Bash runs
+	// in the session's workspace. See ToolResultRetention.
+	ToolResults *ToolResultRetention
 }
 
 // NewPooledWorld opens the shared durable plane and one harness journal per
@@ -1607,6 +1622,14 @@ func NewPooledWorld(tb TB, ctx context.Context, options PooledWorldOptions) *Poo
 	}
 	if options.WithAskTool {
 		world.AskTool = &PooledAskTool{}
+	}
+	if options.ToolResults != nil {
+		if !options.WithWorkspace {
+			tb.Fatalf("orchestrationtest: ToolResults needs WithWorkspace: Bash runs in the session's workspace")
+			return nil
+		}
+		retention := *options.ToolResults
+		world.toolResults = &retention
 	}
 	if options.WithWorkspace {
 		world.workspaces = memstore.New()
@@ -1725,6 +1748,10 @@ func (w *PooledWorld) defineRig(tb TB, tenant sessionwire.TenantID, journal *har
 	if w.workspaces != nil {
 		tools = append(tools, w.WorkspaceTools.definitions()...)
 	}
+	if w.toolResults != nil {
+		tools = append(tools, w.toolResults.definitions()...)
+		loopOptions = append(loopOptions, loop.WithToolLimits(w.toolResults.limits()))
+	}
 	if len(tools) > 0 {
 		loopOptions = append(loopOptions,
 			loop.WithTools(tools...),
@@ -1746,6 +1773,11 @@ func (w *PooledWorld) defineRig(tb TB, tenant sessionwire.TenantID, journal *har
 	}
 	if w.workspaces != nil {
 		rigOptions = append(rigOptions, pooledWorkspaceOptions(tb, workspaceDurable, workspaceBase, tenant)...)
+	}
+	if w.toolResults != nil {
+		// The SAME store the rig journals into: a capture lives beside the
+		// journal that references it, in the tenant's runtime scope.
+		rigOptions = append(rigOptions, rig.WithToolResultObjects(journal.ToolResultObjects(), w.spillBase(tb)))
 	}
 	defined, err := rig.Define(rigOptions...)
 	if err != nil {
@@ -2397,11 +2429,13 @@ func pooledFactoryOptions(tb TB, world *PooledWorld, cfg PooledFactoryConfig, pl
 		factory.WithDepartment(template),
 		factory.WithSessionBinding(PooledBinding, PooledBindingVersion),
 		factory.WithPublicCreates(world.Store),
-		factory.WithObjectStoreResolver(func(context.Context, sessionstore.SessionBinding) (factory.ObjectReader, error) {
-			return nil, ErrObjectNotPermitted
-		}),
 		factory.WithLogger(slog.New(slog.NewJSONHandler(logs, nil))),
 	}
+	objects := world.objectRouteOptions(tb)
+	if objects == nil {
+		return nil, nil
+	}
+	opts = append(opts, objects...)
 	if !cfg.WithoutPendingCommands {
 		// WITHOUT THIS NOTHING IS EVER PLACED. WithPendingCommands is what
 		// triggers pooled placement: a deployment that omits it logs a WARN at
