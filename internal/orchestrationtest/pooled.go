@@ -1141,8 +1141,9 @@ type PooledWorld struct {
 	Tails    *PooledTails
 	AskTool  *PooledAskTool
 
-	tenants []sessionwire.TenantID
-	gated   bool
+	tenants  []sessionwire.TenantID
+	gated    bool
+	hostLogs io.Writer
 }
 
 // PooledWorldOptions chooses what a case's agent can do.
@@ -1155,6 +1156,18 @@ type PooledWorldOptions struct {
 	// world shares. Nil takes a fresh memstore. The harness journals are
 	// unaffected: they are a different module's keyspace.
 	Backend *storage.Composite
+	// JournalBackend, when set, supplies each tenant's harness journal
+	// backend. Nil keeps one fresh memstore per tenant. It must hand back a
+	// DISTINCT, empty backend per tenant: harness files a journal under a
+	// single-tenant layout, so two tenants on one backend would share it.
+	JournalBackend func(tb TB, tenant sessionwire.TenantID) *storage.Composite
+	// JournalOptions are appended to every harness journal's Open, after the
+	// tenant. The cloud lane uses it to lower the offload threshold so the
+	// runtime's own records reach the Blobs provider.
+	JournalOptions []harnessstore.Option
+	// HostLogs, when set, receives every composed Host's operator
+	// diagnostics as JSON lines. Nil leaves Host's logger unset.
+	HostLogs io.Writer
 }
 
 // NewPooledWorld opens the shared durable plane and one harness journal per
@@ -1181,12 +1194,18 @@ func NewPooledWorld(tb TB, ctx context.Context, options PooledWorldOptions) *Poo
 		Tails:    NewPooledTails(),
 		tenants:  tenants,
 		gated:    options.WithAskTool,
+		hostLogs: options.HostLogs,
 	}
 	if options.WithAskTool {
 		world.AskTool = &PooledAskTool{}
 	}
 	for _, tenant := range tenants {
-		journalStore, err := harnessstore.Open(memstore.New(), harnessstore.WithTenant(tenant))
+		journalBackend := memstore.New()
+		if options.JournalBackend != nil {
+			journalBackend = options.JournalBackend(tb, tenant)
+		}
+		journalOptions := append([]harnessstore.Option{harnessstore.WithTenant(tenant)}, options.JournalOptions...)
+		journalStore, err := harnessstore.Open(journalBackend, journalOptions...)
 		if err != nil {
 			tb.Fatalf("orchestrationtest: opening the harness journal for %q: %v", tenant, err)
 			return nil
@@ -1207,6 +1226,14 @@ func NewPooledWorld(tb TB, ctx context.Context, options PooledWorldOptions) *Poo
 		}
 	})
 	return world
+}
+
+// hostLogger is the Host operator logger the world was configured with, or nil.
+func (w *PooledWorld) hostLogger() *slog.Logger {
+	if w.hostLogs == nil {
+		return nil
+	}
+	return slog.New(slog.NewJSONHandler(w.hostLogs, nil))
 }
 
 // PooledModel is the model every pooled loop runs on.
@@ -1406,6 +1433,7 @@ func startHostWrapped(tb TB, ctx context.Context, world *PooledWorld, id session
 				}
 				return []department.Registration{{AgentID: PooledAgent, Target: target}}, nil
 			}),
+			Logger:       world.hostLogger(),
 			Checkpointer: inertCheckpointer{},
 			Auth:         pooledAuth{},
 			Workspaces:   NewTempWorkspaces(tb),

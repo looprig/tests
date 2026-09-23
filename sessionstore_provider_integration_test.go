@@ -111,6 +111,10 @@ func sessionStoreProviders(t *testing.T) []sessionStoreProvider {
 			},
 		},
 	}
+	// The cloud lane (runbook 07 P3.1) adds the released pgstore+s3store
+	// composite when it is compiled in and enabled; see
+	// cloud_sessionstore_integration_test.go.
+	providers = append(providers, cloudSessionStoreProviders(t)...)
 	return assertSessionStoreProviderMatrix(t, providers)
 }
 
@@ -132,7 +136,7 @@ func assertSessionStoreProviderMatrix(t *testing.T, providers []sessionStoreProv
 	for _, provider := range providers {
 		counts[provider.name]++
 	}
-	for _, name := range sessionStoreRequiredProviders {
+	for _, name := range append(append([]string(nil), sessionStoreRequiredProviders...), cloudRequiredSessionStoreProviders()...) {
 		if counts[name] == 1 {
 			continue
 		}
