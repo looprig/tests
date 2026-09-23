@@ -138,6 +138,12 @@ func TestAnIdlePooledSessionIsWarmReleasedAndReplacedOnItsNextCommand(t *testing
 		if len(restores) != 1 || restores[0].ID != runtimeID {
 			t.Fatalf("the Host restored %+v, want exactly one restore of %s", restores, runtimeID)
 		}
+		// The route turns resident a beat after the attach; the input can
+		// settle inside that beat, so it is waited for.
+		orchestrationtest.PooledWait(t, "the re-placed route turned resident", 30*time.Second, func() bool {
+			owner, found := world.Registration(t, ctx, tenant, s)
+			return found && owner.Residency == sessionwire.SessionResidencyResident
+		})
 		owner, found := world.Registration(t, ctx, tenant, s)
 		if !found || owner.Residency != sessionwire.SessionResidencyResident || owner.LeaseEpoch <= attached.LeaseEpoch {
 			t.Fatalf("after re-placement the durable owner is %+v, want resident at an epoch above %d", owner, attached.LeaseEpoch)

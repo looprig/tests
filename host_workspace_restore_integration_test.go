@@ -111,14 +111,14 @@ func TestAWorkspaceSurvivesAWarmReleaseOntoAnotherHostPerTenant(t *testing.T) {
 	orchestrationtest.PooledWait(t, "the first Host released both idle sessions", 30*time.Second, func() bool {
 		return first.SessionsIn(t, "resident") == 0 && first.SessionsIn(t, "releasing") == 0
 	})
-	lastCheckpoint := map[sessionwire.TenantID]string{}
+	lastCheckpoint := map[sessionwire.TenantID]uint64{}
 	for _, tenant := range tenants {
-		checkpoints := orchestrationtest.JournalEvents[event.WorkspaceCheckpointed](t, world, tenant, runtimeIDs[tenant])
-		if len(checkpoints) == 0 {
+		seq, ref, found := orchestrationtest.LastCheckpointSeq(t, world, tenant, runtimeIDs[tenant])
+		if !found {
 			t.Fatalf("%s's session was released with no committed workspace checkpoint", tenant)
 		}
-		lastCheckpoint[tenant] = checkpoints[len(checkpoints)-1].Ref
-		t.Logf("%s: %d checkpoints before the release, last %s", tenant, len(checkpoints), lastCheckpoint[tenant])
+		lastCheckpoint[tenant] = seq
+		t.Logf("%s: last checkpoint before the release at journal seq %d (%s)", tenant, seq, ref)
 	}
 	// The first Host goes away, gracefully: the next generation MUST run on a
 	// different Host, on an empty disk.
@@ -163,8 +163,19 @@ func TestAWorkspaceSurvivesAWarmReleaseOntoAnotherHostPerTenant(t *testing.T) {
 				t.Fatalf("the second generation read present=%v %q, want %s's own bytes %q", read.Present, read.Content, tenant, content[tenant])
 			}
 			orchestrationtest.AssertModelVisiblePathStable(t, written, read)
-			// No WorkspaceRestored is journalled on a journal restore (measured),
-			// so the checkpoint that came back is proven by the bytes.
+			// WHICH checkpoint came back is harness's own report, read off the
+			// restored runtime: the journal sequence of the transition the live
+			// tree was materialized from, and whether work followed it.
+			status := orchestrationtest.AwaitWorkspaceStatus(t, second, tenant, s)
+			if !status.HasCheckpoint || status.CheckpointSeq != lastCheckpoint[tenant] {
+				t.Fatalf("%s came up on checkpoint seq %d (has=%v), want the last committed one, %d", tenant, status.CheckpointSeq, status.HasCheckpoint, lastCheckpoint[tenant])
+			}
+			if status.LogicalRoot != written.LogicalRoot {
+				t.Fatalf("%s's model-visible workspace path is %q after the restore, want %q", tenant, status.LogicalRoot, written.LogicalRoot)
+			}
+			if status.PostCheckpointLoss() {
+				t.Fatalf("%s reports post-checkpoint loss (%d events) after a graceful release that checkpointed last", tenant, status.PostCheckpointEvents)
+			}
 			if got := orchestrationtest.CountJournalEvents[event.SessionStarted](t, world, tenant, runtimeIDs[tenant]); got != 1 {
 				t.Fatalf("%s's journal holds %d SessionStarted: the session was restarted, not restored", tenant, got)
 			}

@@ -14,13 +14,17 @@
 package tests
 
 import (
+	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
+	"strings"
 	"sync"
 	"testing"
 	"time"
 
 	sessionwire "github.com/looprig/core/sessionwire/v1"
+	"github.com/looprig/core/uuid"
 	"github.com/looprig/harness/pkg/event"
 	"github.com/looprig/host"
 	"github.com/looprig/sessionstore"
@@ -70,8 +74,21 @@ func TestAHostThatDiesIsTakenOverAndItsSessionRestored(t *testing.T) {
 	if len(writes) != 1 || writes[0].Content != takeoverBytes {
 		t.Fatalf("the first generation's writes are %+v, want the one notes file", writes)
 	}
-	checkpoints := orchestrationtest.JournalEvents[event.WorkspaceCheckpointed](t, world, tenant, runtimeID)
-	lastCheckpoint := checkpoints[len(checkpoints)-1].Ref
+	// THE LAST COMMITTED CHECKPOINT IS TAKEN EXPLICITLY, by the product, once
+	// the journal is quiet. harness's turn-end snapshot races the turn's own
+	// trailing loop records (measured under -race: the snapshot at seq 13 and a
+	// loop record after it), and harness then reports a post-checkpoint loss
+	// that is only its documented over-approximation. This case is the no-loss
+	// arm, so it anchors the checkpoint after the last record; the loss arm is
+	// TestAHostThatDiesMidTurnSurfacesPostCheckpointLoss.
+	orchestrationtest.AwaitJournalQuiet(t, world, tenant, runtimeID, 500*time.Millisecond)
+	if err := doomed.Rig.CheckpointWorkspace(ctx, tenant, s); err != nil {
+		t.Fatalf("the product checkpoint before the death failed: %v", err)
+	}
+	lastCheckpointSeq, lastCheckpoint, _ := orchestrationtest.LastCheckpointSeq(t, world, tenant, runtimeID)
+	if tip := orchestrationtest.AwaitJournalQuiet(t, world, tenant, runtimeID, 500*time.Millisecond); tip != lastCheckpointSeq {
+		t.Fatalf("the journal moved past the anchoring checkpoint (seq %d, tip %d); the no-loss arm cannot be set up", lastCheckpointSeq, tip)
+	}
 	first, found := world.Registration(t, ctx, tenant, s)
 	if !found || first.HostID != doomed.ID || first.Residency != sessionwire.SessionResidencyResident {
 		t.Fatalf("the first owner is %+v (found=%v), want %s resident", first, found, doomed.ID)
@@ -109,6 +126,13 @@ func TestAHostThatDiesIsTakenOverAndItsSessionRestored(t *testing.T) {
 	t.Logf("the successor applied the input %v after it was admitted", took.Round(time.Millisecond))
 
 	t.Run("the successor took the lease over at a higher epoch", func(t *testing.T) {
+		// The route turns resident a beat after the attach, and the input can
+		// settle inside that beat (measured under -race: "attaching" at the
+		// instant of settlement), so the route is waited for.
+		orchestrationtest.PooledWait(t, "the successor's route turned resident", 30*time.Second, func() bool {
+			owner, found := world.Registration(t, ctx, tenant, s)
+			return found && owner.Residency == sessionwire.SessionResidencyResident
+		})
 		owner, found := world.Registration(t, ctx, tenant, s)
 		if !found || owner.HostID != successor.ID || owner.Residency != sessionwire.SessionResidencyResident {
 			t.Fatalf("the owner after the death is %+v (found=%v), want %s resident", owner, found, successor.ID)
@@ -149,10 +173,21 @@ func TestAHostThatDiesIsTakenOverAndItsSessionRestored(t *testing.T) {
 
 	t.Run("the workspace bytes survived, at the same model-visible path", func(t *testing.T) {
 		assertWorkspaceSurvived(t, world, writes[0], takeoverBytes)
-		// harness journals NO WorkspaceRestored when a restore materializes the
-		// last checkpoint (measured: zero), so which checkpoint came back is
-		// proven by the bytes, not by a ref.
-		t.Logf("the last committed checkpoint before the death was %s", lastCheckpoint)
+		// WHICH checkpoint came back is harness's own report: the journal
+		// sequence of the transition the live tree was materialized from.
+		status := orchestrationtest.AwaitWorkspaceStatus(t, successor, tenant, s)
+		t.Logf("successor workspace status %+v; last checkpoint before the death seq %d (%s)", status, lastCheckpointSeq, lastCheckpoint)
+		if !status.HasCheckpoint || status.CheckpointSeq != lastCheckpointSeq {
+			t.Fatalf("the successor came up on checkpoint seq %d (has=%v), want the last committed one, seq %d", status.CheckpointSeq, status.HasCheckpoint, lastCheckpointSeq)
+		}
+		if status.PostCheckpointLoss() {
+			t.Fatalf("the successor reports post-checkpoint loss (%d events) although the dead Host's last turn was checkpointed", status.PostCheckpointEvents)
+		}
+		// The MODEL-VISIBLE path, from harness's own session report, which
+		// (unlike the restored tool binding) carries it: a hard assertion.
+		if status.LogicalRoot != writes[0].LogicalRoot {
+			t.Fatalf("the successor's model-visible workspace path is %q, want %q", status.LogicalRoot, writes[0].LogicalRoot)
+		}
 	})
 }
 
@@ -240,6 +275,23 @@ func TestTwoHostsRacingOneColdSessionInstallOneRuntime(t *testing.T) {
 		t.Fatalf("%d runtimes were launched across both Hosts, want exactly 1", launched)
 	}
 	winner, loser := hosts[winners[0]], hosts[1-winners[0]]
+	// THE REFUSAL IS THE LEASE-HELD ONE, not any failure: a loser refused for
+	// capacity, compatibility or a transient would otherwise pass as the race's
+	// loser. Host reports a held session lease at the lease step with Core's
+	// epoch_mismatch -- "the registry Factory routed from was stale" -- and
+	// wraps residency.ErrLeaseHeld, whose text is the only exported trace of it.
+	refusal := results[1-winners[0]]
+	var attach *host.AttachError
+	if !errors.As(refusal, &attach) {
+		t.Fatalf("the loser's refusal %v is not a *host.AttachError", refusal)
+	}
+	code, coded := attach.HostLinkCode()
+	if attach.Step != "lease" || !coded || code != sessionwire.HostLinkErrorEpochMismatch {
+		t.Fatalf("the loser was refused at step %q with code %q (coded=%v), want the lease step's epoch_mismatch: %v", attach.Step, code, coded, refusal)
+	}
+	if !strings.Contains(refusal.Error(), "the session lease is held by another owner") {
+		t.Fatalf("the loser's refusal %q does not name the held session lease", refusal)
+	}
 	if got := len(loser.Rig.Creates()) + len(loser.Rig.Restores()); got != 0 {
 		t.Fatalf("the losing Host %s launched %d runtimes", loser.ID, got)
 	}
@@ -250,4 +302,120 @@ func TestTwoHostsRacingOneColdSessionInstallOneRuntime(t *testing.T) {
 	if got := loser.SessionsIn(t, "resident"); got != 0 {
 		t.Fatalf("the losing Host reports %d resident sessions", got)
 	}
+}
+
+// TestAHostThatDiesMidTurnSurfacesPostCheckpointLoss is I2.1 case 4's loss
+// arm: a Host dies with a write made AFTER the last committed checkpoint. The
+// successor restores that checkpoint, so the late bytes are gone -- and harness
+// must SAY so rather than present the older tree silently.
+func TestAHostThatDiesMidTurnSurfacesPostCheckpointLoss(t *testing.T) {
+	ctx := placementContext(t)
+	tenant := orchestrationtest.PooledTenantA
+	const s = sessionwire.SessionID("session-loss")
+	world := orchestrationtest.NewPooledWorld(t, ctx, orchestrationtest.PooledWorldOptions{
+		Tenants:       []sessionwire.TenantID{tenant},
+		WithWorkspace: true,
+	})
+	stuck := make(chan struct{})
+	t.Cleanup(func() { close(stuck) })
+	world.LLM.Script(
+		// Turn one writes kept.txt and finishes: it is checkpointed.
+		orchestrationtest.PooledTurn{ToolName: orchestrationtest.PooledWriteToolName, ToolInput: `{"path":"kept.txt","content":"kept bytes"}`},
+		orchestrationtest.PooledTurn{Text: "kept"},
+		// Turn two writes lost.txt and then never finishes: the Host dies
+		// mid-turn, after the write and before any checkpoint.
+		orchestrationtest.PooledTurn{ToolName: orchestrationtest.PooledWriteToolName, ToolInput: `{"path":"lost.txt","content":"lost bytes"}`},
+		orchestrationtest.PooledTurn{Hold: stuck},
+	)
+	doomed := orchestrationtest.StartLifecycleHost(t, ctx, world, "i21-loss-host", 4, orchestrationtest.PooledHostConfig{Mortal: true})
+	orchestrationtest.AwaitAdvertised(t, world, doomed.ID)
+	served := orchestrationtest.StartPooledFactory(t, ctx, world, "i21-loss-replica", nil)
+
+	status, body := served.Post(t, ctx, tenant, "/v1/sessions", sessionwire.CreateRequest{
+		CommandEnvelope: orchestrationtest.PooledEnvelope("loss-create"),
+		SessionID:       s,
+		AgentID:         orchestrationtest.PooledAgent,
+		Blocks:          json.RawMessage(`[{"type":"text","text":"write the kept file"}]`),
+	})
+	if status != http.StatusCreated {
+		t.Fatalf("the create answered %d: %s", status, body)
+	}
+	runtimeID := uuidOf(t, world, ctx, tenant, s)
+	orchestrationtest.PooledWait(t, "the first turn finished and was checkpointed", 90*time.Second, func() bool {
+		_, _, found := orchestrationtest.LastCheckpointSeq(t, world, tenant, runtimeID)
+		return found && orchestrationtest.CountJournalEvents[event.TurnDone](t, world, tenant, runtimeID) >= 1
+	})
+	status, body = served.Post(t, ctx, tenant, "/v1/sessions/"+string(s)+"/input", sessionwire.InputRequest{
+		CommandEnvelope: orchestrationtest.PooledEnvelope("loss-input"),
+		SessionID:       s,
+		Blocks:          json.RawMessage(`[{"type":"text","text":"write the lost file"}]`),
+	})
+	if status != http.StatusOK {
+		t.Fatalf("the second input answered %d: %s", status, body)
+	}
+	orchestrationtest.PooledWait(t, "the second turn wrote lost.txt", 60*time.Second, func() bool {
+		return len(world.WorkspaceTools.Writes()) == 2
+	})
+	// The write is done; wait for the turn to reach the held model call, so the
+	// Host dies MID-TURN with the tool result journalled after the checkpoint.
+	orchestrationtest.PooledWait(t, "the second turn reached its held model call", 30*time.Second, func() bool {
+		return len(world.LLM.Requests()) >= 4
+	})
+	checkpointSeq, _, _ := orchestrationtest.LastCheckpointSeq(t, world, tenant, runtimeID)
+	if got := orchestrationtest.CountJournalEvents[event.TurnDone](t, world, tenant, runtimeID); got != 1 {
+		t.Fatalf("the journal holds %d TurnDone before the death, want only the first turn's", got)
+	}
+	doomed.Kill(t)
+	world.WipeWorkspaceDisk(t)
+
+	successor := orchestrationtest.StartPooledHost(t, ctx, world, "i21-loss-successor", 5)
+	orchestrationtest.AwaitAdvertised(t, world, successor.ID)
+	world.LLM.Script(
+		orchestrationtest.PooledTurn{ToolName: orchestrationtest.PooledReadToolName, ToolInput: `{"path":"lost.txt"}`},
+		orchestrationtest.PooledTurn{ToolName: orchestrationtest.PooledReadToolName, ToolInput: `{"path":"kept.txt"}`},
+		orchestrationtest.PooledTurn{Text: "read"},
+	)
+	status, body = served.Post(t, ctx, tenant, "/v1/sessions/"+string(s)+"/input", sessionwire.InputRequest{
+		CommandEnvelope: orchestrationtest.PooledEnvelope("loss-read"),
+		SessionID:       s,
+		Blocks:          json.RawMessage(`[{"type":"text","text":"read both files"}]`),
+	})
+	if status != http.StatusOK {
+		t.Fatalf("the read input answered %d: %s", status, body)
+	}
+	orchestrationtest.PooledWait(t, "the successor read both files", 120*time.Second, func() bool {
+		return len(world.WorkspaceTools.Reads()) >= 2
+	})
+
+	reported := orchestrationtest.AwaitWorkspaceStatus(t, successor, tenant, s)
+	t.Logf("successor workspace status %+v (last checkpoint seq %d)", reported, checkpointSeq)
+	if !reported.HasCheckpoint || reported.CheckpointSeq != checkpointSeq {
+		t.Fatalf("the successor came up on checkpoint seq %d (has=%v), want the last committed one, %d", reported.CheckpointSeq, reported.HasCheckpoint, checkpointSeq)
+	}
+	if !reported.PostCheckpointLoss() {
+		t.Fatalf("the successor reports NO post-checkpoint loss (%d events) although the dead Host wrote after its last checkpoint", reported.PostCheckpointEvents)
+	}
+	reads := map[string]orchestrationtest.PooledWorkspaceRead{}
+	for _, read := range world.WorkspaceTools.Reads() {
+		reads[read.Path] = read
+	}
+	if lost := reads["lost.txt"]; lost.Present {
+		t.Fatalf("the successor read lost.txt = %q; bytes written after the last checkpoint cannot have survived a death", lost.Content)
+	}
+	if kept := reads["kept.txt"]; !kept.Present || kept.Content != "kept bytes" {
+		t.Fatalf("the successor read kept.txt present=%v %q, want the checkpointed bytes", kept.Present, kept.Content)
+	}
+}
+
+func uuidOf(t *testing.T, world *orchestrationtest.PooledWorld, ctx context.Context, tenant sessionwire.TenantID, s sessionwire.SessionID) uuid.UUID {
+	t.Helper()
+	var id uuid.UUID
+	orchestrationtest.PooledWait(t, "the catalog names "+string(s)+"'s runtime", 30*time.Second, func() bool {
+		if _, err := world.Store.GetCatalogEntry(ctx, sessionstore.GetCatalogEntryRequest{TenantID: tenant, SessionID: s}); err != nil {
+			return false
+		}
+		id = world.RuntimeSessionID(t, ctx, tenant, s)
+		return true
+	})
+	return id
 }
