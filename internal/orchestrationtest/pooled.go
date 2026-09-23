@@ -1662,6 +1662,9 @@ func startPooledFactory(tb TB, ctx context.Context, world *PooledWorld, cfg Pool
 		return nil
 	}
 	base := "http://" + listener.Addr().String()
+	if cfg.Listener != nil {
+		listener = cfg.Listener(listener)
+	}
 
 	reconcile := factory.DefaultReconcileLimits()
 	reconcile.Interval = ReconcileSweepInterval

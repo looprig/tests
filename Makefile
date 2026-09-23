@@ -1,4 +1,4 @@
-.PHONY: test live-network fmt fmt-check vet staticcheck lint vuln secure dependency-boundary root-layout check mod-check release-check
+.PHONY: test live-network sessionwire-goldens fmt fmt-check vet staticcheck lint vuln secure dependency-boundary root-layout check mod-check release-check
 
 # Module's own package dirs. This module is a single package at its root, but
 # go list is used (rather than hardcoding ".") to match the go-list idiom the
@@ -54,6 +54,20 @@ dependency-boundary:
 root-layout:
 	GOWORK=off go test -count=1 -race -run '^(TestSiblingRootLayout|TestRepositoryRootLayoutMatchesEcosystemConvention)' ./...
 
+
+# Regenerate the frozen HostLink/ClientLink fixtures under testdata/sessionwire
+# from a live run of the released Factory, Host and controller drain client
+# (factory_host_wire_integration_test.go). Only for an INTENDED wire change: it
+# then fails if git sees any diff, so the new fixtures are reviewed and
+# committed rather than slipping in. An ordinary `make test` compares against
+# the committed fixtures and fails on any drift.
+SESSIONWIRE_PRODUCERS := ^(TestFactoryHostWireGoldens|TestHostLinkHostAnswersGoldens)$$
+
+sessionwire-goldens:
+	LOOPRIG_UPDATE_SESSIONWIRE=1 LOOPRIG_LIVE_NETWORK=0 GOWORK=off go test -count=1 -tags integration -run '$(SESSIONWIRE_PRODUCERS)' .
+	LOOPRIG_LIVE_NETWORK=0 GOWORK=off go test -count=1 -tags integration -run '^(TestSessionwireGolden|TestHostAnswersFactoryGoldensUnchanged|TestFactoryAcceptsHostGoldensUnchanged)' .
+	git diff --exit-code -- testdata/sessionwire
+	@test -z "$$(git status --porcelain -- testdata/sessionwire)" || (git status --porcelain -- testdata/sessionwire; echo 'testdata/sessionwire has uncommitted fixtures' >&2; exit 1)
 
 mod-check:
 	@sh scripts/check-release-modfile.sh go.mod

@@ -1,0 +1,24 @@
+{
+  "source": "factory v0.7.1 -> host v0.5.0, captured live",
+  "method": "hostlink.bind",
+  "request": {
+    "id": 0,
+    "rpc": {
+      "data": {
+        "host_generation": 7,
+        "host_id": "orchestrationtest-wire-host",
+        "idempotency_key": "${idempotency_key}",
+        "lease_epoch": 0,
+        "runtime_compatibility_id": "orchestrationtest-pooled-compat",
+        "session_id": "${session}",
+        "tenant_id": "orchestrationtest-tenant-a",
+        "version": 1
+      },
+      "method": "hostlink.bind"
+    }
+  },
+  "reply": {
+    "id": 0,
+    "rpc": {}
+  }
+}

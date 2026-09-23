@@ -81,6 +81,11 @@ type PooledFactoryConfig struct {
 	// lifetime. Zero takes ReconcileSweepInterval and ReconcileClaimTTL.
 	Interval time.Duration
 	ClaimTTL time.Duration
+
+	// Listener, when set, wraps the replica's TCP listener -- how a case taps
+	// Factory's ClientLink below HTTP (HostLinkTap.WrapListener), since
+	// factory.Server serves its own router and offers no handler to wrap.
+	Listener func(net.Listener) net.Listener
 }
 
 // StartPooledFactoryWith composes, starts and serves a real pooled Factory

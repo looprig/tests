@@ -1,0 +1,21 @@
+{
+  "source": "a Core-framed probe -> host v0.5.0; the reply is Host's",
+  "method": "hostlink.bind",
+  "request": {
+    "id": 0,
+    "rpc": {
+      "data": {
+        "orchestrationtest_unknown_member": true,
+        "version": 1
+      },
+      "method": "hostlink.bind"
+    }
+  },
+  "reply": {
+    "error": {
+      "code": 107,
+      "message": "bad request"
+    },
+    "id": 0
+  }
+}

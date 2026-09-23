@@ -1,0 +1,37 @@
+{
+  "source": "factory v0.7.1 -> host v0.5.0, captured live",
+  "method": "connect",
+  "request": {
+    "connect": {
+      "data": {
+        "supported_versions": [
+          1
+        ]
+      },
+      "name": "factory-hostlink",
+      "token": "${hostlink_token}",
+      "version": "factory"
+    },
+    "id": 0
+  },
+  "reply": {
+    "connect": {
+      "client": "${client_id}",
+      "data": {
+        "hostlink_methods": [
+          "hostlink.bind",
+          "hostlink.unbind",
+          "hostlink.attach",
+          "hostlink.drain",
+          "hostlink.drain_status",
+          "hostlink.command.gate_response"
+        ],
+        "version": 1
+      },
+      "ping": 25,
+      "pong": true,
+      "version": "v1"
+    },
+    "id": 0
+  }
+}

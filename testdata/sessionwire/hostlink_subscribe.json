@@ -1,0 +1,15 @@
+{
+  "source": "factory v0.7.1 -> host v0.5.0, captured live",
+  "method": "subscribe",
+  "request": {
+    "id": 0,
+    "subscribe": {
+      "channel": "${hostlink_channel}",
+      "flag": 1
+    }
+  },
+  "reply": {
+    "id": 0,
+    "subscribe": {}
+  }
+}

@@ -1,0 +1,17 @@
+{
+  "source": "factory v0.7.1 -> host v0.5.0, captured live",
+  "method": "${hostlink_channel}",
+  "request": {
+    "id": 0,
+    "rpc": {
+      "data": {
+        "command_id": "${command_id}"
+      },
+      "method": "${hostlink_channel}"
+    }
+  },
+  "reply": {
+    "id": 0,
+    "rpc": {}
+  }
+}

@@ -1,0 +1,117 @@
+{
+  "source": "a centrifuge-go client -> host v0.5.0; the outcome is Host's",
+  "request": [
+    {
+      "label": "the current version alone",
+      "credential": "${hostlink_token}",
+      "data": "{\"supported_versions\":[1]}"
+    },
+    {
+      "label": "the current version among unsupported ones",
+      "credential": "${hostlink_token}",
+      "data": "{\"supported_versions\":[1,2,9]}"
+    },
+    {
+      "label": "only unsupported versions",
+      "credential": "${hostlink_token}",
+      "data": "{\"supported_versions\":[2]}"
+    },
+    {
+      "label": "an unknown member (the request decoder is strict)",
+      "credential": "${hostlink_token}",
+      "data": "{\"supported_versions\":[1],\"orchestrationtest_unknown\":true}"
+    },
+    {
+      "label": "the B8 wrapped shape",
+      "credential": "${hostlink_token}",
+      "data": "{\"version_negotiation\":{\"supported_versions\":[1]}}"
+    },
+    {
+      "label": "a base64 version list",
+      "credential": "${hostlink_token}",
+      "data": "{\"supported_versions\":\"AQ==\"}"
+    },
+    {
+      "label": "no versions",
+      "credential": "${hostlink_token}",
+      "data": "{\"supported_versions\":[]}"
+    },
+    {
+      "label": "an unknown service credential",
+      "credential": "orchestrationtest-not-a-token",
+      "data": "{\"supported_versions\":[1]}"
+    }
+  ],
+  "reply": [
+    {
+      "connected": {
+        "hostlink_methods": [
+          "hostlink.bind",
+          "hostlink.unbind",
+          "hostlink.attach",
+          "hostlink.drain",
+          "hostlink.drain_status",
+          "hostlink.command.gate_response"
+        ],
+        "version": 1
+      },
+      "label": "the current version alone"
+    },
+    {
+      "connected": {
+        "hostlink_methods": [
+          "hostlink.bind",
+          "hostlink.unbind",
+          "hostlink.attach",
+          "hostlink.drain",
+          "hostlink.drain_status",
+          "hostlink.command.gate_response"
+        ],
+        "version": 1
+      },
+      "label": "the current version among unsupported ones"
+    },
+    {
+      "disconnected": {
+        "code": 4501,
+        "reason": "unsupported wire version"
+      },
+      "label": "only unsupported versions"
+    },
+    {
+      "disconnected": {
+        "code": 4501,
+        "reason": "unsupported wire version"
+      },
+      "label": "an unknown member (the request decoder is strict)"
+    },
+    {
+      "disconnected": {
+        "code": 4501,
+        "reason": "unsupported wire version"
+      },
+      "label": "the B8 wrapped shape"
+    },
+    {
+      "disconnected": {
+        "code": 4501,
+        "reason": "unsupported wire version"
+      },
+      "label": "a base64 version list"
+    },
+    {
+      "disconnected": {
+        "code": 4501,
+        "reason": "unsupported wire version"
+      },
+      "label": "no versions"
+    },
+    {
+      "disconnected": {
+        "code": 4500,
+        "reason": "service authentication failed"
+      },
+      "label": "an unknown service credential"
+    }
+  ]
+}

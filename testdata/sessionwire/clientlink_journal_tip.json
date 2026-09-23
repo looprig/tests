@@ -1,0 +1,16 @@
+{
+  "source": "factory v0.7.1 ClientLink -> centrifuge-go viewer, captured live",
+  "push": {
+    "push": {
+      "channel": "session:orchestrationtest-tenant-a:${session}",
+      "pub": {
+        "data": {
+          "journal_tip": 0,
+          "session_id": "${session}",
+          "tenant_id": "orchestrationtest-tenant-a",
+          "type": "journal_tip"
+        }
+      }
+    }
+  }
+}
