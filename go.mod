@@ -10,7 +10,7 @@ require (
 	github.com/looprig/core v0.11.0
 	github.com/looprig/credentials v0.2.0
 	github.com/looprig/eval v0.2.1
-	github.com/looprig/factory v0.6.0
+	github.com/looprig/factory v0.7.1
 	github.com/looprig/foreignloops v0.3.1
 	github.com/looprig/fsstore v0.5.1
 	github.com/looprig/harness v0.36.0

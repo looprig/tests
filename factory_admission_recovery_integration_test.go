@@ -741,6 +741,25 @@ func TestI12ACommandCommittedByADeadFactoryIsAppliedByAnother(t *testing.T) {
 // The claim is the application prefix: whatever arrives how often, the
 // runtime journal correlates the public CommandID to its runtime UUID once,
 // and the effect happens once.
+//
+// # Re-derived on the factory v0.7.1 pin
+//
+// Up to factory v0.6.0 a REST control route woke the owning Host on the
+// request's own context BEFORE it answered, so a Host whose delivery reply was
+// lost held every POST for the full HostLink RPC bound (measured ~5 s here).
+// v0.7.1 writes the durable answer first and wakes the Host afterwards on a
+// router-owned context. Two things follow, and the case asserts both:
+//
+//   - The acknowledgement no longer waits on the Host: every POST, concurrent
+//     or not, must answer within ackBound. On v0.6.0 each one took ~5 s and
+//     this bound would have failed.
+//   - Redelivery still races the first application -- MORE reliably, since the
+//     four concurrent admissions all answer in milliseconds and their wakes
+//     reach the Host together. Measured on this pin under -race, 30 runs:
+//     4 deliveries before settlement in 25, 3 in 4, 2 in 1 -- never fewer
+//     than 2 (factory v0.6.0: 1-2). The floor stays at 1:
+//     2 was the observed minimum, and a floor at the observed minimum would
+//     flake under a loaded make check rather than pin an invariant.
 func TestI12LostHostLinkRepliesAndRedeliveryApplyOnce(t *testing.T) {
 	ctx := placementContext(t)
 	world := admissionWorld(t, ctx, nil)
@@ -770,24 +789,32 @@ func TestI12LostHostLinkRepliesAndRedeliveryApplyOnce(t *testing.T) {
 		}
 	}
 
+	// ackBound is how long a durable acknowledgement may take with every
+	// delivery reply lost. factory v0.7.1 answers before it wakes the Host, so
+	// the answer is milliseconds (measured 3-115 ms under -race); factory
+	// v0.6.0 answered after the wake and took the ~5 s HostLink RPC bound.
+	// 2 s is well clear of the first and well below the second.
+	const ackBound = 2 * time.Second
 	post := func(served *orchestrationtest.PooledFactory, id sessionwire.CommandID, text string) sessionwire.CommandStatus {
 		t.Helper()
 		began := time.Now()
 		status, body, err := served.PostRaw(ctx, admissionTenant, inputPath(session), admissionInput(id, session, text))
+		took := time.Since(began)
 		if err != nil || status != http.StatusOK {
 			t.Fatalf("posting %q answered %d %s: %v", id, status, body, err)
 		}
-		// Measured, not asserted: Factory delivers on the request's own
-		// context BEFORE it answers, so a lost delivery reply delays the
-		// durable acknowledgement by the HostLink RPC bound.
-		t.Logf("posting %q answered %s after %v", id, body, time.Since(began).Round(time.Millisecond))
+		t.Logf("posting %q answered %s after %v", id, body, took.Round(time.Millisecond))
+		if took > ackBound {
+			t.Fatalf("posting %q took %v to acknowledge, above %v: the durable answer is waiting on the Host's lost reply again", id, took, ackBound)
+		}
 		return decodeCommandStatus(t, body)
 	}
 	// Delivered and REdelivered CONCURRENTLY through both replicas, so the
 	// redeliveries reach the Host while the first delivery is still being
-	// applied rather than after it settled. (Sequential posts would not:
-	// each answer waits out a lost reply's RPC bound, and the command
-	// settles inside the first one.)
+	// applied rather than after it settled. (Before factory v0.7.1 this was
+	// the only way: each sequential answer waited out a lost reply's RPC
+	// bound and the command settled inside the first one. It is still the
+	// strongest way, since the four wakes now leave together.)
 	concurrent := []*orchestrationtest.PooledFactory{replicaA, replicaB, replicaA, replicaB}
 	early := make([]sessionwire.CommandStatus, len(concurrent))
 	var wg sync.WaitGroup
@@ -797,10 +824,16 @@ func TestI12LostHostLinkRepliesAndRedeliveryApplyOnce(t *testing.T) {
 		go func() {
 			defer wg.Done()
 			<-start
+			began := time.Now()
 			status, body, err := served.PostRaw(ctx, admissionTenant, inputPath(session), admissionInput(command, session, word))
+			took := time.Since(began)
 			if err != nil || status != http.StatusOK {
 				t.Errorf("concurrent post %d answered %d %s: %v", i, status, body, err)
 				return
+			}
+			t.Logf("concurrent post %d acknowledged after %v", i, took.Round(time.Millisecond))
+			if took > ackBound {
+				t.Errorf("concurrent post %d took %v to acknowledge, above %v: the durable answer is waiting on the Host's lost reply again", i, took, ackBound)
 			}
 			if err := json.Unmarshal(body, &early[i]); err != nil {
 				t.Errorf("concurrent post %d: undecodable %s: %v", i, body, err)
@@ -860,32 +893,21 @@ func TestI12LostHostLinkRepliesAndRedeliveryApplyOnce(t *testing.T) {
 		}
 		// The interesting half of this case is a redelivery racing the FIRST
 		// application, not one arriving after the command already settled: the
-		// two posts issued after PooledWait (line ~765-766) are guaranteed
-		// redeliveries, but they prove nothing about a race.
+		// two posts issued after PooledWait are guaranteed redeliveries, but
+		// they prove nothing about a race.
 		//
-		// beforeSettlement >= 2 would prove TWO independent deliveries raced
-		// the first application concurrently (the reviewer measured exactly 2
-		// in 20/20 runs under -race). That floor was tried here and is NOT
-		// reliable in this environment: one -race run of this case produced
-		// beforeSettlement == 1 (1 of 4 deliveries before settlement), so a
-		// >= 2 requirement flakes rather than pinning a real invariant. The
-		// assertion is therefore beforeSettlement >= 1: at least one
-		// redelivery reached the Host before the command settled, which still
-		// proves a redelivery raced (or immediately preceded) the first
-		// application rather than arriving only after it was already durable.
-		// If this starts failing (beforeSettlement == 0), either the race
-		// genuinely stopped happening, or a Factory change moved delivery off
-		// the request path -- e.g. a queued, asynchronously-woken delivery
-		// such as the factory v0.7.1 design -- in which case this case's
-		// premise needs to be re-derived against that Factory's actual
-		// delivery timing when tests bumps its factory pin.
+		// On factory v0.6.0 the reviewer measured exactly 2 before settlement
+		// in 20/20 runs, and this lane once measured 1. On the v0.7.1 pin --
+		// wakes asynchronous, all four concurrent admissions acknowledged in
+		// milliseconds -- 30 -race runs measured 2-4 (typically 4). The floor
+		// is 1, not the observed minimum of 2, so a loaded run cannot flake it;
+		// 0 means the race genuinely stopped happening and this case silently
+		// stopped exercising it, which is a failure.
 		if beforeSettlement < 1 {
 			t.Fatalf("no delivery of %q happened before settlement (0 of %d); this case needs at least one "+
 				"redelivery racing the FIRST application rather than every delivery arriving only after it was "+
 				"already durable -- otherwise it silently stops exercising a redelivery racing the first "+
-				"application. (A stronger beforeSettlement >= 2 would additionally prove two independent "+
-				"deliveries raced it concurrently, but that floor measured as low as 1 under -race in this "+
-				"environment and would flake.)",
+				"application",
 				command, ours)
 		}
 	})

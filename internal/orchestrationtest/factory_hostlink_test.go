@@ -81,6 +81,38 @@ func rpcsFor(t *testing.T, conn *TappedConn, method string) []tappedRPC {
 	return out
 }
 
+// awaitAnsweredRPCs polls the tap until at least want RPCs on method have been
+// sent AND answered, or bound elapses, and returns what it saw last.
+//
+// It exists because factory v0.7.1 acknowledges a control route BEFORE it
+// wakes the owning Host: the delivery runs afterwards on a router-owned
+// context, so a POST's answer no longer implies the delivery has been sent,
+// let alone answered. A case that read the tap straight after the POST was
+// reading a race. The bound is generous against the measured wake (single
+// milliseconds) and the case still asserts the exact count afterwards.
+func awaitAnsweredRPCs(t *testing.T, conn *TappedConn, method string, want int, bound time.Duration) []tappedRPC {
+	t.Helper()
+	deadline := time.Now().Add(bound)
+	for {
+		rpcs := rpcsFor(t, conn, method)
+		answered := 0
+		for _, rpc := range rpcs {
+			if rpc.answered {
+				answered++
+			}
+		}
+		if answered >= want || time.Now().After(deadline) {
+			return rpcs
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+// deliveryQuiet is how long a case waits before asserting that a delivery did
+// NOT happen. factory v0.7.1's wake is asynchronous, so absence straight after
+// the POST proves nothing; its measured latency is single milliseconds.
+const deliveryQuiet = 500 * time.Millisecond
+
 type tappedRPC struct {
 	data     json.RawMessage
 	reply    WireReply
@@ -335,7 +367,7 @@ func TestFactoryHostLinkDialsAReleasedHost(t *testing.T) {
 
 	t.Run("the delivery is a channel RPC named by Core, and Host accepts it", func(t *testing.T) {
 		channel := sessionwire.HostLinkChannel(lane.Store.Tenant, session)
-		deliveries := rpcsFor(t, link, channel)
+		deliveries := awaitAnsweredRPCs(t, link, channel, 1, 10*time.Second)
 		if len(deliveries) != 1 {
 			t.Fatalf("Factory sent %d RPCs on %q, want exactly 1 (B6: the method IS the channel name)", len(deliveries), channel)
 		}
@@ -458,6 +490,10 @@ func TestFactoryHostLinkBindToANonResidentSessionIsARefusal(t *testing.T) {
 		if status != http.StatusCreated {
 			t.Fatalf("the create replay answered %d: %s", status, body)
 		}
+		// The wake is asynchronous (factory v0.7.1): give it time to have
+		// happened before asserting it did not. The control below re-checks
+		// once a delivery on an accepted route has been observed.
+		time.Sleep(deliveryQuiet)
 		if deliveries := rpcsFor(t, link, sessionwire.HostLinkChannel(lane.Store.Tenant, nonResident)); len(deliveries) != 0 {
 			t.Fatalf("Factory delivered %d commands on a route Host refused; it read the refusal as success", len(deliveries))
 		}
@@ -472,11 +508,14 @@ func TestFactoryHostLinkBindToANonResidentSessionIsARefusal(t *testing.T) {
 		if status != http.StatusCreated {
 			t.Fatalf("the create replay answered %d: %s", status, body)
 		}
-		deliveries := rpcsFor(t, link, sessionwire.HostLinkChannel(lane.Store.Tenant, resident))
+		deliveries := awaitAnsweredRPCs(t, link, sessionwire.HostLinkChannel(lane.Store.Tenant, resident), 1, 10*time.Second)
 		if len(deliveries) != 1 {
 			t.Fatalf("the replay on an accepted route produced %d deliveries, want 1", len(deliveries))
 		}
 		requireAccepted(t, deliveries[0], "control delivery")
+		if refused := rpcsFor(t, link, sessionwire.HostLinkChannel(lane.Store.Tenant, nonResident)); len(refused) != 0 {
+			t.Fatalf("Factory delivered %d commands on the route Host refused", len(refused))
+		}
 	})
 }
 

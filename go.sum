@@ -151,8 +151,8 @@ github.com/looprig/credentials v0.2.0 h1:NUoQcAdHYwC6cOzQi07q8ZJzHYpjXAsi6MlWvMm
 github.com/looprig/credentials v0.2.0/go.mod h1:D+nWToe0jrHFHPQzO3jgHW0xKZWGlJPs8MniQ+FOBQM=
 github.com/looprig/eval v0.2.1 h1:oyxdk3QGdKCtSKB2VXs9NgLU6eNnJqpJnfUXPhaHiRI=
 github.com/looprig/eval v0.2.1/go.mod h1:Yvtgqt1R4uladf+oXdQXdqRreaPHVjhtsSbxX6UXn9Q=
-github.com/looprig/factory v0.6.0 h1:S/RALaOy4zNVSqB0UT8rbBZAGnkwgBYgFk2SuV/DOHk=
-github.com/looprig/factory v0.6.0/go.mod h1:017gtlzjBRX2eYjSAYMWahQQT4cwEw3dBmf0xGsq/Is=
+github.com/looprig/factory v0.7.1 h1:tjH/AtM+pWxyEa7IISeyQM4vU99OToY4LbLQY3fivwc=
+github.com/looprig/factory v0.7.1/go.mod h1:017gtlzjBRX2eYjSAYMWahQQT4cwEw3dBmf0xGsq/Is=
 github.com/looprig/foreignloops v0.3.1 h1:as7Zx5r8SW6P8pSqdb7tsD3DUfNMcbDrITGzP+QIhUo=
 github.com/looprig/foreignloops v0.3.1/go.mod h1:guYBFZWts71EFfYHeNz8G3e8NKrqk5WBMNGCCgBHFeM=
 github.com/looprig/fsstore v0.5.1 h1:Q0zmD05kNzdVX20a5jLRRF17rf3ZkYlsZVk2gfEUVm0=
