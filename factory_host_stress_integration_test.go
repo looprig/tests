@@ -894,6 +894,17 @@ func (s *stress) coldView(rng *rand.Rand, session *stressSession) {
 			return
 		}
 		if status != http.StatusOK {
+			// A replica being stopped QUIESCES first and answers every new
+			// request 503 retryable (factory's Router.Quiesce): the chaos loop
+			// marks it dead before Stop, so that answer is the stop, not a
+			// refused durable read.
+			select {
+			case <-r.dead:
+				if status == http.StatusServiceUnavailable {
+					return
+				}
+			default:
+			}
 			s.t.Errorf("cold view %s%s via %s answered %d: %s", session.id, suffix, r.name, status, truncateBody(body))
 		}
 	}
