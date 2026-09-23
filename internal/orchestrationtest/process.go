@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/looprig/storage"
@@ -348,7 +349,7 @@ func (l processLeaser) Acquire(ctx context.Context, name string) (storage.Lease,
 	if err != nil {
 		return nil, err
 	}
-	lease := &processLease{inner: inner, lost: make(chan struct{}), stop: make(chan struct{})}
+	lease := &processLease{inner: inner, lost: make(chan struct{}), stop: make(chan struct{}), name: name, plane: l.plane}
 	go lease.watch()
 	l.process.mu.Lock()
 	dead := l.process.dead
@@ -371,6 +372,12 @@ type processLease struct {
 	once   sync.Once
 	stop   chan struct{}
 	stopMu sync.Once
+
+	// name and plane identify the grant; released records that the PROCESS
+	// released it itself. See HostProcess.HeldLeases.
+	name     string
+	plane    string
+	released atomic.Bool
 }
 
 func (l *processLease) watch() {
@@ -391,7 +398,29 @@ func (l *processLease) Epoch() uint64         { return l.inner.Epoch() }
 func (l *processLease) Lost() <-chan struct{} { return l.lost }
 func (l *processLease) closeLost()            { l.once.Do(func() { close(l.lost) }) }
 func (l *processLease) Release(ctx context.Context) error {
-	return l.inner.Release(ctx)
+	err := l.inner.Release(ctx)
+	if err == nil {
+		l.released.Store(true)
+	}
+	return err
+}
+
+// HeldLeases reports the names of every lease this process acquired on plane
+// and has NOT released itself, while it is alive. A lease a Kill or Pause
+// lapsed is not counted: the process never released it, but it no longer
+// holds it either. It is the provider-side evidence that a runtime still holds
+// a grant after its Host "drained", which is what a crash-equivalent drain of a
+// parked session leaves behind until the process exits.
+func (p *HostProcess) HeldLeases(plane string) []string {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	var held []string
+	for _, lease := range p.leases {
+		if lease.plane == plane && !lease.released.Load() {
+			held = append(held, lease.name)
+		}
+	}
+	return held
 }
 
 // lapse is what a provider's TTL does to a dead holder's grant, observed.

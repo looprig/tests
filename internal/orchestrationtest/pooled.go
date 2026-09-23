@@ -155,6 +155,19 @@ func (l *PooledLLM) Script(turns ...PooledTurn) {
 	l.turns = append(l.turns, turns...)
 }
 
+// ScriptNext queues turns to answer the NEXT model calls, whatever has been
+// called so far. Script appends to the queue, and the queue is indexed by call
+// count, so a Script after unscripted calls is consumed by calls that have
+// already happened; ScriptNext pads the queue up to the calls made first.
+func (l *PooledLLM) ScriptNext(turns ...PooledTurn) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	for len(l.turns) < l.next {
+		l.turns = append(l.turns, PooledTurn{})
+	}
+	l.turns = append(l.turns, turns...)
+}
+
 // Invoke satisfies inference.Client. Nothing in this harness invokes.
 func (*PooledLLM) Invoke(context.Context, inference.Request) (*inference.Response, error) {
 	return nil, errors.New("orchestrationtest: PooledLLM.Invoke is unused")
@@ -1528,6 +1541,12 @@ type PooledHost struct {
 	server  *httptest.Server
 	stop    func()
 
+	// stopped is closed once Stop has returned; report and stopErr are what
+	// it returned. See BeginStop.
+	stopped chan struct{}
+	report  host.DrainReport
+	stopErr error
+
 	// process is this Host's durable-plane view when it is MORTAL, nil
 	// otherwise. See Kill.
 	process *HostProcess
@@ -1664,13 +1683,19 @@ func startHostConfigured(tb TB, ctx context.Context, world *PooledWorld, id sess
 	pooled.server = server
 
 	var once sync.Once
+	pooled.stopped = make(chan struct{})
 	pooled.stop = func() {
 		once.Do(func() {
+			defer close(pooled.stopped)
 			stopCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 			defer cancel()
-			if _, err := service.Stop(stopCtx); err != nil {
+			report, err := service.Stop(stopCtx)
+			if err != nil {
 				tb.Logf("orchestrationtest: pooled host %q Stop: %v", id, err)
 			}
+			pooled.mu.Lock()
+			pooled.report, pooled.stopErr = report, err
+			pooled.mu.Unlock()
 			server.CloseClientConnections()
 			server.Close()
 		})

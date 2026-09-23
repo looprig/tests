@@ -110,11 +110,11 @@ func TestIntegrationLaneBlockers(t *testing.T) {
 		// HostLink. The row now pins that capability on a RUNNING Host, so the
 		// day it is withdrawn this fails and names I2.3.
 		//
-		// What I2.3 still lacks is a drain CALLER, and that is not Host's:
-		// Factory has none, and the D2.2 ruling (2026-09-18) puts it in
-		// looprig/controller, built from Core's codecs. I2.3's ordering case is
-		// drivable from here with a Core-framed client and is owed as its own
-		// task rather than folded into a premise row.
+		// I2.3 itself is driven in host_drain_integration_test.go. A POOLED
+		// Host's drain caller is its own process lifecycle (Service.Stop, the
+		// SIGTERM path): Factory has none, looprig/controller drains only the
+		// dedicated Pods it owns, and HostLink refuses a whole-Host scope off
+		// the wire.
 		if hostFixture.Host.Placement() != sessionwire.HostPlacementPooled {
 			t.Fatalf("the drain premise was recorded against a non-pooled Host")
 		}
@@ -135,9 +135,9 @@ func TestIntegrationLaneBlockers(t *testing.T) {
 		// un-ranks target capacity" is a durable fact about the target
 		// directory, and the directory is the SAME seam Factory reads through.
 		//
-		// What it does NOT prove is the ORDERING in I2.3 case 1 -- that the
-		// un-rank happens BEFORE the Host stops admitting. Admission is the
-		// Host's own state and no composed surface reports it.
+		// It does not prove the ORDERING in I2.3 case 1 -- that a running
+		// Host's drain un-ranks before it releases anything. That is
+		// host_drain_integration_test.go's, against a composed Host.
 		key := sessionstore.HostTargetKey{
 			AgentID:                blockedAgent,
 			RuntimeCompatibilityID: string(blockedCompatibility),
