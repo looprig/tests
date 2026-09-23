@@ -18,15 +18,15 @@
 //     FIRED on the factory v0.5.0 pin; it is deleted, and the cases below drive
 //     the behaviour for real.
 //
-// # What "exactly once and in order" means here, and why it is not a count
+// # What "exactly once and in order" means here
 //
-// A ClientLink stream is not a replay: a client is covered through a sequence
-// EITHER by receiving each enduring publication OR by a session.reset naming
-// that tip, which tells it to read the journal through it. A reset is how a
-// client is TOLD about a gap, so it is not one. What must never happen is a
-// SILENT gap -- an enduring record that is neither the next sequence nor one
-// the client already holds. PooledCoveredThrough is that rule, and it is the
-// assertion these cases make.
+// Both cases run in a DurableTail world, where the product's committed stream
+// is a real SessionStore journal that Factory's journal route reads, and the
+// client is orchestrationtest.PooledBrowser: it holds a position, applies the
+// next enduring record, skips one it already holds, repairs from the journal
+// route on every (re)subscribe and every session.reset, and FAILS on a silent
+// gap. So the assertion is the records themselves -- EventIDs and journal
+// sequences, in order, once each -- not a count and not a tip.
 
 package tests
 
@@ -36,7 +36,6 @@ import (
 	"fmt"
 	"io"
 	"net/http"
-	"strings"
 	"testing"
 	"time"
 
@@ -162,27 +161,6 @@ func TestFactoryClientLinkIsComposedButNotYetDrivable(t *testing.T) {
 	})
 }
 
-// reconnectWorld stands up one durable plane, one pooled Host and TWO Factory
-// replicas, and returns them with a session id that does not exist yet.
-//
-// TWO REPLICAS OVER ONE DURABLE PLANE is the whole point of cases 3 and 4: a
-// browser that comes back must be repaired by WHICHEVER replica it reaches,
-// from durable state alone, because nothing is shared between them but the
-// store. A single-replica case would prove only that one process remembers.
-func reconnectWorld(t *testing.T) (context.Context, *orchestrationtest.PooledWorld, *orchestrationtest.PooledFactory, *orchestrationtest.PooledFactory, sessionwire.SessionID) {
-	t.Helper()
-	ctx := placementContext(t)
-	world := orchestrationtest.NewPooledWorld(t, ctx, orchestrationtest.PooledWorldOptions{
-		Tenants: []sessionwire.TenantID{orchestrationtest.PooledTenantA},
-	})
-	pooled := orchestrationtest.StartPooledHost(t, ctx, world, "orchestrationtest-reconnect-host", 4)
-	orchestrationtest.AwaitAdvertised(t, world, pooled.ID)
-
-	replicaA := orchestrationtest.StartPooledFactory(t, ctx, world, "orchestrationtest-reconnect-a", nil)
-	replicaB := orchestrationtest.StartPooledFactory(t, ctx, world, "orchestrationtest-reconnect-b", nil)
-	return ctx, world, replicaA, replicaB, sessionwire.SessionID("session-reconnect")
-}
-
 // reconnectCreate posts the create and waits for it to apply.
 func reconnectCreate(t *testing.T, ctx context.Context, world *orchestrationtest.PooledWorld, f *orchestrationtest.PooledFactory, session sessionwire.SessionID) {
 	t.Helper()
@@ -255,33 +233,6 @@ func reconnectCapturedTip(t *testing.T, ctx context.Context, f *orchestrationtes
 		return 0
 	}
 	return page.CapturedTip
-}
-
-// assertLiveTailIsExactlyOnceInOrder holds a viewer's stream to the rule: no
-// silent gap, no stray, and no enduring sequence delivered twice.
-func assertLiveTailIsExactlyOnceInOrder(t *testing.T, viewer *orchestrationtest.PooledViewer, from, through uint64) {
-	t.Helper()
-	covered, err := orchestrationtest.PooledCoveredThroughFrom(viewer.Records(), from)
-	if err != nil || covered < through {
-		t.Fatalf("the stream %v covers through %d (%v) from %d, want %d with no silent gap", viewer.Records(), covered, err, from, through)
-	}
-	if strays := viewer.Strays(); len(strays) != 0 {
-		t.Fatalf("the viewer received records naming another session: %v", strays)
-	}
-	// PooledCoveredThrough tolerates a duplicate the client already holds,
-	// because a repair may legitimately re-send one; what it cannot tolerate is
-	// the same NEW sequence twice, which is checked here.
-	seen := map[string]int{}
-	for _, record := range viewer.Records() {
-		if strings.HasPrefix(record, "E") {
-			seen[record]++
-		}
-	}
-	for record, count := range seen {
-		if count > 1 {
-			t.Fatalf("the viewer received %s %d times: %v", record, count, viewer.Records())
-		}
-	}
 }
 
 // TestFactoryRepairsAReconnectedBrowserAcrossReplicas is I1.1 CASE 3, in full.
@@ -456,12 +407,16 @@ func assertStoreJournalHolds(t *testing.T, ctx context.Context, world *orchestra
 	assertHoldsExactly(t, "the store's own journal", got[:len(want)], want)
 }
 
-// TestFactoryBRepairsABrowserAfterFactoryADies is I1.1 CASE 4.
+// TestFactoryBRepairsABrowserAfterFactoryADies is I1.1 CASE 4, with exact
+// records.
 //
-// Factory A is killed while a browser is attached to it and events are
-// committed with nothing delivering them. The browser reconnects to Factory B,
-// which must repair it from the JOURNAL SEQUENCE -- it shares no buffer, no
-// cursor and no connection with A.
+// Factory A is killed while a browser is attached to it; events are committed
+// with nothing delivering them; the browser reconnects to Factory B with the
+// cursor it held, and B must repair it from the JOURNAL SEQUENCE -- it shares no
+// buffer, no cursor and no connection with A. The assertion is the records
+// themselves: the browser ends holding exactly what was committed after its
+// cursor, by EventID and sequence, and the events A never delivered came from
+// B's journal read from that cursor.
 //
 // # The approximation, stated
 //
@@ -470,49 +425,91 @@ func assertStoreJournalHolds(t *testing.T, ctx context.Context, world *orchestra
 // buffer is internal and the delivery is a goroutine. What is driven instead is
 // the STATE that window produces and that a replica must recover from -- a
 // replica gone, a browser that was attached to it, and committed events nobody
-// delivered. A narrower test would be a test of this module's timing.
+// delivered. What the browser held when A died is read from the browser, not
+// assumed, so a record A buffered and never sent is simply one the browser does
+// not hold, and B must supply it.
 func TestFactoryBRepairsABrowserAfterFactoryADies(t *testing.T) {
-	ctx, world, replicaA, replicaB, session := reconnectWorld(t)
-	const perInput = orchestrationtest.PooledPublicationsPerInput
-
-	attached := orchestrationtest.ConnectPooledViewer(t, ctx, replicaA, orchestrationtest.PooledTenantA)
-	if err := attached.Watch(t, ctx, orchestrationtest.PooledTenantA, session); err != nil {
-		t.Fatalf("the viewer's subscribe to replica A was refused: %v", err)
-	}
-	reconnectCreate(t, ctx, world, replicaA, session)
-	orchestrationtest.PooledWait(t, "the viewer is covered through the create", 60*time.Second, func() bool {
-		covered, err := orchestrationtest.PooledCoveredThrough(attached.Records())
-		return err == nil && covered >= perInput
+	ctx := placementContext(t)
+	world := orchestrationtest.NewPooledWorld(t, ctx, orchestrationtest.PooledWorldOptions{
+		Tenants:     []sessionwire.TenantID{orchestrationtest.PooledTenantA},
+		DurableTail: true,
 	})
+	pooled := orchestrationtest.StartPooledHost(t, ctx, world, "orchestrationtest-reconnect-host", 4)
+	orchestrationtest.AwaitAdvertised(t, world, pooled.ID)
+	replicaA := orchestrationtest.StartPooledFactory(t, ctx, world, "orchestrationtest-reconnect-a", nil)
+	replicaB := orchestrationtest.StartPooledFactory(t, ctx, world, "orchestrationtest-reconnect-b", nil)
+	const tenant = orchestrationtest.PooledTenantA
+	session := sessionwire.SessionID("session-reconnect-death")
+	const perInput = orchestrationtest.PooledPublicationsPerInput
+	committed := func() []orchestrationtest.PooledCommitted { return world.Tails.Committed(tenant, session) }
+	settledThrough := func(b *orchestrationtest.PooledBrowser, want int) func() bool {
+		return func() bool {
+			all := committed()
+			if len(all) < want {
+				return false
+			}
+			_, position := b.Settle(t, ctx)
+			return position >= all[want-1].JournalSeq
+		}
+	}
 
-	// KILL A, with the browser still attached to it.
+	reconnectCreate(t, ctx, world, replicaA, session)
+	attached := orchestrationtest.OpenPooledBrowser(t, ctx, replicaA, tenant, orchestrationtest.PooledBrowserOptions{})
+	if err := attached.Watch(t, ctx, session, 0); err != nil {
+		t.Fatalf("the browser's subscribe to replica A was refused: %v", err)
+	}
+	attached.Settle(t, ctx)
+	reconnectInput(t, ctx, world, replicaA, session, "command-reconnect-before-death")
+	orchestrationtest.PooledWait(t, "the browser on A holds the create and the first input", 60*time.Second, settledThrough(attached, 2*perInput))
+
+	// KILL A, with the browser still attached to it. What the browser holds
+	// is read AFTER the kill, so anything A had in flight and never sent is
+	// counted as not held.
 	stopCtx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	if err := replicaA.Server.Stop(stopCtx); err != nil {
 		t.Logf("case 4: replica A stopped with %v", err)
 	}
 	cancel()
+	held, cursor := attached.Settle(t, ctx)
+	assertHoldsExactly(t, "the browser on A", held, committed()[:len(held)])
+	attached.Close()
 
 	// Events committed with the browser's replica gone.
 	reconnectInput(t, ctx, world, replicaB, session, "command-reconnect-after-death")
 	orchestrationtest.PooledWait(t, "the events were committed with A gone", 60*time.Second, func() bool {
-		return world.Tails.Tip(orchestrationtest.PooledTenantA, session) == 2*perInput
+		return len(committed()) == 3*perInput
 	})
+	undelivered := committed()[len(held):]
+	assertStoreJournalHolds(t, ctx, world, tenant, session, cursor, undelivered)
 
-	// THE REPAIR, on B: the journal sequence carries what A never delivered.
-	repaired := orchestrationtest.ConnectPooledViewer(t, ctx, replicaB, orchestrationtest.PooledTenantA)
-	if err := repaired.Watch(t, ctx, orchestrationtest.PooledTenantA, session); err != nil {
-		t.Fatalf("the repaired viewer's subscribe to replica B was refused: %v", err)
+	// THE REPAIR, on B, from the cursor the browser held.
+	repaired := orchestrationtest.OpenPooledBrowser(t, ctx, replicaB, tenant, orchestrationtest.PooledBrowserOptions{})
+	if err := repaired.Watch(t, ctx, session, cursor); err != nil {
+		t.Fatalf("the repaired browser's subscribe to replica B was refused: %v", err)
 	}
-	resumed := reconnectCapturedTip(t, ctx, replicaB, session)
-	if resumed < 2*perInput {
-		t.Fatalf("replica B reported captured tip %d, want at least %d: what replica A never delivered is unreachable",
-			resumed, 2*perInput)
-	}
+	repaired.Settle(t, ctx)
 	reconnectInput(t, ctx, world, replicaB, session, "command-reconnect-recovered")
-	orchestrationtest.PooledWait(t, "replica B delivered the continued stream", 60*time.Second, func() bool {
-		covered, err := orchestrationtest.PooledCoveredThroughFrom(repaired.Records(), resumed)
-		return err == nil && covered >= 3*perInput
-	})
-	t.Logf("case 4: the repaired viewer on replica B resumed at %d and received %v", resumed, repaired.Records())
-	assertLiveTailIsExactlyOnceInOrder(t, repaired, resumed, 3*perInput)
+	orchestrationtest.PooledWait(t, "replica B delivered the continued stream", 60*time.Second, settledThrough(repaired, 4*perInput))
+	got, _ := repaired.Settle(t, ctx)
+	t.Logf("case 4: the browser held through %d when A died; on B it repaired %+v and holds %v", cursor, repaired.Repairs(), got)
+
+	assertHoldsExactly(t, "the browser repaired on B", got, committed()[len(held):4*perInput])
+	repairs := repaired.Repairs()
+	if len(repairs) == 0 || repairs[0].From != cursor+1 {
+		t.Fatalf("the first repair on B is %+v, want a read from the held cursor %d", repairs, cursor+1)
+	}
+	assertHoldsExactly(t, "B's repair of what A never delivered", repairs[0].Events, undelivered)
+	var live []orchestrationtest.PooledCommitted
+	for _, event := range repaired.LiveEnduring() {
+		if event.JournalSeq > undelivered[len(undelivered)-1].JournalSeq {
+			live = append(live, event)
+		}
+	}
+	assertHoldsExactly(t, "B's live tail after the repair", live, committed()[3*perInput:4*perInput])
+	if duplicates := repaired.LiveDuplicates(); len(duplicates) != 0 {
+		t.Fatalf("the repaired browser received sequences live more than once: %v", duplicates)
+	}
+	if failures := world.Tails.DurableFailures(); len(failures) != 0 {
+		t.Fatalf("the product failed to commit durably: %v", failures)
+	}
 }
