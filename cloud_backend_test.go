@@ -27,7 +27,6 @@ package tests
 import (
 	"context"
 	"crypto/rand"
-	"crypto/sha256"
 	"crypto/tls"
 	"crypto/x509"
 	"encoding/hex"
@@ -167,13 +166,6 @@ type cloudBackend struct {
 // posture s3store cannot put on the wire itself is refused at Open.
 func openCloudBackend(t testing.TB, ctx context.Context, cfg cloudConfig, dep cloudDeployment) *cloudBackend {
 	t.Helper()
-	return openCloudBackendWith(t, ctx, cfg, dep, laneShims())
-}
-
-// openCloudBackendWith is openCloudBackend with the shims stated explicitly;
-// the known-defect cases open the BARE released modules with cloudShims{}.
-func openCloudBackendWith(t testing.TB, ctx context.Context, cfg cloudConfig, dep cloudDeployment, shims cloudShims) *cloudBackend {
-	t.Helper()
 	dsn, _ := cfg.structuredDSN()
 	openCtx, cancel := context.WithTimeout(ctx, 60*time.Second)
 	defer cancel()
@@ -201,7 +193,7 @@ func openCloudBackendWith(t testing.TB, ctx context.Context, cfg cloudConfig, de
 	if err != nil {
 		t.Fatalf("s3store.Open: %v", s3store.RedactedErrorText(err))
 	}
-	metrics := newCloudMetrics(shims)
+	metrics := newCloudMetrics()
 	composite, err := storage.NewCompositeWithOrderedIndex(
 		timedLedger{structured.Ledger, metrics},
 		timedLeaser{structured.Leaser, metrics},
@@ -222,14 +214,13 @@ func openCloudBackendWith(t testing.TB, ctx context.Context, cfg cloudConfig, de
 // step 4 asks for measurements without identifiers or secrets, and a recorder
 // that never holds one cannot leak one.
 type cloudMetrics struct {
-	shims cloudShims
-
 	mu  sync.Mutex
 	ops map[string]*cloudOpStats
 	// undated counts calls that arrived with NO context deadline, per op,
-	// and remembers the first non-lane caller of each. pgstore and s3store
-	// refuse every such call (DeadlineRequiredError), a precondition the
-	// Storage contract does not state; see cloudShims.
+	// and remembers the first non-lane caller of each. pgstore/s3store v0.1.x
+	// refused every such call (defect D2); v0.2.0 bounds each one by its
+	// DefaultOperationTimeout (30s). The census stays so an operator can see
+	// which callers lean on that provider default.
 	undated       map[string]int
 	undatedCaller map[string]string
 	putBytes      int64
@@ -245,43 +236,13 @@ type cloudOpStats struct {
 	max    time.Duration
 }
 
-func newCloudMetrics(shims cloudShims) *cloudMetrics {
-	return &cloudMetrics{shims: shims, ops: map[string]*cloudOpStats{}, undated: map[string]int{}, undatedCaller: map[string]string{}}
+func newCloudMetrics() *cloudMetrics {
+	return &cloudMetrics{ops: map[string]*cloudOpStats{}, undated: map[string]int{}, undatedCaller: map[string]string{}}
 }
 
-// cloudShims are the two lane-local workarounds for defects found in the
-// released modules (see CLAUDE_RESULT_P3.1.md). Both are ON by default so the
-// rest of the composition can be exercised past them, and both are
-// switched off by LOOPRIG_CLOUD_NO_SHIMS=1, which reproduces each defect in
-// the composition cases themselves. TestCloudKnownDefect* pin each defect
-// against the bare released modules regardless of this switch.
-type cloudShims struct {
-	// defaultDeadline gives a structured or blob call that arrives with no
-	// context deadline a bounded one instead of letting pgstore/s3store
-	// refuse it. Defect D2: host v0.5.0 opens SessionStore on
-	// context.WithoutCancel, so without this no Host composes over pgstore.
-	defaultDeadline time.Duration
-	// hashLongKeys stores a logical blob key longer than
-	// s3storeMinIOMaxLogicalKey under a fixed-length digest key instead.
-	// Defect D1: s3store encodes the whole logical key as ONE object-key
-	// path segment, and MinIO refuses a segment over 255 bytes, so every
-	// SessionStore object key (~235 bytes -> ~314-byte segment) fails.
-	hashLongKeys bool
-}
-
-// s3storeMinIOMaxLogicalKey is the longest logical key s3store v0.1.1 can
-// store on MinIO: base64url(191 bytes) is 255 characters, MinIO's per-segment
-// limit; 192 bytes encodes to 256.
-const s3storeMinIOMaxLogicalKey = 191
-
-func laneShims() cloudShims {
-	if os.Getenv("LOOPRIG_CLOUD_NO_SHIMS") == "1" {
-		return cloudShims{}
-	}
-	return cloudShims{defaultDeadline: 30 * time.Second, hashLongKeys: true}
-}
-
-// bound applies the deadline shim and records a deadline-less call.
+// bound records a deadline-less call. It passes the context through
+// UNCHANGED, so the providers' own default bound is what is exercised. It
+// returns a cancel func only so every call site keeps one shape.
 func (m *cloudMetrics) bound(ctx context.Context, op string) (context.Context, context.CancelFunc) {
 	if _, ok := ctx.Deadline(); ok {
 		return ctx, func() {}
@@ -293,10 +254,7 @@ func (m *cloudMetrics) bound(ctx context.Context, op string) (context.Context, c
 		m.undatedCaller[op] = caller
 	}
 	m.mu.Unlock()
-	if m.shims.defaultDeadline <= 0 {
-		return ctx, func() {}
-	}
-	return context.WithTimeout(ctx, m.shims.defaultDeadline)
+	return ctx, func() {}
 }
 
 // firstForeignCaller names the chain of looprig module frames (outside this
@@ -385,6 +343,16 @@ func (m *cloudMetrics) Calls(op string) int {
 	return 0
 }
 
+// Errors reports how many calls to op failed.
+func (m *cloudMetrics) Errors(op string) int {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if stats := m.ops[op]; stats != nil {
+		return stats.errors
+	}
+	return 0
+}
+
 // Report renders the recorder as a table for a test log.
 func (m *cloudMetrics) Report(label string) string {
 	m.mu.Lock()
@@ -414,7 +382,7 @@ func (m *cloudMetrics) Report(label string) string {
 			undatedOps = append(undatedOps, op)
 		}
 		sort.Strings(undatedOps)
-		fmt.Fprintf(&b, "  calls with NO context deadline (refused by pgstore/s3store unless shimmed=%v):\n", m.shims.defaultDeadline > 0)
+		fmt.Fprintf(&b, "  calls with NO context deadline (bounded by the provider's 30s default):\n")
 		for _, op := range undatedOps {
 			fmt.Fprintf(&b, "    %-20s %5d  first: %s\n", op, m.undated[op], m.undatedCaller[op])
 		}
@@ -568,19 +536,6 @@ type timedBlobs struct {
 
 var _ storage.BlobReaderLifecycle = timedBlobs{}
 
-// errShimmedList is what List answers while the long-key shim is on: a
-// hashed key cannot be listed back under its logical prefix, so a listing
-// would be silently incomplete. Nothing this lane drives lists blobs.
-var errShimmedList = fmt.Errorf("p3.1 lane: Blobs.List is unavailable while the long-key shim (defect D1) is on")
-
-func (b timedBlobs) physical(key string) string {
-	if !b.m.shims.hashLongKeys || len(key) <= s3storeMinIOMaxLogicalKey {
-		return key
-	}
-	sum := sha256.Sum256([]byte(key))
-	return "p31-long-key/" + hex.EncodeToString(sum[:])
-}
-
 func (b timedBlobs) BlobReaderCloseBound() time.Duration { return b.inner.BlobReaderCloseBound() }
 
 func (b timedBlobs) Put(ctx context.Context, key string, r io.Reader) error {
@@ -588,7 +543,7 @@ func (b timedBlobs) Put(ctx context.Context, key string, r io.Reader) error {
 	defer cancel()
 	counted := &countingReader{r: r}
 	started := time.Now()
-	err := b.inner.Put(ctx, b.physical(key), counted)
+	err := b.inner.Put(ctx, key, counted)
 	b.m.observe("blobs.put", started, err)
 	if err == nil {
 		b.m.addPut(counted.n, time.Since(started))
@@ -596,12 +551,12 @@ func (b timedBlobs) Put(ctx context.Context, key string, r io.Reader) error {
 	return err
 }
 
-// Get keeps a shimmed deadline alive until the reader is closed: s3store
-// bounds the returned stream by the Get call's context.
+// Get holds bound's cancel until the reader closes: s3store bounds the
+// returned stream by the Get call's context.
 func (b timedBlobs) Get(ctx context.Context, key string) (io.ReadCloser, error) {
 	ctx, cancel := b.m.bound(ctx, "blobs.get")
 	started := time.Now()
-	reader, err := b.inner.Get(ctx, b.physical(key))
+	reader, err := b.inner.Get(ctx, key)
 	b.m.observe("blobs.get", started, err)
 	if err != nil {
 		cancel()
@@ -614,16 +569,12 @@ func (b timedBlobs) Delete(ctx context.Context, key string) error {
 	ctx, cancel := b.m.bound(ctx, "blobs.delete")
 	defer cancel()
 	started := time.Now()
-	err := b.inner.Delete(ctx, b.physical(key))
+	err := b.inner.Delete(ctx, key)
 	b.m.observe("blobs.delete", started, err)
 	return err
 }
 
 func (b timedBlobs) List(ctx context.Context, prefix string) ([]string, error) {
-	if b.m.shims.hashLongKeys {
-		b.m.observe("blobs.list", time.Now(), errShimmedList)
-		return nil, errShimmedList
-	}
 	ctx, cancel := b.m.bound(ctx, "blobs.list")
 	defer cancel()
 	started := time.Now()

@@ -18,17 +18,18 @@
 // crash-prefix suite over memstore; this lane does not repeat it over real
 // containers.
 //
-// # Measured on the released pins (factory v0.7.1, host v0.5.0, harness
-// v0.36.0, sessionstore v0.13.0, pgstore v0.1.1, s3store v0.1.1)
+// # What the storage-crash phases require (round 2)
 //
-// The PostgreSQL and S3 phases FAIL, and they fail the same way (defect D3 in
-// CLAUDE_RESULT_P3.1.md): one journal write fails during the outage, the
-// harness runtime stops writing its journal, and Host keeps the session
-// resident and keeps claiming commands into it. The next command begins an
-// attempt and sits `applying` with no disposition and no successor to close
-// it, every command behind it stays `pending`, and they are rejected at their
-// apply deadline -- acknowledged input never applied. These cases assert the
-// correct behaviour and are left failing on purpose; they are the record.
+// Round 1 found D3: on host v0.5.0 / harness v0.36.0 one failed journal write
+// left the runtime unable to persist while Host kept it resident, so the
+// session's command stream wedged. harness v0.38.0 reports the latched fault
+// and host v0.8.0 releases such a runtime so a successor RESTORES it. The
+// phases now require, strictly: if the crash failed any runtime journal
+// write, the session is restored by a successor (never restarted); every
+// acknowledged input is applied exactly once, except that the ONE input in
+// flight when a runtime was lost may instead be visibly closed (rejected,
+// outcome not_applied or refused, no effect, never seen by the model); every
+// later input applies; and nothing is left pending, claimed or applying.
 package tests
 
 import (
@@ -44,6 +45,8 @@ import (
 	"time"
 
 	sessionwire "github.com/looprig/core/sessionwire/v1"
+	"github.com/looprig/core/uuid"
+	"github.com/looprig/harness/pkg/event"
 	"github.com/looprig/sessionstore"
 	"github.com/looprig/tests/internal/orchestrationtest"
 )
@@ -52,12 +55,14 @@ import (
 type outageLedger struct {
 	acked     []string
 	ambiguous []string
-	// inFlight names acknowledged commands that were in flight on a Host
-	// that was STOPPED. host v0.5.0's stop is crash-equivalent for an
-	// in-flight attempt: the successor closes it not_applied under a later
-	// journal grant. That is an honest durable outcome rather than a lost
-	// command, so for these ids "rejected with a not_applied outcome" is
-	// accepted as terminal -- and logged, because the user's words were
+	// inFlight names the acknowledged command that was in flight when its
+	// runtime was lost -- a Host stopped (crash-equivalent for an in-flight
+	// attempt) or a runtime abandoned after a persistence fault (host
+	// v0.8.0). The successor settles it from evidence or closes it
+	// not_applied under a later journal grant, or the stopping runtime
+	// refuses it. Either is an honest durable outcome rather than a lost
+	// command, so for these ids "rejected (not_applied or refused) with no
+	// application" is accepted -- and logged, because the user's words were
 	// acknowledged and never applied.
 	inFlight map[string]bool
 }
@@ -130,9 +135,9 @@ func (l *outageLedger) awaitAllApplied(t *testing.T, ctx context.Context, w *orc
 				entry, err := w.Store.GetDispositionCommand(ctx, sessionstore.GetDispositionCommandRequest{
 					TenantID: tenant, SessionID: s, CommandID: sessionwire.CommandID(id),
 				})
-				if err == nil && entry.Record.Outcome != nil && entry.Record.Outcome.Kind == sessionstore.DispositionNotApplied {
-					t.Logf("FINDING: acknowledged %s was in flight when its Host stopped and was closed not_applied by the successor (waited %v); its words must be resent",
-						id, time.Since(started).Round(time.Millisecond))
+				if err == nil && entry.Record.Outcome != nil && visiblyClosed(entry.Record.Outcome.Kind) {
+					t.Logf("FINDING: acknowledged %s was in flight when its runtime was lost and was closed %s (waited %v); its words must be resent",
+						id, entry.Record.Outcome.Kind, time.Since(started).Round(time.Millisecond))
 					break
 				}
 			}
@@ -177,6 +182,15 @@ func streamDiagnosis(ctx context.Context, w *orchestrationtest.PooledWorld, tena
 	cursor, err := w.Store.LoadDispositionCommandCursor(ctx, sessionstore.LoadDispositionCommandCursorRequest{TenantID: tenant, SessionID: s})
 	fmt.Fprintf(&b, "  consumption cursor: consumed_order=%d lease_epoch=%d (err=%v)", cursor.Cursor.ConsumedOrder, cursor.Cursor.LeaseEpoch, err)
 	return b.String()
+}
+
+// visiblyClosed reports the terminal outcomes an in-flight command may take
+// when its runtime is lost: closed not_applied by a successor, or refused by
+// the stopping runtime itself (harness refuses a command write once the
+// runtime is sealed). Both are durable and visible to the caller; neither
+// applied anything.
+func visiblyClosed(kind sessionstore.DispositionOutcomeKind) bool {
+	return kind == sessionstore.DispositionNotApplied || kind == sessionstore.DispositionRefused
 }
 
 // s3ObjectCount counts the raw objects under a deployment prefix.
@@ -258,8 +272,48 @@ func (e *outageEnv) settle(t *testing.T) {
 		apps := evidence.ApplicationsOf(sessionwire.CommandID(id))
 		if e.ledger.inFlight[id] {
 			state, _ := commandState(e.ctx, e.world.PooledWorld, e.tenant, e.session, id)
-			if (state == sessionstore.InboxStateApplied && len(apps) != 1) || len(apps) > 1 {
-				t.Fatalf("in-flight %s is %s with %d applications", id, state, len(apps))
+			switch {
+			case state == sessionstore.InboxStateApplied && len(apps) == 1:
+				t.Logf("in-flight %s applied exactly once", id)
+			case state == sessionstore.InboxStateRejected && len(apps) <= 1:
+				// A visible rejection may carry the runtime's APPLICATION
+				// PREFIX (the intent record written before applying) -- the
+				// S3 shape writes one and is then sealed, so the command is
+				// closed refused -- but it must have had no EFFECT and the
+				// model must never have seen it: an input that reached a turn
+				// and was then reported refused would tell the user to resend
+				// words the agent already acted on.
+				if e.world.LLM.SawInRequest(0, "outage probe "+id) {
+					t.Fatalf("in-flight %s was reported rejected but the model saw its words", id)
+				}
+				entry, err := e.world.Store.GetDispositionCommand(e.ctx, sessionstore.GetDispositionCommandRequest{
+					TenantID: e.tenant, SessionID: e.session, CommandID: sessionwire.CommandID(id),
+				})
+				if err != nil {
+					t.Fatalf("reading in-flight %s: %v", id, err)
+				}
+				runtimeCommand, err := uuid.Parse(string(entry.Record.Descriptor.RuntimeCommandID))
+				if err != nil {
+					t.Fatalf("in-flight %s names runtime command %q: %v", id, entry.Record.Descriptor.RuntimeCommandID, err)
+				}
+				if effects := evidence.EffectsOf(runtimeCommand); effects != 0 {
+					t.Fatalf("in-flight %s was reported %s but its input reached %d turns", id, entry.Record.Outcome.Kind, effects)
+				}
+				t.Logf("in-flight %s was visibly closed %s with %d application prefix(es), no effect, unseen by the model", id, entry.Record.Outcome.Kind, len(apps))
+			default:
+				entry, _ := e.world.Store.GetDispositionCommand(e.ctx, sessionstore.GetDispositionCommandRequest{
+					TenantID: e.tenant, SessionID: e.session, CommandID: sessionwire.CommandID(id),
+				})
+				outcome, effects := "", -1
+				if entry.Record.Outcome != nil {
+					outcome = string(entry.Record.Outcome.Kind)
+				}
+				if runtimeCommand, err := uuid.Parse(string(entry.Record.Descriptor.RuntimeCommandID)); err == nil {
+					effects = evidence.EffectsOf(runtimeCommand)
+				}
+				t.Fatalf("in-flight %s is %s (outcome %q) with %d applications, %d dispositions and %d effects; the model saw its words: %v -- want applied once, or rejected with no effect",
+					id, state, outcome, len(apps), len(evidence.DispositionsOf(sessionwire.CommandID(id))), effects,
+					e.world.LLM.SawInRequest(0, "outage probe "+id))
 			}
 			continue
 		}
@@ -278,8 +332,49 @@ func (e *outageEnv) settle(t *testing.T) {
 		ids = append(ids, string(command.Record.Descriptor.CommandID))
 	}
 	sort.Strings(ids)
+	for _, command := range page.Commands {
+		switch command.Record.State {
+		case sessionstore.InboxStateApplied, sessionstore.InboxStateRejected:
+		default:
+			t.Fatalf("command %s is left %s; nothing may be stuck after recovery\n%s",
+				command.Record.Descriptor.CommandID, command.Record.State, streamDiagnosis(e.ctx, e.world.PooledWorld, e.tenant, e.session))
+		}
+	}
 	if want := uniqueSorted(e.ledger.acked); fmt.Sprint(ids) != fmt.Sprint(want) {
 		t.Fatalf("the session holds commands %v, want exactly the acknowledged set %v", ids, want)
+	}
+}
+
+// journalWriteFailures counts the runtime journal's failed writes so far --
+// the event that latches harness's persistence fault.
+func (e *outageEnv) journalWriteFailures() int {
+	metrics := e.world.journals[e.tenant].Metrics
+	return metrics.Errors("ledger.append") + metrics.Errors("blobs.put")
+}
+
+// requireRestoredBySuccessor requires that, IF the crash failed a runtime
+// journal write (latching the runtime's persistence fault), the faulted
+// runtime was released and the session RESTORED by a successor -- the
+// recovery D3 lacked -- and in every case that the conversation was not
+// restarted. A crash that failed no journal write (PgBouncer in front of a
+// restarting PostgreSQL can hold a query until the server is back) faults
+// nothing, so no restore is owed; that is logged rather than required.
+func (e *outageEnv) requireRestoredBySuccessor(t *testing.T, restoresBefore, failuresBefore int) {
+	t.Helper()
+	restores := len(e.host.Rig.Restores())
+	failures := e.journalWriteFailures() - failuresBefore
+	switch {
+	case failures > 0 && restores <= restoresBefore:
+		t.Fatalf("the crash failed %d runtime journal writes but no successor restored the session (restores %d -> %d); the faulted runtime was never released",
+			failures, restoresBefore, restores)
+	case failures > 0:
+		t.Logf("the crash failed %d runtime journal writes; restored by a successor (restores %d -> %d)", failures, restoresBefore, restores)
+	default:
+		t.Logf("the crash failed no runtime journal write, so nothing faulted and no restore was owed (restores %d -> %d)", restoresBefore, restores)
+	}
+	runtimeID := e.world.RuntimeSessionID(t, e.ctx, e.tenant, e.session)
+	if started := orchestrationtest.CountJournalEvents[event.SessionStarted](t, e.world.PooledWorld, e.tenant, runtimeID); started != 1 {
+		t.Fatalf("the journal holds %d SessionStarted, want 1: the session was restarted, not restored", started)
 	}
 }
 
@@ -290,7 +385,11 @@ func TestCloudOutagesLoseNoAcknowledgedCommandOrObject(t *testing.T) {
 
 	t.Run("PostgreSQL crash and restart", func(t *testing.T) {
 		env := newOutageEnv(t, cfg)
+		restoresBefore, failuresBefore := len(env.host.Rig.Restores()), env.journalWriteFailures()
 		env.post(t, "pg-before", 30*time.Second)
+		// host v0.8.0: the PostgreSQL shape rejects the input in flight at the
+		// crash rather than redelivering it in place.
+		env.ledger.inFlight = map[string]bool{"pg-before": true}
 		cloudDocker(t, "kill", cfg.pgContainer)
 		status := env.post(t, "pg-during", 10*time.Second)
 		t.Logf("PostgreSQL killed; pg-during answered %d", status)
@@ -301,10 +400,18 @@ func TestCloudOutagesLoseNoAcknowledgedCommandOrObject(t *testing.T) {
 		}
 		env.post(t, "pg-after", 60*time.Second)
 		env.settle(t)
+		env.requireRestoredBySuccessor(t, restoresBefore, failuresBefore)
 	})
 
 	t.Run("S3 crash and restart", func(t *testing.T) {
 		env := newOutageEnv(t, cfg)
+		restoresBefore, failuresBefore := len(env.host.Rig.Restores()), env.journalWriteFailures()
+		// s3-during's turn writes to S3, so it is the input in flight when
+		// the runtime faults. host v0.8.0 settles it applied in most runs;
+		// in roughly a third (measured) it is instead closed refused after
+		// its application prefix, which the ledger accepts only with no
+		// effect and unseen by the model.
+		env.ledger.inFlight = map[string]bool{"s3-during": true}
 		cloudDocker(t, "kill", cfg.s3Container)
 		// Admission touches only PostgreSQL, so this can be acknowledged
 		// while S3 is down; its APPLICATION offloads the turn's records to
@@ -319,6 +426,7 @@ func TestCloudOutagesLoseNoAcknowledgedCommandOrObject(t *testing.T) {
 		}
 		env.post(t, "s3-after", 60*time.Second)
 		env.settle(t)
+		env.requireRestoredBySuccessor(t, restoresBefore, failuresBefore)
 	})
 
 	t.Run("Factory stop and a fresh replica", func(t *testing.T) {

@@ -772,6 +772,26 @@ func (s *pooledSession) ReleaseResidency(ctx context.Context) error {
 	return s.controller.(session.Releaser).ReleaseResidency(ctx)
 }
 
+// PersistenceFaulted, PersistenceFault and AbandonResidency are host
+// v0.8.0's optional department.PersistenceFaults capability, forwarded to
+// harness v0.38.0's session.PersistenceFaultReporter and
+// session.ResidencyAbandoner. Without them Host cannot see a latched journal
+// fault and keeps a dead runtime resident, which wedges the session's whole
+// command stream after a storage outage (the P3.1 cloud lane's D3).
+func (s *pooledSession) PersistenceFaulted() <-chan struct{} {
+	return s.controller.(session.PersistenceFaultReporter).PersistenceFaulted()
+}
+
+func (s *pooledSession) PersistenceFault() error {
+	return s.controller.(session.PersistenceFaultReporter).PersistenceFault()
+}
+
+func (s *pooledSession) AbandonResidency(ctx context.Context) error {
+	return s.controller.(session.ResidencyAbandoner).AbandonResidency(ctx)
+}
+
+var _ department.PersistenceFaults = (*pooledSession)(nil)
+
 func (s *pooledSession) LeaseEpoch() (uint64, bool) {
 	return s.controller.(session.LeaseEpochReporter).LeaseEpoch()
 }

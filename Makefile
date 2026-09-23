@@ -65,8 +65,7 @@ mod-check:
 # PostgreSQL, PgBouncer and MinIO containers that scripts/cloud-up.sh starts
 # and scripts/cloud-down.sh removes on exit. Needs Docker; never contacts a
 # cloud. `cloud-bouncer` routes every pgstore pool through PgBouncer in
-# transaction mode. Set LOOPRIG_CLOUD_NO_SHIMS=1 to reproduce the lane's known
-# upstream defects in the composition cases (see cloud_backend_test.go).
+# transaction mode.
 CLOUD_TEST = GOWORK=off go test -count=1 -tags 'integration cloud' -race -timeout 40m -run '^(TestCloud|TestSessionStore)' .
 
 cloud:
