@@ -62,6 +62,10 @@ type PooledHostConfig struct {
 	Drain *host.DrainOptions
 	// WrapCheckpointer, when set, wraps the product's checkpointer.
 	WrapCheckpointer func(host.Checkpointer) host.Checkpointer
+	// WorkspaceBase, when set, is this Host's OWN physical workspace base
+	// path. Empty takes the world's one shared base. See
+	// PooledWorld.WipeWorkspaceDisk.
+	WorkspaceBase string
 	// Mortal gives this Host a durable-plane view (HostProcess) that its
 	// death can cut (PooledHost.Kill) or that can be PAUSED and resumed
 	// (HostProcess.Pause/Resume), as a stopped process would be.
@@ -393,15 +397,18 @@ var (
 // WipeWorkspaceDisk removes every materialized workspace, as a fresh Pod's
 // empty disk would have none. It reports how many session roots it removed.
 //
-// # Why every Host shares ONE physical base path
+// # Why Hosts share ONE physical base path by default
 //
 // harness v0.36.0 folds a workspace placement's canonical PHYSICAL base into the
 // session's config fingerprint (rig.placementFingerprint), and its default
 // restore decider REJECTS a restore whose fingerprint moved ("restore rejected
 // by policy: 1 warn category (workspace)") -- measured here, with each Host on
-// its own directory. So a pooled fleet must mount the workspace base at the
+// its own directory. So, before v0.37.1, a pooled fleet had to mount the base at the
 // same path on every Host, which is what a real deployment of identical Pods
-// does. In one test binary the same path is the same disk, so a case wipes it
+// does. harness v0.37.1 compares two per-session placements by mode alone, so
+// a relocated base now restores; a case proving that gives each Host its own
+// PooledHostConfig.WorkspaceBase. In one test binary the same path is the same
+// disk, so a case using the shared base wipes it
 // between generations: the bytes a successor then reads can only have come
 // from the durable snapshot plane.
 func (w *PooledWorld) WipeWorkspaceDisk(tb TB) int {
@@ -465,32 +472,13 @@ func (p *PooledRig) RuntimeEnded(tenant sessionwire.TenantID, s sessionwire.Sess
 // AssertModelVisiblePathStable checks that a restored generation's tool saw its
 // workspace at the same model-visible path the first generation did.
 //
-// # KNOWN DEFECT IN harness v0.36.0, PINNED SO ITS FIX IS NOTICED
-//
-// A RESTORED session binds its loops' tools with an EMPTY LogicalRoot:
-// restoreTopologySession (internal/sessionruntime/restore_constructor.go:492)
-// hands planLoops `probe.newWorkspaceBinding`, and `probe` is a bare
-// &Session{} whose sessionID is zero, so logicalWorkspaceRoot yields "". The
-// physical root and the bytes are right; the path harness promises is stable
-// across Hosts ("a journalled instruction naming a file must still resolve")
-// is simply absent after every restore. Still present on harness main at
-// cf01e492. harness's own session report (session.WorkspaceStatus) DOES carry
-// the right LogicalRoot after a restore, so the cases assert the model-visible
-// path hard against THAT, and this helper covers the binding: until a release
-// fixes it, an empty restored binding LogicalRoot is logged, not failed; a NON-empty one must equal the first generation's, and the
-// physical root -- the same base path on every Host -- must match.
+// harness v0.36.0 bound every loop planned at restore with an EMPTY
+// LogicalRoot (restoreTopologySession handed planLoops a probe session whose id
+// was zero); harness v0.37.1 fixed it, and this is now a hard assertion.
 func AssertModelVisiblePathStable(tb TB, written, restored PooledWorkspaceRead) {
 	tb.Helper()
 	if written.LogicalRoot == "" {
 		tb.Fatalf("orchestrationtest: the first generation's tool saw no model-visible workspace path")
-		return
-	}
-	if restored.PhysicalRoot != written.PhysicalRoot {
-		tb.Fatalf("orchestrationtest: the workspace moved from %q to %q", written.PhysicalRoot, restored.PhysicalRoot)
-		return
-	}
-	if restored.LogicalRoot == "" {
-		tb.Logf("KNOWN harness v0.36.0 DEFECT: the restored tool binding carries no LogicalRoot (want %q)", written.LogicalRoot)
 		return
 	}
 	if restored.LogicalRoot != written.LogicalRoot {

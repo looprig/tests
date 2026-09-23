@@ -17,6 +17,8 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -184,4 +186,122 @@ func TestAWorkspaceSurvivesAWarmReleaseOntoAnotherHostPerTenant(t *testing.T) {
 	if creates, restores := second.Rig.Creates(), second.Rig.Restores(); len(creates) != 0 || len(restores) != 2 {
 		t.Fatalf("the second Host launched creates=%+v restores=%+v, want two restores and no create", creates, restores)
 	}
+}
+
+// TestAWorkspaceRestoresOntoAHostWithADifferentBase gives each Host its OWN
+// physical workspace base path -- a pod-specific mount, a rollout that moved
+// the mount, pooled and dedicated Pods mounting differently -- and proves a
+// session warm-released on one restores on the other with its bytes and its
+// model-visible path.
+//
+// Up to harness v0.37.0 this restore was REFUSED ("restore rejected by
+// policy: 1 warn category (workspace)"), surfaced to Factory as attach code
+// 100, and the session was never re-placed. harness v0.37.1 compares two
+// per-session placements by mode alone.
+func TestAWorkspaceRestoresOntoAHostWithADifferentBase(t *testing.T) {
+	ctx := placementContext(t)
+	tenant := orchestrationtest.PooledTenantA
+	const s = sessionwire.SessionID("session-relocated-base")
+	const payload = "bytes that crossed to a relocated base 5b1f"
+	world := orchestrationtest.NewPooledWorld(t, ctx, orchestrationtest.PooledWorldOptions{
+		Tenants:       []sessionwire.TenantID{tenant},
+		WithWorkspace: true,
+	})
+	baseA := filepath.Join(t.TempDir(), "pod-a", "workspaces")
+	baseB := filepath.Join(t.TempDir(), "pod-b", "mnt", "work")
+	first := orchestrationtest.StartLifecycleHost(t, ctx, world, "i21-base-a", 4, orchestrationtest.PooledHostConfig{
+		WarmTTL: lifecycleWarmTTL, WorkPoll: lifecycleWorkPoll, WorkspaceBase: baseA,
+	})
+	orchestrationtest.AwaitAdvertised(t, world, first.ID)
+	served := orchestrationtest.StartPooledFactory(t, ctx, world, "i21-base-replica", nil)
+
+	world.LLM.Script(
+		orchestrationtest.PooledTurn{ToolName: orchestrationtest.PooledWriteToolName,
+			ToolInput: fmt.Sprintf(`{"path":"notes.txt","content":%q}`, payload)},
+		orchestrationtest.PooledTurn{Text: "written"},
+	)
+	status, body := served.Post(t, ctx, tenant, "/v1/sessions", sessionwire.CreateRequest{
+		CommandEnvelope: orchestrationtest.PooledEnvelope("base-create"),
+		SessionID:       s,
+		AgentID:         orchestrationtest.PooledAgent,
+		Blocks:          json.RawMessage(`[{"type":"text","text":"write the notes file"}]`),
+	})
+	if status != http.StatusCreated {
+		t.Fatalf("the create answered %d: %s", status, body)
+	}
+	orchestrationtest.PooledWait(t, "the create applied", 90*time.Second, func() bool {
+		return world.CommandState(ctx, tenant, s, "base-create") == sessionstore.InboxStateApplied
+	})
+	runtimeID := world.RuntimeSessionID(t, ctx, tenant, s)
+	orchestrationtest.PooledWait(t, "the first Host released the idle session", 60*time.Second, func() bool {
+		return orchestrationtest.CountJournalEvents[event.TurnDone](t, world, tenant, runtimeID) >= 1 &&
+			first.SessionsIn(t, "resident") == 0 && first.SessionsIn(t, "releasing") == 0
+	})
+	writes := world.WorkspaceTools.Writes()
+	if len(writes) != 1 || !strings.HasPrefix(writes[0].PhysicalRoot, evalSymlinks(t, baseA)) {
+		t.Fatalf("the first generation wrote %+v, want one write under base A %s", writes, baseA)
+	}
+	checkpointSeq, _, found := orchestrationtest.LastCheckpointSeq(t, world, tenant, runtimeID)
+	if !found {
+		t.Fatal("the session was released with no committed checkpoint")
+	}
+	first.Stop()
+
+	second := orchestrationtest.StartLifecycleHost(t, ctx, world, "i21-base-b", 5, orchestrationtest.PooledHostConfig{WorkspaceBase: baseB})
+	orchestrationtest.AwaitAdvertised(t, world, second.ID)
+	world.LLM.Script(
+		orchestrationtest.PooledTurn{ToolName: orchestrationtest.PooledReadToolName, ToolInput: `{"path":"notes.txt"}`},
+		orchestrationtest.PooledTurn{Text: "read"},
+	)
+	status, body = served.Post(t, ctx, tenant, "/v1/sessions/"+string(s)+"/input", sessionwire.InputRequest{
+		CommandEnvelope: orchestrationtest.PooledEnvelope("base-input"),
+		SessionID:       s,
+		Blocks:          json.RawMessage(`[{"type":"text","text":"read the notes file"}]`),
+	})
+	if status != http.StatusOK {
+		t.Fatalf("the input answered %d: %s", status, body)
+	}
+	orchestrationtest.PooledWait(t, "the Host on a relocated base applied the input", 90*time.Second, func() bool {
+		return world.CommandState(ctx, tenant, s, "base-input") == sessionstore.InboxStateApplied
+	})
+	if creates, restores := second.Rig.Creates(), second.Rig.Restores(); len(creates) != 0 || len(restores) != 1 || restores[0].ID != runtimeID {
+		t.Fatalf("the relocated Host launched creates=%+v restores=%+v, want one restore of %s", creates, restores, runtimeID)
+	}
+	var read orchestrationtest.PooledWorkspaceRead
+	orchestrationtest.PooledWait(t, "the relocated agent read its workspace", 60*time.Second, func() bool {
+		reads := world.WorkspaceTools.Reads()
+		if len(reads) == 0 {
+			return false
+		}
+		read = reads[0]
+		return true
+	})
+	if !read.Present || read.Content != payload {
+		t.Fatalf("the relocated generation read present=%v %q, want %q", read.Present, read.Content, payload)
+	}
+	if !strings.HasPrefix(read.PhysicalRoot, evalSymlinks(t, baseB)) || read.PhysicalRoot == writes[0].PhysicalRoot {
+		t.Fatalf("the relocated generation's workspace is at %q, want under base B %s", read.PhysicalRoot, baseB)
+	}
+	orchestrationtest.AssertModelVisiblePathStable(t, writes[0], read)
+	reported := orchestrationtest.AwaitWorkspaceStatus(t, second, tenant, s)
+	if !reported.HasCheckpoint || reported.CheckpointSeq != checkpointSeq || reported.PostCheckpointLoss() {
+		t.Fatalf("the relocated restore reports %+v, want the last checkpoint seq %d and no loss", reported, checkpointSeq)
+	}
+	if reported.LogicalRoot != writes[0].LogicalRoot {
+		t.Fatalf("the relocated restore reports model-visible path %q, want %q", reported.LogicalRoot, writes[0].LogicalRoot)
+	}
+	if got := orchestrationtest.CountJournalEvents[event.SessionStarted](t, world, tenant, runtimeID); got != 1 {
+		t.Fatalf("the journal holds %d SessionStarted, want 1", got)
+	}
+}
+
+// evalSymlinks canonicalizes a path the way harness does, so a macOS
+// /var -> /private/var temp dir compares equal to the root harness reports.
+func evalSymlinks(t *testing.T, path string) string {
+	t.Helper()
+	parent, err := filepath.EvalSymlinks(filepath.Dir(filepath.Dir(path)))
+	if err != nil {
+		t.Fatalf("resolving %s: %v", path, err)
+	}
+	return filepath.Join(parent, filepath.Base(filepath.Dir(path)), filepath.Base(path))
 }

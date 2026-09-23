@@ -16,7 +16,10 @@
 //	registry    the stale Host's route heartbeat, sessionstore's
 //	            PutHostRegistration, caught at its write;
 //	command     the stale Host's SETTLEMENT of a command it had claimed and
-//	            begun an attempt on, caught at its write;
+//	            begun an attempt on, caught at its write. The successor must
+//	            settle it itself, from the durable evidence, and unblock the
+//	            session's stream (host v0.7.1; v0.7.0 blocked on it for good and
+//	            the stale settle then LANDED -- D1 in CLAUDE_RESULT_I2.1.md);
 //	checkpoint  the spec's "checkpoint pointer". SessionStore's checkpoint
 //	            pointers are LEGACY-ONLY and a disposition session has none;
 //	            a Host session's checkpoint pointer is harness's
@@ -180,45 +183,32 @@ func TestAResumedStaleHostsWritesAreFencedByTheStores(t *testing.T) {
 	if status != http.StatusOK {
 		t.Fatalf("the successor's input answered %d: %s", status, body)
 	}
-	// The successor takes both sessions over. It either settles the stale
-	// Host's half-finished command itself or -- host v0.7.0, see KNOWN DEFECT
-	// below -- blocks on it; both are waited for, and which one happened is
-	// recorded rather than assumed.
-	orchestrationtest.PooledWait(t, "the successor took both sessions over", 120*time.Second, func() bool {
+	// The successor takes both sessions over AND SETTLES the stale Host's
+	// half-finished command from its durable evidence, and the session's
+	// command stream is unblocked. host v0.7.0 did not: it called the recovery
+	// closure first, harness refused it over the committed effect, and the
+	// successor blocked on the command for good (D1, fixed in host v0.7.1).
+	orchestrationtest.PooledWait(t, "the successor took both sessions over and settled the half-settled command", 120*time.Second, func() bool {
 		turnOwner, turnFound := world.Registration(t, ctx, tenant, turnSession)
 		idleOwner, idleFound := world.Registration(t, ctx, tenant, idleSession)
 		return turnFound && idleFound && turnOwner.HostID == successor.ID && idleOwner.HostID == successor.ID &&
 			world.CommandState(ctx, tenant, idleSession, "successor-input") == sessionstore.InboxStateApplied &&
-			(world.CommandState(ctx, tenant, turnSession, staleInput) == sessionstore.InboxStateApplied ||
-				successor.Metric(t, "host_sessions_command_blocked") >= 1)
+			world.CommandState(ctx, tenant, turnSession, staleInput) == sessionstore.InboxStateApplied
 	})
 	owner, _ := world.Registration(t, ctx, tenant, turnSession)
 	if owner.LeaseEpoch <= staleOwner.LeaseEpoch {
 		t.Fatalf("the successor holds epoch %d, not above the stale Host's %d", owner.LeaseEpoch, staleOwner.LeaseEpoch)
 	}
 	settled, err := world.Store.GetDispositionCommand(ctx, sessionstore.GetDispositionCommandRequest{TenantID: tenant, SessionID: turnSession, CommandID: staleInput})
-	if err != nil {
-		t.Fatalf("reading the command before the stale Host resumes: %v", err)
+	if err != nil || settled.Record.Outcome == nil || settled.Record.Outcome.Kind != sessionstore.DispositionApplied {
+		t.Fatalf("reading the successor's settlement: %+v %v", settled.Record, err)
 	}
-	// KNOWN DEFECT (host v0.7.0, internal/commands/disposition_applier.go
-	// settleOrRecover): a successor facing an `applying` record whose attempt
-	// names an EARLIER journal grant calls the runtime's recovery closure FIRST
-	// and settles only if the closure succeeds. Here the predecessor's runtime
-	// had already committed its `applied` disposition frame and the turn's
-	// TurnStarted, so harness refuses the closure (EnduringEffectError) -- and
-	// the successor never tries the settlement the durable evidence would
-	// support. The command stays `applying`, the session's consumer blocks
-	// (host_sessions_command_blocked = 1) and every later command queues behind
-	// it, until something else settles it. The trigger is any crash or pause in
-	// the window between the runtime's disposition append and the store settle.
-	wedged := settled.Record.State == sessionstore.InboxStateApplying
-	if wedged {
-		t.Logf("KNOWN host v0.7.0 DEFECT: the successor is blocked on the stale Host's half-settled command "+
-			"(state %s, revision %d, host_sessions_command_blocked=%d); its recovery closure is refused and it never settles from the durable evidence",
-			settled.Record.State, settled.Revision, successor.Metric(t, "host_sessions_command_blocked"))
-	} else if settled.Record.Outcome == nil || uint64(settled.Record.Outcome.SettlingResidencyEpoch) != owner.LeaseEpoch {
-		t.Fatalf("the command settled %+v, want settled by the successor at residency %d", settled.Record.Outcome, owner.LeaseEpoch)
+	if got := uint64(settled.Record.Outcome.SettlingResidencyEpoch); got != owner.LeaseEpoch {
+		t.Fatalf("the half-settled command was settled under residency %d, want the successor's %d", got, owner.LeaseEpoch)
 	}
+	orchestrationtest.PooledWait(t, "the successor's command stream is unblocked", 30*time.Second, func() bool {
+		return successor.Metric(t, "host_sessions_command_blocked") == 0
+	})
 	startedBefore := orchestrationtest.CountJournalEvents[event.SessionStarted](t, world, tenant, turnRuntime)
 
 	// ---- the stale process comes back ------------------------------------
@@ -239,20 +229,6 @@ func TestAResumedStaleHostsWritesAreFencedByTheStores(t *testing.T) {
 		for name, hold := range holds {
 			call := process.Call(hold.Call().Seq)
 			t.Logf("%s: %s %s -> %v", name, call.Op, call.Name, call.Err)
-			if name == "command" && wedged {
-				// THE STORE DID NOT FENCE IT, AND BY ITS OWN CONTRACT IT WOULD
-				// NOT: sessionstore fences a settlement against the CLAIM's
-				// residency high-water and reads no live lease, and the blocked
-				// successor never wrote the record, so the stale Host's
-				// compare-and-swap still names the current revision. Pinned so
-				// that fixing the successor (which then settles, moving the
-				// revision) turns this into an ordinary refusal.
-				if call.Err != nil {
-					t.Errorf("the stale settlement was refused (%v) although the successor never wrote the record; re-derive this case", call.Err)
-				}
-				t.Logf("KNOWN DEFECT, consequence: the superseded Host's in-flight settlement LANDED after the takeover")
-				continue
-			}
 			if call.Err == nil {
 				t.Errorf("the stale Host's in-flight %s write LANDED: %s %s", name, call.Op, call.Name)
 				continue
@@ -286,10 +262,6 @@ func TestAResumedStaleHostsWritesAreFencedByTheStores(t *testing.T) {
 				continue
 			}
 			attempted[kind]++
-			if kind == "command" && wedged {
-				t.Logf("stale command write (known defect path): %s %s -> %v", call.Op, call.Name, call.Err)
-				continue
-			}
 			if call.Err == nil {
 				t.Errorf("a stale %s write LANDED after the successor took over: %s %s", kind, call.Op, call.Name)
 			}
@@ -311,14 +283,7 @@ func TestAResumedStaleHostsWritesAreFencedByTheStores(t *testing.T) {
 		if err != nil || again.Record.Outcome == nil || again.Record.Outcome.Kind != sessionstore.DispositionApplied {
 			t.Fatalf("the command is %+v after the stale Host resumed (%v), want applied", again.Record, err)
 		}
-		if wedged {
-			// The pinned defect's durable trace: settled applied (the evidence
-			// is real) but under the SUPERSEDED residency.
-			if got := uint64(again.Record.Outcome.SettlingResidencyEpoch); got != staleOwner.LeaseEpoch {
-				t.Fatalf("the known-defect settlement names residency %d, want the stale Host's %d", got, staleOwner.LeaseEpoch)
-			}
-			t.Logf("KNOWN DEFECT: the command was settled by the superseded residency %d, not the successor's %d", staleOwner.LeaseEpoch, owner.LeaseEpoch)
-		} else if again.Revision != settled.Revision || uint64(again.Record.Outcome.SettlingResidencyEpoch) != owner.LeaseEpoch {
+		if again.Revision != settled.Revision || uint64(again.Record.Outcome.SettlingResidencyEpoch) != owner.LeaseEpoch {
 			t.Fatalf("the successor's settlement moved after the stale Host resumed: %+v (rev %d, was %d)", again.Record.Outcome, again.Revision, settled.Revision)
 		}
 		for name, runtime := range map[string]string{"journal": turnRuntime.String(), "checkpoint": idleRuntime.String()} {

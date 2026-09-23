@@ -1463,7 +1463,11 @@ func startHostConfigured(tb TB, ctx context.Context, world *PooledWorld, id sess
 		if process != nil && durable != nil {
 			durable = process.View(tb, PlaneWorkspace, durable)
 		}
-		rigs[tenant] = world.defineRig(tb, tenant, journal, durable, world.workspaceBase)
+		base := world.workspaceBase
+		if cfg.WorkspaceBase != "" {
+			base = cfg.WorkspaceBase
+		}
+		rigs[tenant] = world.defineRig(tb, tenant, journal, durable, base)
 		journals[host.EvidenceKey{TenantID: tenant, StorageBindingID: PooledBinding}] =
 			PooledEvidence{Store: journal}
 	}
