@@ -1,8 +1,8 @@
 //go:build integration
 
 // This file is runbook 07 I2.3, DRAIN POOLED HOSTS SAFELY, against released
-// modules: factory v0.8.0 placing onto composed host v0.7.1 processes whose
-// runtimes are real harness v0.37.1 rigs over real harness journals, with
+// modules: factory v0.8.1 placing onto composed host v0.8.1 processes whose
+// runtimes are real harness v0.38.0 rigs over real harness journals, with
 // sessionstore v0.13.0 as the durable plane.
 //
 // # The drain caller
@@ -273,54 +273,40 @@ func TestDrainingAPooledHostStopsAdmissionFirstAndHandsItsSessionsToASuccessor(t
 		}
 	})
 
-	// FINDING (host v0.7.1), pinned as a trip-wire: the drain does NOT halt a
-	// session's command consumer until ReleaseResidency, which runs AFTER the
-	// checkpoint -- whereas the warm release halts it as its step 0
-	// (internal/residency/warm.go, "STEP 0. Halt this Host's consumption"). So
-	// an input admitted while the drain is parked at the session's checkpoint
-	// is CLAIMED AND APPLIED BY THE DRAINING HOST, under its own residency,
-	// while its registration says `releasing` and not accepting, and the turn
-	// it starts runs across the checkpoint the release is supposed to end on.
-	// Nothing is lost -- ReleaseResidency waits for idle -- but a long turn
-	// here would outrun the grace and turn a graceful release into the
-	// crash-equivalent one. The day Host halts consumption at BeginRelease this
-	// row fails, and the input must instead be applied by the successor.
-	t.Run("FINDING: a releasing session's consumer still applies input during the drain", func(t *testing.T) {
+	// THE DRAIN HALTS CONSUMPTION FIRST (host v0.8.1; under v0.7.1 this row
+	// was a pinned finding: the draining Host claimed and applied an input
+	// admitted while the drain was parked at the session's checkpoint, under
+	// its own residency, while its registration said `releasing`). Now the
+	// consumer is halted before the checkpoint, as the warm release halts it
+	// at its step 0, so an input admitted during the drain STAYS PENDING for
+	// the successor: no attempt, no turn on the draining Host. Case 2 proves it
+	// is still pending when the drain ends and that the successor applies it,
+	// exactly once.
+	t.Run("case 1: an input admitted during the drain stays pending on the draining Host", func(t *testing.T) {
 		inputPooled(t, ctx, served, tenant, idle, "idle-drain-input", "during the drain: what was the remembered word?")
-		// A BOUNDED WINDOW, well under the busy session's idle boundary (15s),
-		// so that when the finding is fixed this row fails with its own
-		// message and leaves the drain's timing to case 2. Today the drainee's
-		// consumer claims the input within a poll or two.
+		// A BOUNDED WINDOW, well under the busy session's idle boundary (15s).
+		// Under host v0.7.1 the drainee's consumer claimed the input within a
+		// poll or two, so three seconds is ample to see a regression.
 		const window = 3 * time.Second
 		deadline := time.Now().Add(window)
-		state := world.CommandState(ctx, tenant, idle, "idle-drain-input")
-		for (state == "" || state == sessionstore.InboxStatePending) && time.Now().Before(deadline) {
+		for time.Now().Before(deadline) {
+			if state := world.CommandState(ctx, tenant, idle, "idle-drain-input"); state != sessionstore.InboxStatePending {
+				t.Fatalf("the input admitted during the drain is %q while the drain is parked at the checkpoint, want pending: "+
+					"the draining Host's consumer was not halted", state)
+			}
 			time.Sleep(20 * time.Millisecond)
-			state = world.CommandState(ctx, tenant, idle, "idle-drain-input")
 		}
-		if state == "" || state == sessionstore.InboxStatePending {
-			t.Fatalf("the input admitted during the drain is still %q after %v while the drain is parked at the checkpoint: "+
-				"Host now halts consumption before the drain's checkpoint -- the finding is fixed; update this row "+
-				"(the input must now be applied by the successor, exactly once)", state, window)
-		}
-		orchestrationtest.PooledWait(t, "the input the drainee claimed applied", 10*time.Second, func() bool {
-			return world.CommandState(ctx, tenant, idle, "idle-drain-input") == sessionstore.InboxStateApplied
-		})
 		entry, err := world.Store.GetDispositionCommand(ctx, sessionstore.GetDispositionCommandRequest{TenantID: tenant, SessionID: idle, CommandID: "idle-drain-input"})
-		if err != nil || entry.Record.Attempt == nil {
-			t.Fatalf("reading the input admitted during the drain: %+v, %v", entry.Record.Attempt, err)
+		if err != nil || entry.Record.Attempt != nil {
+			t.Fatalf("the input admitted during the drain carries attempt %+v (err %v), want none", entry.Record.Attempt, err)
 		}
 		owner, found := world.Registration(t, ctx, tenant, idle)
 		if !found || owner.HostID != drainee.ID || owner.Residency != sessionwire.SessionResidencyReleasing {
 			t.Fatalf("while the drain is parked the idle session's owner is %+v (found=%v), want the drainee releasing", owner, found)
 		}
-		if got := uint64(entry.Record.Attempt.ResidencyEpoch); got != firstOwner[idle].LeaseEpoch {
-			t.Fatalf("the input admitted during the drain was applied under residency %d, not the drainee's %d: "+
-				"Host now halts consumption before the drain's checkpoint -- the finding is fixed; update this row", got, firstOwner[idle].LeaseEpoch)
+		if got := turnsCarrying(t, world, tenant, idleRuntime, "during the drain"); got != 0 {
+			t.Fatalf("the draining Host began %d turns for the input admitted during the drain, want none", got)
 		}
-		orchestrationtest.PooledWait(t, "the draining Host began the input's turn", 20*time.Second, func() bool {
-			return turnsCarrying(t, world, tenant, idleRuntime, "during the drain") == 1
-		})
 	})
 
 	var report host.DrainReport
@@ -332,6 +318,12 @@ func TestDrainingAPooledHostStopsAdmissionFirstAndHandsItsSessionsToASuccessor(t
 		orchestrationtest.PooledWait(t, "the busy session reached its drain checkpoint", 20*time.Second, func() bool {
 			return len(holding.Entered()) == 2
 		})
+		// PLACEMENT IS PAUSED for the rest of this row: the idle session holds
+		// the pending input admitted during the drain, so the moment the drain
+		// releases it a running Factory's pending sweep would place it on the
+		// successor and race every released-state assertion below. The next
+		// row starts a fresh replica.
+		served.Stop()
 		holding.Proceed()
 		select {
 		case report = <-stopped:
@@ -401,10 +393,30 @@ func TestDrainingAPooledHostStopsAdmissionFirstAndHandsItsSessionsToASuccessor(t
 		if got := drainee.SessionsIn(t, "resident") + drainee.SessionsIn(t, "releasing"); got != 0 {
 			t.Fatalf("the drained Host still reports %d sessions resident or releasing", got)
 		}
+		// PENDING THROUGH THE WHOLE DRAIN: the input admitted during it was
+		// never attempted by the draining Host.
+		entry, err := world.Store.GetDispositionCommand(ctx, sessionstore.GetDispositionCommandRequest{TenantID: tenant, SessionID: idle, CommandID: "idle-drain-input"})
+		if err != nil || entry.Record.State != sessionstore.InboxStatePending || entry.Record.Attempt != nil {
+			t.Fatalf("after the drain the input admitted during it is %q with attempt %+v (err %v), want pending and never attempted", entry.Record.State, entry.Record.Attempt, err)
+		}
+		if got := turnsCarrying(t, world, tenant, idleRuntime, "during the drain"); got != 0 {
+			t.Fatalf("the draining Host began %d turns for the input admitted during the drain, want none", got)
+		}
 	})
 
 	t.Run("case 2: the successor restores both sessions and nothing is lost or repeated", func(t *testing.T) {
 		requestsAfterDrain := len(world.LLM.Requests())
+		// Placement resumes with a fresh replica. The input admitted during the
+		// drain is the idle session's open work, so the successor restores it
+		// and applies that input -- exactly once, under its own residency.
+		served := orchestrationtest.StartPooledFactory(t, ctx, world, "i23-drain-replica-2", nil)
+		orchestrationtest.PooledWait(t, "the input admitted during the drain applied on the successor", 90*time.Second, func() bool {
+			return world.CommandState(ctx, tenant, idle, "idle-drain-input") == sessionstore.InboxStateApplied
+		})
+		drained, err := world.Store.GetDispositionCommand(ctx, sessionstore.GetDispositionCommandRequest{TenantID: tenant, SessionID: idle, CommandID: "idle-drain-input"})
+		if err != nil || drained.Record.Attempt == nil || uint64(drained.Record.Attempt.ResidencyEpoch) <= firstOwner[idle].LeaseEpoch {
+			t.Fatalf("the input admitted during the drain carries attempt %+v (err %v), want one under the successor's residency above %d", drained.Record.Attempt, err, firstOwner[idle].LeaseEpoch)
+		}
 		inputPooled(t, ctx, served, tenant, idle, "idle-after", "after the drain: recall the remembered word")
 		inputPooled(t, ctx, served, tenant, busy, "busy-after", "after the drain: recall the busy word")
 		for _, c := range []struct {
@@ -543,13 +555,11 @@ func TestDrainingAPooledHostParkedAtAGateIsCrashEquivalentAndBounded(t *testing.
 		if got := orchestrationtest.CountJournalEvents[event.GateOpened](t, world, tenant, runtimeID); got != 1 {
 			t.Fatalf("the journal holds %d GateOpened, want the one the agent raised", got)
 		}
-		// FINDING (host v0.7.1), pinned as a trip-wire: the Host's own
-		// gauge does not see it. Compose wires no GateWaits source into its
-		// metrics, although the same composition's derived work-state source
-		// folds this gate (it is what keeps the session from being
-		// warm-released), so an operator reads zero sessions at a gate.
-		if got := drainee.Metric(t, "host_sessions_gate_waiting"); got != 0 {
-			t.Fatalf("host_sessions_gate_waiting = %d: Host now composes a gate-wait source -- the finding is fixed; assert 1 here", got)
+		// Where the Host's operator reads it: the gate-wait gauge counts the
+		// resident session parked at the gate (host v0.8.1; under v0.7.1 it
+		// always read 0, a pinned finding).
+		if got := drainee.Metric(t, "host_sessions_gate_waiting"); got != 1 {
+			t.Fatalf("host_sessions_gate_waiting = %d while the gated drainee is resident, want 1", got)
 		}
 	})
 
@@ -579,6 +589,9 @@ func TestDrainingAPooledHostParkedAtAGateIsCrashEquivalentAndBounded(t *testing.
 		// THE STEP NAMES ARE HOST'S lifecycle vocabulary (internal, so
 		// spelled here): the idle wait hit its boundary and the runtime
 		// refused a nonterminal release of a session parked at a gate.
+		// host v0.8.1 halts the session's consumer first; that halt must not
+		// time out on a session merely parked at a gate, so a third
+		// `halt_consumption` failure here is a finding, not noise.
 		if len(report.Failures) != 2 || !steps["wait_idle"] || !steps["release_residency"] {
 			t.Fatalf("the drain recorded %+v, want exactly a wait_idle and a release_residency failure", report.Failures)
 		}
