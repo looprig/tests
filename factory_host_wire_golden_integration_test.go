@@ -47,6 +47,7 @@ import (
 	"testing"
 	"time"
 
+	sessionwire "github.com/looprig/core/sessionwire/v1"
 	"github.com/looprig/core/uuid"
 	"github.com/looprig/tests/internal/orchestrationtest"
 )
@@ -159,6 +160,9 @@ func (n *wireNormalizer) value(key string, value any) any {
 		for k, member := range v {
 			out[k] = n.value(k, member)
 		}
+		if _, ok := v["body"]; ok && v["type"] == string(sessionwire.SessionRecordTypeEnduringPublication) {
+			out["body"] = wireFrozenBody()
+		}
 		return out
 	case []any:
 		out := make([]any, len(v))
@@ -190,6 +194,19 @@ func (n *wireNormalizer) value(key string, value any) any {
 	default:
 		return v
 	}
+}
+
+// wireFrozenBody is what an enduring publication's BODY is frozen as.
+//
+// The body is the RUNTIME's content -- Core carries it as an opaque public JSON
+// object -- and since tests v0.12.0 the kit's stream is a real harness
+// runtime's (its committed public events, relayed as host's reference adapter
+// relays them), so a live body is a harness event with per-run ids and times.
+// What these fixtures freeze is the SESSIONWIRE envelope around it; freezing a
+// harness event's shape here would make every harness release a wire change.
+// A replay sends this constant, which is a valid opaque body.
+func wireFrozenBody() map[string]any {
+	return map[string]any{"orchestrationtest_runtime_body": "opaque"}
 }
 
 // ---- denormalization ------------------------------------------------------------

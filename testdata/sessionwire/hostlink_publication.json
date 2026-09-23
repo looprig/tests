@@ -6,8 +6,7 @@
       "pub": {
         "data": {
           "body": {
-            "seq": 0,
-            "tenant": "orchestrationtest-tenant-a"
+            "orchestrationtest_runtime_body": "opaque"
           },
           "covered_through": 0,
           "event_id": "${event_id}",
