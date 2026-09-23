@@ -1,0 +1,12 @@
+{
+  "source": "factory ClientLink/HTTP (version pinned in go.mod), an authenticated principal refused",
+  "request": {
+    "connect_data": "{\"protocol_version\":1}"
+  },
+  "reply": {
+    "close": {
+      "code": 3501,
+      "reason": "bad request"
+    }
+  }
+}

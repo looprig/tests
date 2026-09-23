@@ -68,6 +68,11 @@ type PooledFactoryConfig struct {
 	// reports as its Directory.
 	Directory func(factory.Directory) factory.Directory
 
+	// Authorizer, when set, replaces the permit-everything authorizer. It is
+	// how a case freezes Factory's answer to an authenticated principal that
+	// is NOT authorized (identity.ErrUnauthorized).
+	Authorizer factory.Authorizer
+
 	// ServiceToken is the HostLink credential this replica presents. Empty
 	// takes PooledServiceToken, which the world's Hosts accept; anything else
 	// is refused by every Host.

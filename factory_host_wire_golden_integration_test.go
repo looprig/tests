@@ -16,7 +16,9 @@
 // which runs the producing cases with LOOPRIG_UPDATE_SESSIONWIRE=1 and then
 // fails if git sees a diff -- so a regeneration is always a reviewed change,
 // and an unintended one cannot slip into a commit by being regenerated. An
-// ordinary run (make test, CI) compares instead and fails on any drift.
+// ordinary run compares instead and fails on any drift, so drift fails
+// `make test` and `make release-check`. This repository has no CI workflow of
+// its own: the gate is whoever runs those targets.
 //
 // # What normalization removes, and why only that
 //
@@ -75,6 +77,12 @@ var wireGoldenManifest = []string{
 	"clientlink_session_reset",
 	"clientlink_enduring_publication",
 	"clientlink_connect_unauthenticated",
+	// Factory's refusals of an authenticated principal.
+	"clientlink_connect_unsupported_protocol",
+	"clientlink_connect_malformed_protocol",
+	"clientlink_subscribe_not_authorized",
+	"clientlink_subscribe_cross_tenant",
+	"http_session_read_not_authorized",
 	// controller drain client <-> Host, captured live.
 	"hostlink_drain",
 	"hostlink_drain_status",

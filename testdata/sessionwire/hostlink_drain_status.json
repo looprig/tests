@@ -1,5 +1,5 @@
 {
-  "source": "controller v0.1.1 drain client -> host v0.5.0, captured live",
+  "source": "controller drain client -> host (both pinned in go.mod), captured live",
   "method": "hostlink.drain_status",
   "request": {
     "id": 0,

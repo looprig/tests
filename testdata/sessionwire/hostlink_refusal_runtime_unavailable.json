@@ -1,5 +1,5 @@
 {
-  "source": "a Core-framed probe -> host v0.5.0; the reply is Host's",
+  "source": "a Core-framed probe -> host (pinned in go.mod); the reply is Host's",
   "method": "hostlink.attach",
   "request": {
     "id": 0,

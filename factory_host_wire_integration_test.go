@@ -47,6 +47,15 @@
 // leak between the released pair; it is owed to Factory, and the row that
 // records it fails the day Factory fixes it.
 //
+// # Host answers every refused connect shape with one code
+//
+// Only-unsupported versions, an unknown member, the B8 wrapped shape, a base64
+// list and an empty list are five different mistakes, and Host answers all of
+// them with the same close, 4501 "unsupported wire version". That is frozen
+// honestly, but a peer cannot tell "wrong version" from "malformed request"
+// on the wire. The diagnostic is owed to Host; changing it will move
+// hostlink_connect_negotiation.json, which is the point.
+//
 // # Refusal codes, and the one not driven
 //
 // Core names six HostLink refusal codes. Five are driven against a real Host
@@ -350,7 +359,7 @@ func TestFactoryHostWireGoldens(t *testing.T) {
 	n := liveNormalizer(capture.host.Base, sessions, wireCommandList())
 	hostLines := capture.hostLinesBeforeSever
 	hostExchanges := wireExchanges(hostLines)
-	const factorySource = "factory v0.7.1 -> host v0.5.0, captured live"
+	const factorySource = "factory -> host (released versions pinned in go.mod), captured live"
 
 	t.Run("the HostLink exchanges are the frozen ones", func(t *testing.T) {
 		for name, kind := range map[string]string{
@@ -385,7 +394,7 @@ func TestFactoryHostWireGoldens(t *testing.T) {
 	viewLines := wireLines(t, capture.viewTap)
 	t.Run("the ClientLink frames are the frozen ones", func(t *testing.T) {
 		exchanges := wireExchanges(viewLines)
-		const source = "factory v0.7.1 ClientLink -> centrifuge-go viewer, captured live"
+		const source = "factory ClientLink (pinned in go.mod) -> centrifuge-go viewer, captured live"
 		checkWireGolden(t, "clientlink_connect", goldenExchange(t, n, source, firstExchange(t, exchanges, "connect")))
 		checkWireGolden(t, "clientlink_subscribe", goldenExchange(t, n, source, firstExchange(t, exchanges, "subscribe")))
 		byType := map[string]wireLine{}
@@ -420,33 +429,13 @@ func TestFactoryHostWireGoldens(t *testing.T) {
 
 	t.Run("an unauthenticated viewer is refused, and the refusal is frozen", func(t *testing.T) {
 		before := len(capture.viewTap.Conns())
-		result := rawClientLinkConnect(t, capture.factory, "orchestrationtest-not-a-bearer")
+		result := rawClientLinkConnect(t, capture.factory, "orchestrationtest-not-a-bearer", `{"protocol_version":"1"}`)
 		if result.Connected {
 			t.Fatalf("Factory accepted a ClientLink connect with an unknown bearer")
 		}
-		var refusal any
-		for _, conn := range capture.viewTap.Conns()[before:] {
-			switch status := conn.Status(); {
-			case status == http.StatusSwitchingProtocols:
-				for _, line := range wireLines(t, orchestrationtest.TapOf(conn)) {
-					if line.FromServer {
-						refusal = normalizeLine(t, n, line)
-					}
-				}
-				for _, message := range conn.Messages() {
-					if message.Close && message.FromHost {
-						refusal = map[string]any{"close": map[string]any{"code": message.CloseCode, "reason": message.Reason}}
-					}
-				}
-			case status != 0:
-				refusal = map[string]any{"http_status": status}
-			}
-		}
-		if refusal == nil {
-			t.Fatalf("the tap saw no answer to the unauthenticated connect: %+v", result)
-		}
+		refusal := clientLinkRefusal(t, capture.viewTap, before, n)
 		checkWireGolden(t, "clientlink_connect_unauthenticated", wireGolden{
-			Source: "factory v0.7.1 ClientLink, a connect presenting an unknown bearer",
+			Source: "factory ClientLink (pinned in go.mod), a connect presenting an unknown bearer",
 			Reply:  refusal,
 		})
 	})
@@ -727,14 +716,52 @@ func keysOf[V any](m map[string]V) []string {
 	return out
 }
 
+// clientLinkRefusal is what Factory answered on the connections the tap saw
+// from index before on: an HTTP status for a refused upgrade, or the server's
+// frames and its close for an upgraded one.
+func clientLinkRefusal(t *testing.T, tap *orchestrationtest.HostLinkTap, before int, n *wireNormalizer) any {
+	t.Helper()
+	var refusal map[string]any
+	orchestrationtest.PooledWait(t, "the tap recorded Factory's refusal", 10*time.Second, func() bool {
+		refusal = nil
+		for _, conn := range tap.Conns()[before:] {
+			switch status := conn.Status(); {
+			case status == http.StatusSwitchingProtocols:
+				answer := map[string]any{}
+				var frames []any
+				for _, line := range wireLines(t, orchestrationtest.TapOf(conn)) {
+					if line.FromServer {
+						frames = append(frames, normalizeLine(t, n, line))
+					}
+				}
+				if frames != nil {
+					answer["frames"] = frames
+				}
+				for _, message := range conn.Messages() {
+					if message.Close && message.FromHost {
+						answer["close"] = map[string]any{"code": message.CloseCode, "reason": message.Reason}
+					}
+				}
+				if answer["close"] != nil {
+					refusal = answer
+				}
+			case status != 0:
+				refusal = map[string]any{"http_status": status}
+			}
+		}
+		return refusal != nil
+	})
+	return refusal
+}
+
 // rawClientLinkConnect opens a ClientLink with a caller-chosen bearer and
-// reports whether Factory accepted it.
-func rawClientLinkConnect(t *testing.T, f *orchestrationtest.PooledFactory, bearer string) orchestrationtest.RawConnectResult {
+// connect data, and reports whether Factory accepted it.
+func rawClientLinkConnect(t *testing.T, f *orchestrationtest.PooledFactory, bearer, data string) orchestrationtest.RawConnectResult {
 	t.Helper()
 	endpoint := "ws" + strings.TrimPrefix(f.BaseURL, "http") + "/v1/realtime"
 	client := centrifugego.NewJsonClient(endpoint, centrifugego.Config{
 		Token:            bearer,
-		Data:             []byte(`{"protocol_version":"1"}`),
+		Data:             []byte(data),
 		Header:           http.Header{"Authorization": {"Bearer " + bearer}, "Origin": {f.BaseURL}},
 		Name:             "orchestrationtest-wire-intruder",
 		HandshakeTimeout: 10 * time.Second,
@@ -762,7 +789,7 @@ func rawClientLinkConnect(t *testing.T, f *orchestrationtest.PooledFactory, bear
 	case result := <-done:
 		return result
 	case <-time.After(15 * time.Second):
-		t.Fatalf("the unauthenticated ClientLink connect was neither accepted nor refused")
+		t.Fatalf("the ClientLink connect was neither accepted nor refused")
 		return orchestrationtest.RawConnectResult{}
 	}
 }
@@ -911,7 +938,7 @@ func TestHostLinkHostAnswersGoldens(t *testing.T) {
 	}
 	n := liveNormalizer(pooled.Base, sessions, nil)
 	probe := dialHostProbe(t, pooled.Base, coreConnect(t))
-	const probeSource = "a Core-framed probe -> host v0.5.0; the reply is Host's"
+	const probeSource = "a Core-framed probe -> host (pinned in go.mod); the reply is Host's"
 	refusal := func(name, method string, data []byte, wantCode sessionwire.HostLinkErrorCode) {
 		t.Helper()
 		reply, err := probe.call(t, ctx, method, data)
@@ -974,7 +1001,7 @@ func TestHostLinkHostAnswersGoldens(t *testing.T) {
 		if _, err := drainer.StartDrain(ctx, dedicated.Base, request); err != nil {
 			t.Fatalf("the controller's drain: %v", err)
 		}
-		const drainSource = "controller v0.1.1 drain client -> host v0.5.0, captured live"
+		const drainSource = "controller drain client -> host (both pinned in go.mod), captured live"
 		checkWireGolden(t, "hostlink_drain", goldenExchange(t, dn, drainSource, lastExchange(t, dedicatedTap, sessionwire.HostLinkMethodDrain)))
 
 		// not_admitting: a bind to a Host that has begun draining.
@@ -1041,7 +1068,7 @@ func TestHostLinkHostAnswersGoldens(t *testing.T) {
 			outcomes = append(outcomes, outcome)
 		}
 		checkWireGolden(t, "hostlink_connect_negotiation", wireGolden{
-			Source:  "a centrifuge-go client -> host v0.5.0; the outcome is Host's",
+			Source:  "a centrifuge-go client -> host (pinned in go.mod); the outcome is Host's",
 			Request: requests,
 			Reply:   outcomes,
 		})
@@ -1169,6 +1196,9 @@ type standinOptions struct {
 	register bool
 	// mutateAttachReply edits the frozen attach reply before it is sent.
 	mutateAttachReply func(map[string]any)
+	// connectVersion, when nonzero, replaces the frozen connect reply's
+	// selected wire version.
+	connectVersion int
 }
 
 const (
@@ -1223,6 +1253,9 @@ func startStandinRun(t *testing.T, ctx context.Context, options standinOptions) 
 			methods, _ := reply["hostlink_methods"].([]any)
 			reply["hostlink_methods"] = append(append([]any{}, methods...), "hostlink.command.orchestrationtest_future_kind")
 			reply["orchestrationtest_future_member"] = map[string]any{"any": "shape"}
+			if options.connectVersion != 0 {
+				reply["version"] = options.connectVersion
+			}
 			return json.Marshal(reply)
 		},
 		RPC: func(method string, data []byte) ([]byte, error) {
@@ -1289,6 +1322,35 @@ func (r standinRun) sent(method string) bool {
 	return false
 }
 
+// standinPublication is the frozen HostLink publication, filled for session s
+// at sequence seq.
+func standinPublication(t *testing.T, s sessionwire.SessionID, seq uint64) map[string]any {
+	t.Helper()
+	data := member(loadWireGolden(t, "hostlink_publication").Push, "push", "pub", "data")
+	fill := wireFill{
+		strings:  map[string]string{"${session}": string(s), "${event_id}": fmt.Sprintf("event-standin-%d", seq)},
+		counters: map[string]uint64{"journal_seq": seq, "covered_through": seq, "seq": seq},
+	}
+	record, _ := fill.apply(t, "", data).(map[string]any)
+	return record
+}
+
+// publishUntilSeen republishes record until the viewer holds want. The
+// stand-in's subscribe callback can return before the hub routes the channel
+// to the client, and a push in that window reaches nobody; a repeat of one
+// sequence is a duplicate the relay may drop.
+func publishUntilSeen(t *testing.T, run standinRun, channel string, record map[string]any, want string) {
+	t.Helper()
+	orchestrationtest.PooledWait(t, want+" reached the viewer", 30*time.Second, func() bool {
+		if run.viewer.Has(want) {
+			return true
+		}
+		run.standin.Publish(t, channel, mustJSON(t, record))
+		time.Sleep(100 * time.Millisecond)
+		return run.viewer.Has(want)
+	})
+}
+
 // TestFactoryAcceptsHostGoldensUnchanged drives a REAL Factory against a Host
 // that answers only with the frozen replies. A failure here is a Factory-side
 // wire change: the Host half of every exchange is the frozen one.
@@ -1339,53 +1401,18 @@ func TestFactoryAcceptsHostGoldensUnchanged(t *testing.T) {
 		// obligation and not Factory's: Factory cannot tell a private member
 		// from a future public one. The live leg holds the real Host to it.)
 		//
-		// After it, on the same channel, the stand-in pushes two records naming
-		// ANOTHER session and ANOTHER tenant, which is finding F1 below, and
-		// then a frame that is not a valid Core record, which must not reach
-		// the browser in any form.
-		golden := loadWireGolden(t, "hostlink_publication")
-		data := member(golden.Push, "push", "pub", "data")
-		publication := func(s sessionwire.SessionID, seq uint64) map[string]any {
-			fill := wireFill{
-				strings:  map[string]string{"${session}": string(s), "${event_id}": fmt.Sprintf("event-standin-%d", seq)},
-				counters: map[string]uint64{"journal_seq": seq, "covered_through": seq, "seq": seq},
-			}
-			record, _ := fill.apply(t, "", data).(map[string]any)
-			return record
-		}
+		// After it, on the same channel, the stand-in pushes a frame that is
+		// not a valid Core record, which must not reach the browser in any
+		// form. (Foreign-scope records are finding F1's own run, below.)
+		publication := func(s sessionwire.SessionID, seq uint64) map[string]any { return standinPublication(t, s, seq) }
 		extended := publication(standinSession, 1)
 		extended["orchestrationtest_future_member"] = "retained"
 		// Republished until it lands: the stand-in's subscribe callback can
 		// return before the hub routes the channel to the client, and a push
 		// in that window reaches nobody. A repeat of one sequence is a
 		// duplicate the relay may drop; the first to land is the one asserted.
-		orchestrationtest.PooledWait(t, "the first frozen publication reached the viewer", 30*time.Second, func() bool {
-			if run.viewer.Has("E1") {
-				return true
-			}
-			run.standin.Publish(t, channel, mustJSON(t, extended))
-			time.Sleep(100 * time.Millisecond)
-			return run.viewer.Has("E1")
-		})
-		run.standin.Publish(t, channel, mustJSON(t, publication("session-wire-foreign", 2)))
-		foreignTenant := publication(standinSession, 3)
-		foreignTenant["tenant_id"] = string(orchestrationtest.PooledTenantB)
-		run.standin.Publish(t, channel, mustJSON(t, foreignTenant))
-		// The last push is a valid record at the next sequence. The relay is
-		// ordered per session, so once it (or a reset standing for it) has
-		// arrived, everything pushed before it has been relayed or dropped.
-		run.standin.Publish(t, channel, mustJSON(t, publication(standinSession, 4)))
-		deadline := time.Now().Add(30 * time.Second)
-		for {
-			records := run.viewer.Records()
-			if run.viewer.Has("E4") || strings.HasPrefix(records[len(records)-1], "R") {
-				break
-			}
-			if time.Now().After(deadline) {
-				t.Fatalf("the last frozen publication never reached the viewer; it received %v", records)
-			}
-			time.Sleep(50 * time.Millisecond)
-		}
+		publishUntilSeen(t, run, channel, extended, "E1")
+		publishUntilSeen(t, run, channel, publication(standinSession, 2), "E2")
 		// Only then a record that is valid JSON but not a valid Core record
 		// (no journal_seq). Factory fails the tail CLOSED on it -- measured: it
 		// unsubscribes from the session channel and restarts the tail -- so
@@ -1404,7 +1431,7 @@ func TestFactoryAcceptsHostGoldensUnchanged(t *testing.T) {
 			return n
 		}
 		before := unsubscribes()
-		run.standin.Publish(t, channel, []byte(`{"type":"enduring_publication","tenant_id":"orchestrationtest-tenant-a","session_id":"session-wire-standin","event_id":"orchestrationtest-not-a-record","covered_through":5,"body":{}}`))
+		run.standin.Publish(t, channel, []byte(`{"type":"enduring_publication","tenant_id":"orchestrationtest-tenant-a","session_id":"session-wire-standin","event_id":"orchestrationtest-not-a-record","covered_through":3,"body":{}}`))
 		orchestrationtest.PooledWait(t, "Factory failed the tail closed on the invalid record", 30*time.Second, func() bool {
 			return unsubscribes() > before
 		})
@@ -1412,7 +1439,6 @@ func TestFactoryAcceptsHostGoldensUnchanged(t *testing.T) {
 		// Read off the ClientLink wire itself, not the viewer's summary: a
 		// summary decodes through Core and would hide a frame Core refuses.
 		retained := false
-		foreign := map[string]bool{}
 		for _, line := range wireLines(t, run.viewTap) {
 			if !line.FromServer {
 				continue
@@ -1421,31 +1447,59 @@ func TestFactoryAcceptsHostGoldensUnchanged(t *testing.T) {
 				t.Errorf("LEAK: a malformed Host frame reached the browser: %s", line.Raw)
 			}
 			retained = retained || strings.Contains(string(line.Raw), "orchestrationtest_future_member")
-			for _, needle := range []string{"session-wire-foreign", string(orchestrationtest.PooledTenantB)} {
-				if strings.Contains(string(line.Raw), needle) {
-					foreign[needle] = true
-				}
-			}
 		}
 		if !retained {
 			t.Errorf("Factory dropped a publication member Core retains as forward-compatible; a newer Host's public field would never reach a browser")
 		}
+	})
 
-		// FINDING F1 (factory v0.7.1), RECORDED AS A TRIP-WIRE, NOT ACCEPTED.
-		// Factory relays a Host publication onto the session channel it
-		// arrived on WITHOUT checking that the record names that channel's
-		// tenant and session: a record naming another session of the tenant,
-		// and one naming ANOTHER TENANT, both reach this session's browser.
-		// Only a faulty or compromised Host can send one -- the released Host
-		// scopes its own publications, and the live leg holds it to that -- so
-		// this is a missing defence in depth on Factory's public face, not a
-		// leak between today's released pair. It is owed to Factory (refuse,
-		// and reset the viewer, on a scope mismatch). This lane may not patch
-		// Factory, so the row asserts the defect and FAILS THE DAY IT IS FIXED:
-		// then flip it into a refusal assertion.
-		if !foreign["session-wire-foreign"] || !foreign[string(orchestrationtest.PooledTenantB)] {
-			t.Errorf("F1 HAS LIFTED: Factory no longer relays a Host record naming another session/tenant (%v). "+
-				"Flip this row: assert neither reaches the browser and Strays() is empty.", foreign)
+	// FINDING F1 (factory v0.7.1), RECORDED AS A TRIP-WIRE, NOT ACCEPTED.
+	// Factory relays a Host publication onto the session channel it arrived on
+	// WITHOUT checking that the record names that channel's tenant and session:
+	// a record naming another session of the tenant, and one naming ANOTHER
+	// TENANT, both reach this session's browser. Only a faulty or compromised
+	// Host can send one -- the released Host scopes its own publications, and
+	// the live leg holds it to that -- so this is missing defence in depth on
+	// Factory's public face, not a leak between today's released pair. It is
+	// owed to Factory. This lane may not patch Factory, so the row asserts the
+	// defect and FAILS THE DAY IT IS FIXED.
+	//
+	// It has its OWN stand-in run and judges ONLY the ClientLink wire, over a
+	// bounded window, so it reads "F1 HAS LIFTED" for EITHER plausible fix:
+	// Factory silently dropping the foreign records, or refusing them and
+	// failing the tail closed (which stops everything behind them, so nothing
+	// here may wait for a later record or a reset). Both were proven by
+	// mutating Factory (see CLAUDE_RESULT_I0.2.md, "Fix round").
+	t.Run("F1 trip-wire: a Host record naming another session or tenant reaches the browser", func(t *testing.T) {
+		run := startStandinRun(t, ctx, standinOptions{register: true})
+		channel := sessionwire.HostLinkChannel(wireTenant, standinSession)
+		orchestrationtest.PooledWait(t, "Factory subscribed to the stand-in's session channel", 60*time.Second, func() bool {
+			return run.standin.Subscribed(channel)
+		})
+		// A valid record first: proves the relay is live, so an absence
+		// below is Factory's decision, not a tail that was never up.
+		publishUntilSeen(t, run, channel, standinPublication(t, standinSession, 1), "E1")
+		run.standin.Publish(t, channel, mustJSON(t, standinPublication(t, "session-wire-foreign", 2)))
+		foreignTenant := standinPublication(t, standinSession, 3)
+		foreignTenant["tenant_id"] = string(orchestrationtest.PooledTenantB)
+		run.standin.Publish(t, channel, mustJSON(t, foreignTenant))
+
+		needles := []string{"session-wire-foreign", string(orchestrationtest.PooledTenantB)}
+		foreign := map[string]bool{}
+		deadline := time.Now().Add(5 * time.Second)
+		for time.Now().Before(deadline) && len(foreign) < len(needles) {
+			for _, line := range wireLines(t, run.viewTap) {
+				for _, needle := range needles {
+					if line.FromServer && strings.Contains(string(line.Raw), needle) {
+						foreign[needle] = true
+					}
+				}
+			}
+			time.Sleep(50 * time.Millisecond)
+		}
+		if len(foreign) < len(needles) {
+			t.Fatalf("F1 HAS LIFTED: within 5s Factory relayed %v of the foreign records to the browser, not both. "+
+				"Flip this row: assert neither record reaches the ClientLink wire.", foreign)
 		}
 		t.Logf("F1 (known, owed to Factory): foreign records relayed to this session's browser: %v", run.viewer.Strays())
 	})
@@ -1455,6 +1509,30 @@ func TestFactoryAcceptsHostGoldensUnchanged(t *testing.T) {
 		orchestrationtest.PooledWait(t, "Factory bound on the frozen attach reply", 60*time.Second, func() bool {
 			return run.sent(sessionwire.HostLinkMethodBind)
 		})
+	})
+
+	t.Run("a Host that selects a wire version Factory did not offer is never attached to", func(t *testing.T) {
+		run := startStandinRun(t, ctx, standinOptions{register: true, connectVersion: 2})
+		orchestrationtest.PooledWait(t, "Factory dialled the stand-in", 60*time.Second, func() bool {
+			for _, exchange := range wireExchanges(wireLines(t, run.tap)) {
+				if exchange.Kind == "connect" && exchange.Reply != nil {
+					return true
+				}
+			}
+			return false
+		})
+		// Three guards stand behind this row: Core's reply decoder, Core's
+		// Validate, and Factory's own version check. Only with all three
+		// mutated away does Factory attach (measured), so the row pins the
+		// outcome rather than any one guard.
+		//
+		// Several placement passes: the control arm above attaches within one.
+		time.Sleep(10 * orchestrationtest.ReconcileSweepInterval)
+		for _, rpc := range run.standin.RPCs() {
+			if rpc == sessionwire.HostLinkMethodAttach || rpc == sessionwire.HostLinkMethodBind {
+				t.Fatalf("Factory sent %s to a Host whose connect reply selected wire version 2: %v", rpc, run.standin.RPCs())
+			}
+		}
 	})
 
 	t.Run("an attach reply with an unknown member is refused by Factory's strict decoder", func(t *testing.T) {
@@ -1601,4 +1679,108 @@ func TestSessionwireGoldensDecodeWithCore(t *testing.T) {
 			t.Fatalf("Core does not round-trip releasing: %s %v", data, err)
 		}
 	})
+}
+
+// ---- Factory's public refusals ---------------------------------------------------------------
+
+// TestClientLinkRefusalGoldens freezes what Factory's public face answers an
+// AUTHENTICATED browser it refuses: a ClientLink protocol it does not speak or
+// cannot read, a session the principal is not authorized for (the
+// identity.ErrUnauthorized contract: 403 over HTTP, permission denied 103 over
+// ClientLink), and a session channel of another tenant. The unauthenticated
+// refusal is frozen by the capture above.
+func TestClientLinkRefusalGoldens(t *testing.T) {
+	ctx := wireContext(t)
+	const forbidden = sessionwire.SessionID("session-wire-forbidden")
+	const permitted = sessionwire.SessionID("session-wire-permitted")
+	world := orchestrationtest.NewPooledWorld(t, ctx, orchestrationtest.PooledWorldOptions{})
+	tap := orchestrationtest.NewHostLinkTap()
+	served := orchestrationtest.StartPooledFactoryWith(t, ctx, world, orchestrationtest.PooledFactoryConfig{
+		Replica:                "orchestrationtest-wire-refuser",
+		WithoutPendingCommands: true,
+		Authorizer:             orchestrationtest.DenySessionAuthorizer{Session: forbidden},
+		Listener:               tap.WrapListener,
+	})
+	wireAdmit(t, ctx, served, forbidden, "command-wire-forbidden-create")
+	wireAdmit(t, ctx, served, permitted, "command-wire-permitted-create")
+	n := liveNormalizer("ws://unused.invalid", []sessionwire.SessionID{forbidden, permitted}, nil)
+	const source = "factory ClientLink/HTTP (version pinned in go.mod), an authenticated principal refused"
+
+	for _, row := range []struct {
+		name, data, label string
+	}{
+		{"clientlink_connect_unsupported_protocol", `{"protocol_version":"2"}`, "a protocol_version this build does not speak"},
+		{"clientlink_connect_malformed_protocol", `{"protocol_version":1}`, "a protocol_version that is not a string"},
+	} {
+		t.Run(row.label, func(t *testing.T) {
+			before := len(tap.Conns())
+			result := rawClientLinkConnect(t, served, orchestrationtest.PooledBearers[wireTenant], row.data)
+			if result.Connected {
+				t.Fatalf("Factory accepted a ClientLink connect with %s", row.label)
+			}
+			checkWireGolden(t, row.name, wireGolden{
+				Source:  source,
+				Request: map[string]any{"connect_data": row.data},
+				Reply:   clientLinkRefusal(t, tap, before, n),
+			})
+		})
+	}
+
+	subscribeRefusal := func(t *testing.T, name string, viewerTenant, sessionTenant sessionwire.TenantID, s sessionwire.SessionID) {
+		t.Helper()
+		before := len(tap.Conns())
+		viewer := orchestrationtest.ConnectPooledViewer(t, ctx, served, viewerTenant)
+		defer viewer.Close()
+		if err := viewer.Watch(t, ctx, sessionTenant, s); err == nil {
+			t.Fatalf("%s was allowed to subscribe to %s/%s", viewerTenant, sessionTenant, s)
+		}
+		exchange := lastExchange(t, tapFrom(tap, before), "subscribe")
+		checkWireGolden(t, name, goldenExchange(t, n, source, exchange))
+	}
+
+	t.Run("a session the principal is not authorized for: permission denied (103)", func(t *testing.T) {
+		subscribeRefusal(t, "clientlink_subscribe_not_authorized", wireTenant, wireTenant, forbidden)
+		golden := loadWireGolden(t, "clientlink_subscribe_not_authorized")
+		if code := member(golden.Reply, "error", "code"); fmt.Sprint(code) != "103" {
+			t.Errorf("an unauthorized subscribe answered code %v, want Factory's contract 103 (permission denied)", code)
+		}
+		// Control: the same principal subscribes to a session it may see.
+		viewer := orchestrationtest.ConnectPooledViewer(t, ctx, served, wireTenant)
+		defer viewer.Close()
+		if err := viewer.Watch(t, ctx, wireTenant, permitted); err != nil {
+			t.Fatalf("the permitted subscribe was refused too, so the 103 is not the authorizer's: %v", err)
+		}
+	})
+
+	// Frozen as Factory answers it today, which is NOT a denial: a subscribe
+	// to another tenant's channel is refused by Factory's channel routing as
+	// code 100 "internal server error", temporary -- so a browser is told to
+	// retry a request that can never succeed, and cannot tell it from a
+	// transient fault. The authorizer here would have permitted it; the
+	// refusal is Factory's own. A 103 would be the honest answer; that is
+	// owed to Factory, and fixing it moves this fixture.
+	t.Run("another tenant's session channel", func(t *testing.T) {
+		subscribeRefusal(t, "clientlink_subscribe_cross_tenant", wireTenant, orchestrationtest.PooledTenantB, permitted)
+	})
+
+	t.Run("the HTTP equivalent: 403 not_authorized", func(t *testing.T) {
+		status, body := served.Get(t, ctx, wireTenant, "/v1/sessions/"+string(forbidden)+"/status")
+		if status != http.StatusForbidden {
+			t.Fatalf("an unauthorized session read answered %d: %s", status, body)
+		}
+		frozen, err := n.frame(body)
+		if err != nil {
+			t.Fatalf("the refusal body is not JSON: %s", body)
+		}
+		checkWireGolden(t, "http_session_read_not_authorized", wireGolden{
+			Source: source,
+			Method: "GET /v1/sessions/{sid}/status",
+			Reply:  map[string]any{"status": status, "body": frozen},
+		})
+	})
+}
+
+// tapFrom views the connections a tap saw from index before on.
+func tapFrom(tap *orchestrationtest.HostLinkTap, before int) *orchestrationtest.HostLinkTap {
+	return orchestrationtest.TapOfConns(tap.Conns()[before:])
 }

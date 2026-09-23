@@ -1,0 +1,14 @@
+{
+  "source": "factory ClientLink/HTTP (version pinned in go.mod), an authenticated principal refused",
+  "method": "GET /v1/sessions/{sid}/status",
+  "reply": {
+    "body": {
+      "error": {
+        "code": "not_authorized",
+        "message": "this principal may not perform that operation",
+        "retryable": false
+      }
+    },
+    "status": 403
+  }
+}

@@ -528,3 +528,12 @@ func ReplyTo(replies []WireReply, id uint32) (WireReply, bool) {
 func TapOf(conn *TappedConn) *HostLinkTap {
 	return &HostLinkTap{conns: []*TappedConn{conn}, next: conn.ID}
 }
+
+// TapOfConns views several tapped connections as a tap of their own.
+func TapOfConns(conns []*TappedConn) *HostLinkTap {
+	tap := &HostLinkTap{conns: append([]*TappedConn(nil), conns...)}
+	if len(conns) > 0 {
+		tap.next = conns[len(conns)-1].ID
+	}
+	return tap
+}

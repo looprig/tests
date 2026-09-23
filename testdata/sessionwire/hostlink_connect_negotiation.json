@@ -1,5 +1,5 @@
 {
-  "source": "a centrifuge-go client -> host v0.5.0; the outcome is Host's",
+  "source": "a centrifuge-go client -> host (pinned in go.mod); the outcome is Host's",
   "request": [
     {
       "label": "the current version alone",

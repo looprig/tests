@@ -61,7 +61,7 @@ root-layout:
 # then fails if git sees any diff, so the new fixtures are reviewed and
 # committed rather than slipping in. An ordinary `make test` compares against
 # the committed fixtures and fails on any drift.
-SESSIONWIRE_PRODUCERS := ^(TestFactoryHostWireGoldens|TestHostLinkHostAnswersGoldens)$$
+SESSIONWIRE_PRODUCERS := ^(TestFactoryHostWireGoldens|TestHostLinkHostAnswersGoldens|TestClientLinkRefusalGoldens)$$
 
 sessionwire-goldens:
 	LOOPRIG_UPDATE_SESSIONWIRE=1 LOOPRIG_LIVE_NETWORK=0 GOWORK=off go test -count=1 -tags integration -run '$(SESSIONWIRE_PRODUCERS)' .
