@@ -17,7 +17,7 @@ require (
 	github.com/looprig/factory v0.10.0
 	github.com/looprig/foreignloops v0.3.1
 	github.com/looprig/fsstore v0.5.1
-	github.com/looprig/harness v0.39.0
+	github.com/looprig/harness v0.39.1
 	github.com/looprig/host v0.10.1
 	github.com/looprig/inference v0.12.1
 	github.com/looprig/llm v0.14.1
