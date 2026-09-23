@@ -10,9 +10,8 @@
   },
   "reply": {
     "error": {
-      "code": 100,
-      "message": "internal server error",
-      "temporary": true
+      "code": 103,
+      "message": "permission denied"
     },
     "id": 0
   }

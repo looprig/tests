@@ -38,14 +38,14 @@
 // (ClientLink) frame carries a transport type name, a backend key, a
 // credential, the raw gate answer, a runtime identity or a harness event.
 //
-// # Finding F1, held as a trip-wire
+// # Finding F1, closed by factory v0.8.1
 //
-// factory v0.7.1 relays a Host publication onto the session channel it arrived
-// on without checking that the record names that channel's tenant and session
-// (leg 3 pushes both kinds of foreign record and both reach the browser). Only
-// a faulty Host can send one, so it is missing defence in depth rather than a
-// leak between the released pair; it is owed to Factory, and the row that
-// records it fails the day Factory fixes it.
+// factory v0.7.1 relayed a Host publication onto the session channel it
+// arrived on without checking that the record names that channel's tenant and
+// session. factory v0.8.1 refuses such a record and repairs the tail (a
+// session.reset to viewers, then a re-bind); leg 3 pushes both kinds of
+// foreign record and asserts neither reaches the browser and each is answered
+// by a reset.
 //
 // # Host answers every refused connect shape with one code
 //
@@ -1180,6 +1180,7 @@ func TestHostAnswersFactoryGoldensUnchanged(t *testing.T) {
 // standinRun is one real Factory driving a stand-in Host that answers only
 // with frozen replies.
 type standinRun struct {
+	world   *orchestrationtest.PooledWorld
 	standin *orchestrationtest.ScriptedHost
 	viewer  *orchestrationtest.PooledViewer
 	tap     *orchestrationtest.HostLinkTap
@@ -1305,6 +1306,7 @@ func startStandinRun(t *testing.T, ctx context.Context, options standinOptions) 
 	}
 	wireAdmit(t, ctx, served, standinSession, standinCreate)
 	return standinRun{
+		world:   world,
 		standin: standin,
 		viewer:  viewer,
 		tap:     tap,
@@ -1453,24 +1455,20 @@ func TestFactoryAcceptsHostGoldensUnchanged(t *testing.T) {
 		}
 	})
 
-	// FINDING F1 (factory v0.7.1), RECORDED AS A TRIP-WIRE, NOT ACCEPTED.
-	// Factory relays a Host publication onto the session channel it arrived on
-	// WITHOUT checking that the record names that channel's tenant and session:
-	// a record naming another session of the tenant, and one naming ANOTHER
-	// TENANT, both reach this session's browser. Only a faulty or compromised
-	// Host can send one -- the released Host scopes its own publications, and
-	// the live leg holds it to that -- so this is missing defence in depth on
-	// Factory's public face, not a leak between today's released pair. It is
-	// owed to Factory. This lane may not patch Factory, so the row asserts the
-	// defect and FAILS THE DAY IT IS FIXED.
+	// FINDING F1, CLOSED BY factory v0.8.1. Before it, Factory relayed a Host
+	// publication onto the session channel it arrived on WITHOUT checking that
+	// the record names that channel's tenant and session, so a record naming
+	// another session of the tenant, and one naming ANOTHER TENANT, both
+	// reached this session's browser (this row was a trip-wire holding that).
+	// v0.8.1 refuses such a record: it never reaches a viewer, and the
+	// existing refused-record repair runs -- viewers get a session.reset and
+	// the tail is re-bound. Only a faulty or compromised Host can send one.
 	//
-	// It has its OWN stand-in run and judges ONLY the ClientLink wire, over a
-	// bounded window, so it reads "F1 HAS LIFTED" for EITHER plausible fix:
-	// Factory silently dropping the foreign records, or refusing them and
-	// failing the tail closed (which stops everything behind them, so nothing
-	// here may wait for a later record or a reset). Both were proven by
-	// mutating Factory (see CLAUDE_RESULT_I0.2.md, "Fix round").
-	t.Run("F1 trip-wire: a Host record naming another session or tenant reaches the browser", func(t *testing.T) {
+	// It has its OWN stand-in run and judges the foreign records ONLY on the
+	// ClientLink wire. Each foreign record is pushed on its own tail: a refusal
+	// fails the tail closed, so a record pushed behind the first would be lost
+	// to the teardown, not refused, and would prove nothing.
+	t.Run("F1 closed: a Host record naming another session or tenant is refused and the viewer is reset", func(t *testing.T) {
 		run := startStandinRun(t, ctx, standinOptions{register: true})
 		channel := sessionwire.HostLinkChannel(wireTenant, standinSession)
 		orchestrationtest.PooledWait(t, "Factory subscribed to the stand-in's session channel", 60*time.Second, func() bool {
@@ -1479,29 +1477,72 @@ func TestFactoryAcceptsHostGoldensUnchanged(t *testing.T) {
 		// A valid record first: proves the relay is live, so an absence
 		// below is Factory's decision, not a tail that was never up.
 		publishUntilSeen(t, run, channel, standinPublication(t, standinSession, 1), "E1")
-		run.standin.Publish(t, channel, mustJSON(t, standinPublication(t, "session-wire-foreign", 2)))
+
+		count := func(kind string) int {
+			n := 0
+			for _, exchange := range wireExchanges(wireLines(t, run.tap)) {
+				if exchange.Kind == kind && exchange.Reply != nil {
+					n++
+				}
+			}
+			return n
+		}
+		resets := func() int {
+			n := 0
+			for _, record := range run.viewer.Records() {
+				if strings.HasPrefix(record, "R") {
+					n++
+				}
+			}
+			return n
+		}
 		foreignTenant := standinPublication(t, standinSession, 3)
 		foreignTenant["tenant_id"] = string(orchestrationtest.PooledTenantB)
-		run.standin.Publish(t, channel, mustJSON(t, foreignTenant))
+		for _, push := range []struct {
+			name   string
+			record map[string]any
+		}{
+			{"another session of the tenant", standinPublication(t, "session-wire-foreign", 2)},
+			{"another tenant", foreignTenant},
+		} {
+			// The repair's reset names the session's DURABLE tip, which must
+			// be at or above what the viewer already holds, or Factory closes
+			// the viewer's link instead (an incoherent reset). The stand-in
+			// keeps no journal, so the kit's committed tip stands in for the
+			// one a real Host's runtime would have written first.
+			run.world.Tails.Hint(wireTenant, standinSession)
+			run.world.Tails.Hint(wireTenant, standinSession)
+			subscribes, resetsBefore := count("subscribe"), resets()
+			run.standin.Publish(t, channel, mustJSON(t, push.record))
+			orchestrationtest.PooledWait(t, "the viewer was reset after the record naming "+push.name, 30*time.Second, func() bool {
+				return resets() > resetsBefore
+			})
+			orchestrationtest.PooledWait(t, "Factory re-bound the tail after refusing the record naming "+push.name, 30*time.Second, func() bool {
+				return count("subscribe") > subscribes
+			})
+		}
 
+		// Bounded window after both refusals: neither foreign record may
+		// appear on the ClientLink wire in any form.
 		needles := []string{"session-wire-foreign", string(orchestrationtest.PooledTenantB)}
-		foreign := map[string]bool{}
-		deadline := time.Now().Add(5 * time.Second)
-		for time.Now().Before(deadline) && len(foreign) < len(needles) {
+		deadline := time.Now().Add(2 * time.Second)
+		for {
 			for _, line := range wireLines(t, run.viewTap) {
 				for _, needle := range needles {
 					if line.FromServer && strings.Contains(string(line.Raw), needle) {
-						foreign[needle] = true
+						t.Fatalf("F1 REGRESSED: a Host record naming %q reached the browser: %s", needle, line.Raw)
 					}
 				}
 			}
+			if !time.Now().Before(deadline) {
+				break
+			}
 			time.Sleep(50 * time.Millisecond)
 		}
-		if len(foreign) < len(needles) {
-			t.Fatalf("F1 HAS LIFTED: within 5s Factory relayed %v of the foreign records to the browser, not both. "+
-				"Flip this row: assert neither record reaches the ClientLink wire.", foreign)
+		if strays := run.viewer.Strays(); len(strays) > 0 {
+			t.Fatalf("F1 REGRESSED: the viewer received foreign records: %v", strays)
 		}
-		t.Logf("F1 (known, owed to Factory): foreign records relayed to this session's browser: %v", run.viewer.Strays())
+		t.Logf("F1 closed: the viewer received %v (foreign records refused, each answered by a reset)", run.viewer.Records())
 	})
 
 	t.Run("control: with no registration, the frozen attach reply alone is what makes Factory bind", func(t *testing.T) {
@@ -1752,15 +1793,20 @@ func TestClientLinkRefusalGoldens(t *testing.T) {
 		}
 	})
 
-	// Frozen as Factory answers it today, which is NOT a denial: a subscribe
-	// to another tenant's channel is refused by Factory's channel routing as
-	// code 100 "internal server error", temporary -- so a browser is told to
-	// retry a request that can never succeed, and cannot tell it from a
-	// transient fault. The authorizer here would have permitted it; the
-	// refusal is Factory's own. A 103 would be the honest answer; that is
-	// owed to Factory, and fixing it moves this fixture.
-	t.Run("another tenant's session channel", func(t *testing.T) {
+	// A subscribe to another tenant's channel. The authorizer here would have
+	// permitted it; the refusal is Factory's own. Through factory v0.8.0 it
+	// was code 100 "internal server error", temporary -- a browser was told to
+	// retry a request that can never succeed. factory v0.8.1 answers it
+	// permission denied (103), identical whether or not the session exists.
+	t.Run("another tenant's session channel: permission denied (103)", func(t *testing.T) {
 		subscribeRefusal(t, "clientlink_subscribe_cross_tenant", wireTenant, orchestrationtest.PooledTenantB, permitted)
+		golden := loadWireGolden(t, "clientlink_subscribe_cross_tenant")
+		if code := member(golden.Reply, "error", "code"); fmt.Sprint(code) != "103" {
+			t.Errorf("a cross-tenant subscribe answered code %v, want factory v0.8.1's 103 (permission denied)", code)
+		}
+		if temporary := member(golden.Reply, "error", "temporary"); temporary != nil {
+			t.Errorf("a cross-tenant subscribe is marked temporary (%v): a browser would retry a request that can never succeed", temporary)
+		}
 	})
 
 	t.Run("the HTTP equivalent: 403 not_authorized", func(t *testing.T) {
