@@ -147,8 +147,16 @@ type FactorySeams struct {
 	// ObjectPolicy and ObjectStore compose the object plane. They travel
 	// TOGETHER: factory.New refuses a policy without a resolver, and the
 	// router's legacy-binding fallback is why.
+	//
+	// ObjectStore is the DEPRECATED public-addressed resolver on purpose: the
+	// one lane that composes it (factory_object_reads) seeds its objects under
+	// the PUBLIC session id and proves factory v0.10.0's addressing, which
+	// factory v0.11.0 keeps for this option. A Host session's captures, under
+	// the runtime id, are served by WithSessionObjectStoreResolver instead --
+	// see toolresults.go and package toolresultobjects.
 	ObjectPolicy factory.ObjectPolicy
-	ObjectStore  factory.ObjectStoreResolver
+	//lint:ignore SA1019 the deprecated public-addressed resolver is what this seam exercises (see above).
+	ObjectStore factory.ObjectStoreResolver
 
 	// Reconcile bounds the periodic sweeps. Zero takes Factory's defaults.
 	Reconcile factory.ReconcileLimits
@@ -263,6 +271,7 @@ func NewFactoryFixtureWithSeams(tb TB, store *StoreFixture, clock *Clock, seams 
 	if seams.ObjectPolicy != nil {
 		options = append(options,
 			factory.WithObjectPolicy(seams.ObjectPolicy),
+			//lint:ignore SA1019 the deprecated public-addressed resolver is what this seam exercises (see FactorySeams.ObjectStore).
 			factory.WithObjectStoreResolver(seams.ObjectStore))
 	}
 	if seams.SessionBindingID != "" || seams.SessionBindingVersion != "" {
@@ -274,7 +283,7 @@ func NewFactoryFixtureWithSeams(tb TB, store *StoreFixture, clock *Clock, seams 
 			// (ErrSessionBindingWithoutResolver). A case composing only the
 			// create plane serves no objects, so the resolver it gets refuses
 			// every binding rather than inventing a store.
-			options = append(options, factory.WithObjectStoreResolver(refuseObjectStores))
+			options = append(options, factory.WithSessionObjectStoreResolver(refuseObjectStores))
 		}
 	}
 	if seams.Reconcile != (factory.ReconcileLimits{}) {
@@ -602,6 +611,6 @@ func (d *StoreDirectory) Candidates(ctx context.Context, req sessionstore.ListCo
 // ErrNoObjectStore is what the kit's create-plane resolver answers.
 var ErrNoObjectStore = errors.New("orchestrationtest: this composition serves no object store")
 
-func refuseObjectStores(context.Context, sessionstore.SessionBinding) (factory.ObjectReader, error) {
+func refuseObjectStores(context.Context, sessionwire.TenantID, sessionwire.SessionID, sessionstore.SessionBinding) (factory.ObjectReader, error) {
 	return nil, ErrNoObjectStore
 }

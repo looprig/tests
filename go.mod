@@ -14,11 +14,11 @@ require (
 	github.com/looprig/core v0.11.0
 	github.com/looprig/credentials v0.2.0
 	github.com/looprig/eval v0.2.1
-	github.com/looprig/factory v0.10.0
+	github.com/looprig/factory v0.11.0
 	github.com/looprig/foreignloops v0.3.1
 	github.com/looprig/fsstore v0.5.1
-	github.com/looprig/harness v0.39.0
-	github.com/looprig/host v0.10.1
+	github.com/looprig/harness v0.40.0
+	github.com/looprig/host v0.10.2
 	github.com/looprig/inference v0.12.1
 	github.com/looprig/llm v0.14.1
 	github.com/looprig/mcp v0.7.1
@@ -29,6 +29,7 @@ require (
 	github.com/looprig/secrets v0.2.0
 	github.com/looprig/sessionstore v0.13.0
 	github.com/looprig/storage v0.6.1
+	github.com/looprig/tools v0.14.0
 	k8s.io/client-go v0.37.0
 )
 
