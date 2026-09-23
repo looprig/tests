@@ -194,47 +194,6 @@ func reconnectInput(t *testing.T, ctx context.Context, world *orchestrationtest.
 	})
 }
 
-// reconnectCapturedTip reads one session's journal page through a replica and
-// returns the captured tip it reports.
-//
-// THIS IS HALF OF WHAT A RECONNECTING BROWSER DOES, and the half that carries
-// the events it missed. Measured here: a ClientLink subscribe to a QUIET
-// session delivers NOTHING -- not a publication, not even a journal-tip hint --
-// because the link is a live tail and nothing is being published. A client
-// learns where it is by reading the journal, and the live tail continues from
-// there. A case that waited on the socket alone would wait forever, which is
-// what the first draft of this file did.
-//
-// # THE LIMITATION THIS PUTS ON I1.1 CASE 3, STATED
-//
-// The acceptance row asks the reconnected browser to "observe ALL THREE
-// exactly once and in order". THIS FIXTURE CANNOT SHOW IT THE THREE. It can
-// only show it a NUMBER, and the reason is structural rather than lazy:
-// PooledTails is the PRODUCT's committed stream and SessionStore's journal
-// holds none of it, so orchestrationtest.pooledTipReader reports the product's
-// tip and CLEARS page.Events whenever that tip is above the store's. A
-// reconnecting browser here therefore learns `CapturedTip` and nothing else.
-//
-// That limitation now binds only the cases still run in an ordinary world
-// (case 4 and I1.4 case 1). Case 3 runs in a DurableTail world, where the
-// product's events ARE in SessionStore's own journal, and proves the three
-// missed events themselves arrive -- see
-// TestFactoryRepairsAReconnectedBrowserAcrossReplicas.
-func reconnectCapturedTip(t *testing.T, ctx context.Context, f *orchestrationtest.PooledFactory, session sessionwire.SessionID) uint64 {
-	t.Helper()
-	status, body := f.Get(t, ctx, orchestrationtest.PooledTenantA, "/v1/sessions/"+string(session)+"/journal")
-	if status != http.StatusOK {
-		t.Fatalf("the journal read answered %d: %s", status, body)
-		return 0
-	}
-	var page sessionwire.JournalPage
-	if err := json.Unmarshal(body, &page); err != nil {
-		t.Fatalf("the journal page is not a Core JournalPage (%s): %v", body, err)
-		return 0
-	}
-	return page.CapturedTip
-}
-
 // TestFactoryRepairsAReconnectedBrowserAcrossReplicas is I1.1 CASE 3, in full.
 //
 // A browser holding a cursor disconnects, EXACTLY THREE enduring events are

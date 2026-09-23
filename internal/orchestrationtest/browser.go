@@ -55,8 +55,8 @@ type PooledBrowserOptions struct {
 
 // PooledBrowserEntry is one thing that happened to a browser, in order.
 type PooledBrowserEntry struct {
-	// Kind is "E" (enduring publication), "R" (session.reset), "T" (journal
-	// tip hint), "subscribed", "subscribing", "unsubscribed", "connecting",
+	// Kind is "E" (enduring publication), "X" (ephemeral publication, Seq is
+	// its body's "n"), "R" (session.reset), "T" (journal tip hint), "subscribed", "subscribing", "unsubscribed", "connecting",
 	// "disconnected" or "?" (an undecodable record).
 	Kind    string
 	EventID sessionwire.EventID
@@ -253,6 +253,18 @@ func browserEntryOf(data []byte, tenant sessionwire.TenantID, s sessionwire.Sess
 			return PooledBrowserEntry{Kind: "?", Reason: string(data)}
 		}
 		return PooledBrowserEntry{Kind: "R", Seq: r.LastContiguous, Tip: r.JournalTip, Stray: r.TenantID != tenant || r.SessionID != s}
+	case sessionwire.SessionRecordTypeEphemeralPublication:
+		var x sessionwire.EphemeralPublication
+		if err := x.UnmarshalJSON(data); err != nil {
+			return PooledBrowserEntry{Kind: "?", Reason: string(data)}
+		}
+		// A case numbers its ephemeral bodies {"n":...}; the number is carried
+		// in Seq so order and uniqueness can be read off the log.
+		var numbered struct {
+			N uint64 `json:"n"`
+		}
+		_ = json.Unmarshal(x.Body, &numbered)
+		return PooledBrowserEntry{Kind: "X", Seq: numbered.N, Stray: x.TenantID != tenant || x.SessionID != s}
 	case sessionwire.SessionRecordTypeJournalTip:
 		var t sessionwire.JournalTip
 		if err := t.UnmarshalJSON(data); err != nil {
@@ -302,6 +314,29 @@ func (b *PooledBrowser) LiveEnduring() []PooledCommitted {
 	for _, entry := range b.Log() {
 		if entry.Kind == "E" {
 			out = append(out, PooledCommitted{EventID: entry.EventID, JournalSeq: entry.Seq})
+		}
+	}
+	return out
+}
+
+// Ephemeral reports the numbers of every ephemeral publication that arrived,
+// in arrival order.
+func (b *PooledBrowser) Ephemeral() []uint64 {
+	var out []uint64
+	for _, entry := range b.Log() {
+		if entry.Kind == "X" {
+			out = append(out, entry.Seq)
+		}
+	}
+	return out
+}
+
+// Resets reports every session.reset this browser received.
+func (b *PooledBrowser) Resets() []PooledBrowserEntry {
+	var out []PooledBrowserEntry
+	for _, entry := range b.Log() {
+		if entry.Kind == "R" {
+			out = append(out, entry)
 		}
 	}
 	return out
@@ -478,6 +513,8 @@ func (e PooledBrowserEntry) String() string {
 		return fmt.Sprintf("R%d/%d", e.Seq, e.Tip)
 	case "T":
 		return fmt.Sprintf("T%d", e.Tip)
+	case "X":
+		return fmt.Sprintf("X%d", e.Seq)
 	default:
 		if e.Code != 0 {
 			return fmt.Sprintf("%s(%d %s)", e.Kind, e.Code, e.Reason)

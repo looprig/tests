@@ -1524,12 +1524,12 @@ func startHost(tb TB, ctx context.Context, world *PooledWorld, id sessionwire.Ho
 	if len(taps) > 0 && taps[0] != nil {
 		wrap = taps[0].Wrap
 	}
-	return startHostWrapped(tb, ctx, world, id, generation, fixed, wrap)
+	return startHostWrapped(tb, ctx, world, id, generation, fixed, 0, wrap)
 }
 
 // startHostWrapped is startHost with an arbitrary handler wrapper in front of
 // the Host's real Routes(). A nil wrap serves Routes() as they are.
-func startHostWrapped(tb TB, ctx context.Context, world *PooledWorld, id sessionwire.HostID, generation uint64, fixed sessionwire.SessionID, wrap func(http.Handler) http.Handler) *PooledHost {
+func startHostWrapped(tb TB, ctx context.Context, world *PooledWorld, id sessionwire.HostID, generation uint64, fixed sessionwire.SessionID, pooledCapacity uint64, wrap func(http.Handler) http.Handler) *PooledHost {
 	tb.Helper()
 	raw, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
@@ -1545,6 +1545,8 @@ func startHostWrapped(tb TB, ctx context.Context, world *PooledWorld, id session
 	placement, capacity := sessionwire.HostPlacementPooled, uint64(8)
 	if fixed != "" {
 		placement, capacity = sessionwire.HostPlacementDedicated, 1
+	} else if pooledCapacity > 0 {
+		capacity = pooledCapacity
 	}
 	recorder := &pooledRecorder{}
 	rigs := map[sessionwire.TenantID]*rig.Rig{}

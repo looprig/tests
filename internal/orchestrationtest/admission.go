@@ -108,7 +108,17 @@ func StartPooledFactoryWith(tb TB, ctx context.Context, world *PooledWorld, cfg 
 // real Factory and a real Host without either knowing.
 func StartPooledHostWith(tb TB, ctx context.Context, world *PooledWorld, id sessionwire.HostID, generation uint64, wrap func(http.Handler) http.Handler) *PooledHost {
 	tb.Helper()
-	return startHostWrapped(tb, ctx, world, id, generation, "", wrap)
+	return startHostWrapped(tb, ctx, world, id, generation, "", 0, wrap)
+}
+
+// StartPooledHostSized is StartPooledHostWith with the Host's advertised
+// capacity chosen. Placement skips a Host with no available capacity and ranks
+// the rest by free capacity, so a Host of capacity one that already holds a
+// session is how a case puts its NEXT session on a different Host without any
+// placement seam.
+func StartPooledHostSized(tb TB, ctx context.Context, world *PooledWorld, id sessionwire.HostID, generation, capacity uint64, wrap func(http.Handler) http.Handler) *PooledHost {
+	tb.Helper()
+	return startHostWrapped(tb, ctx, world, id, generation, "", capacity, wrap)
 }
 
 // PostRaw is Post without a test handle, for use from racing goroutines: a
