@@ -9,6 +9,7 @@ import (
 
 	sessionwire "github.com/looprig/core/sessionwire/v1"
 	"github.com/looprig/factory"
+	"github.com/looprig/host"
 	"github.com/looprig/sessionstore"
 	"github.com/looprig/storage"
 )
@@ -45,18 +46,32 @@ func OpenRuntimeJournal(tb TB, ctx context.Context, backend *storage.Composite, 
 // another's configuration.
 var ErrUnknownJournalBinding = fmt.Errorf("orchestrationtest: the journal resolver does not know this binding")
 
-// journalResolver answers journals[tenant] for exactly the one storage
-// binding and version this kit's Factories write, and refuses anything else.
-func journalResolver(bindingID, bindingVersion string, journals func(sessionwire.TenantID) factory.JournalReader) factory.JournalResolver {
-	return func(_ context.Context, tenant sessionwire.TenantID, binding sessionstore.SessionBinding) (factory.JournalReader, error) {
+// journalResolver is the factory.SessionJournalResolver a kit Factory is
+// composed with (factory >= v0.10.0): journals(tenant) wrapped in host's
+// PublicJournals projection, for exactly the one storage binding and version
+// this kit's Factories write, and a refusal of anything else.
+//
+// THE PROJECTION IS host v0.10.0's CONSUMER OBLIGATION. A harness public body
+// names the RUNTIME session id and runtime command ids, which are private
+// (finding W1); Host projects them on the live tail it relays, but Factory
+// reads /journal and every repair tip from the runtime journal directly, so
+// the composition must apply the same projection there or /journal hands a
+// browser exactly what the live tail withholds.
+//
+// public is ONE PublicJournals per DEPLOYMENT: per process in a product main
+// (kindcontrol), per world here, because one test process hosts many worlds
+// that reuse tenant and session names over different stores, and the cache is
+// keyed by (tenant, session, runtime).
+func journalResolver(bindingID, bindingVersion string, public *host.PublicJournals, journals func(sessionwire.TenantID) *sessionstore.Store) factory.SessionJournalResolver {
+	return func(_ context.Context, tenant sessionwire.TenantID, session sessionwire.SessionID, binding sessionstore.SessionBinding) (factory.JournalReader, error) {
 		if binding.StorageBindingID != bindingID || binding.BindingVersion != bindingVersion {
 			return nil, fmt.Errorf("%w: %q/%q", ErrUnknownJournalBinding, binding.StorageBindingID, binding.BindingVersion)
 		}
-		reader := journals(tenant)
-		if reader == nil {
+		store := journals(tenant)
+		if store == nil {
 			return nil, fmt.Errorf("%w: no runtime journal for tenant %q", ErrUnknownJournalBinding, tenant)
 		}
-		return reader, nil
+		return public.Reader(store, tenant, session, binding)
 	}
 }
 

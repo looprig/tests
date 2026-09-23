@@ -332,6 +332,13 @@ const PooledAskToolName = "orchestrationtest_ask"
 // next model request -- and it can only get there through this result.
 type PooledAskTool struct {
 	Question string
+	// ReplaySafe is what the tool answers to harness v0.39.0's
+	// tool.UserInputReplaySafe. It does nothing before it asks (the counters
+	// are the test's own bookkeeping), so declaring it is honest; a case sets
+	// it before the first session starts. With it an ask_user gate SURVIVES a
+	// restore and the answer reaches the tool on the successor; without it
+	// harness keeps the old close-at-restore (restore_unavailable).
+	ReplaySafe bool
 
 	mu      sync.Mutex
 	calls   int
@@ -448,9 +455,17 @@ func (t *PooledAskTool) Answers() []string {
 	return append([]string(nil), t.answers...)
 }
 
+// UserInputReplaySafe satisfies tool.UserInputReplaySafe. See ReplaySafe.
+func (t *PooledAskTool) UserInputReplaySafe() bool {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	return t.ReplaySafe
+}
+
 var (
-	_ tool.InvokableTool = (*PooledAskTool)(nil)
-	_ tool.CallPreparer  = (*PooledAskTool)(nil)
+	_ tool.InvokableTool       = (*PooledAskTool)(nil)
+	_ tool.CallPreparer        = (*PooledAskTool)(nil)
+	_ tool.UserInputReplaySafe = (*PooledAskTool)(nil)
 )
 
 // pooledAllowAll is the access gate the gated loop runs under.
@@ -1483,6 +1498,10 @@ type PooledWorld struct {
 	// world.
 	RuntimeJournals map[sessionwire.TenantID]*sessionstore.Store
 
+	// publicJournals is this world's one host.PublicJournals: the projection
+	// every Factory's journal resolver reads through (one per deployment).
+	publicJournals *host.PublicJournals
+
 	tenants  []sessionwire.TenantID
 	gated    bool
 	hostLogs io.Writer
@@ -1577,6 +1596,7 @@ func NewPooledWorld(tb TB, ctx context.Context, options PooledWorldOptions) *Poo
 		LLM:      NewPooledLLM(),
 
 		RuntimeJournals: map[sessionwire.TenantID]*sessionstore.Store{},
+		publicJournals:  host.NewPublicJournals(0),
 
 		journalBackends: map[sessionwire.TenantID]*storage.Composite{},
 		Tails:           NewPooledTails(),
@@ -2188,20 +2208,18 @@ func (pooledAuthorizer) AuthorizeSubscribe(context.Context, identity.Principal, 
 
 func (pooledAuthorizer) AuthorizeServiceSweep(context.Context, identity.Principal) error { return nil }
 
-// JournalResolver is the factory.JournalResolver every Factory this world
-// starts is composed with -- factory v0.9.0 refuses one that creates or places
-// Host sessions without it. It answers the product journal in a DurableTail
-// world and the tenant's harness runtime journal otherwise, for this kit's one
+// JournalResolver is the factory.SessionJournalResolver every Factory this
+// world starts is composed with -- factory refuses one that creates or places
+// Host sessions without a resolver. It answers the product journal in a
+// DurableTail world and the tenant's harness runtime journal otherwise, both
+// through the world's one host.PublicJournals projection, for this kit's one
 // storage binding only.
-func (world *PooledWorld) JournalResolver() factory.JournalResolver {
-	return journalResolver(PooledBinding, PooledBindingVersion, func(tenant sessionwire.TenantID) factory.JournalReader {
+func (world *PooledWorld) JournalResolver() factory.SessionJournalResolver {
+	return journalResolver(PooledBinding, PooledBindingVersion, world.publicJournals, func(tenant sessionwire.TenantID) *sessionstore.Store {
 		if world.ProductJournal != nil {
 			return world.ProductJournal
 		}
-		if runtime := world.RuntimeJournals[tenant]; runtime != nil {
-			return runtime
-		}
-		return nil
+		return world.RuntimeJournals[tenant]
 	})
 }
 
@@ -2360,7 +2378,7 @@ func pooledFactoryOptions(tb TB, world *PooledWorld, cfg PooledFactoryConfig, pl
 		factory.WithCredentialVerifier(pooledVerifier{}),
 		factory.WithAuthorizer(authorizer),
 		factory.WithSessionReader(world.Store),
-		factory.WithJournalResolver(world.JournalResolver()),
+		factory.WithSessionJournalResolver(world.JournalResolver()),
 		factory.WithCommands(commands),
 		factory.WithDirectory(directory),
 		factory.WithCatalog(world.Store),

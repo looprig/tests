@@ -15,6 +15,7 @@ import (
 	sessionwire "github.com/looprig/core/sessionwire/v1"
 	"github.com/looprig/factory"
 	"github.com/looprig/factory/identity"
+	"github.com/looprig/host"
 	"github.com/looprig/sessionstore"
 )
 
@@ -283,14 +284,16 @@ func NewFactoryFixtureWithSeams(tb TB, store *StoreFixture, clock *Clock, seams 
 		options = append(options, factory.WithPendingCommands(seams.PendingCommands))
 	}
 	if seams.SessionBindingID != "" || seams.SessionBindingVersion != "" || seams.PendingCommands != nil {
-		// factory v0.9.0 REFUSES a replica that creates or places Host
-		// sessions with no journal resolver: a Host session's journal is its
-		// runtime's, and this fixture's runtime journal is store.Journal's.
+		// factory REFUSES a replica that creates or places Host sessions with
+		// no journal resolver: a Host session's journal is its runtime's, and
+		// this fixture's runtime journal is store.Journal's -- read through
+		// host's public projection (host v0.10.0), so /journal carries no
+		// runtime id.
 		runtime := store.RuntimeJournal
-		options = append(options, factory.WithJournalResolver(journalResolver(
-			seams.SessionBindingID, seams.SessionBindingVersion,
-			func(tenant sessionwire.TenantID) factory.JournalReader {
-				if tenant != store.Tenant || runtime == nil {
+		options = append(options, factory.WithSessionJournalResolver(journalResolver(
+			seams.SessionBindingID, seams.SessionBindingVersion, host.NewPublicJournals(0),
+			func(tenant sessionwire.TenantID) *sessionstore.Store {
+				if tenant != store.Tenant {
 					return nil
 				}
 				return runtime

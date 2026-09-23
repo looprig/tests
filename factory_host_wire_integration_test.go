@@ -74,6 +74,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"net/url"
 	"reflect"
 	"sort"
 	"strings"
@@ -538,25 +539,16 @@ func TestFactoryHostWireGoldens(t *testing.T) {
 
 	t.Run("no public frame leaks a private value", func(t *testing.T) {
 		forbidden := wireForbidden(t, ctx, capture)
-		// THE RUNTIME'S OWN PUBLIC BODIES ARE JUDGED SEPARATELY, and that is
-		// the tests v0.12.0 change, not a relaxation of a Factory claim. Until
-		// then the kit's publication stream was synthetic -- {"tenant","seq"}
-		// -- so a body could carry nothing. The stream is now the harness
-		// runtime's own committed public events, relayed exactly as host's
-		// reference adapter relays them, because factory v0.9.0 reads the
-		// journal from that runtime (WithJournalResolver) and a live position
-		// must be a position in it. A harness public body is the agent's
-		// CONVERSATION and harness's public event vocabulary, so the event type
-		// names and whatever the agent was told (the ask tool's result echoes
-		// the user's answer) are content, not leaks. What the RUNTIME
-		// IDENTITIES in those bodies are is FINDING W1, below.
-		//
-		// Everything OUTSIDE a publication body -- envelopes, replies, command
-		// deliveries, resets, hints -- is held to the whole list, as before.
-		bodyScoped := func(name string) bool {
+		// The kit's stream is a real harness runtime's committed public events
+		// (tests v0.12.0), so a publication BODY is the agent's conversation in
+		// harness's public vocabulary: the event type names, and whatever the
+		// agent was told -- the ask tool's result echoes the user's answer into
+		// the agent's own StepDone -- are content. Those two and only those two
+		// are judged outside the body. The RUNTIME IDENTITIES are held to the
+		// whole frame, body included: host v0.10.0 projects them out of every
+		// relayed body (FINDING W1, closed; see the row below).
+		bodyContent := func(name string) bool {
 			return strings.HasPrefix(name, "the raw gate answer") ||
-				strings.HasPrefix(name, "a runtime session identity") ||
-				strings.HasPrefix(name, "a runtime command identity") ||
 				strings.HasPrefix(name, "the harness event ")
 		}
 		scanned := 0
@@ -569,7 +561,7 @@ func TestFactoryHostWireGoldens(t *testing.T) {
 			outside := strings.ToLower(withoutPublicationBody(t, line))
 			for name, needle := range forbidden {
 				haystack := lowered
-				if bodyScoped(name) {
+				if bodyContent(name) {
 					haystack = outside
 				}
 				if strings.Contains(haystack, strings.ToLower(needle)) {
@@ -581,49 +573,130 @@ func TestFactoryHostWireGoldens(t *testing.T) {
 			t.Fatalf("no ClientLink frame was scanned")
 		}
 		// The HostLink is internal, but its contract is that private payload
-		// stays in the durable inbox: a delivery carries a public CommandID and
-		// nothing else. (The credential legitimately crosses in the connect.)
+		// stays in the durable inbox and runtime ids stay on the Host: a
+		// delivery carries a public CommandID, and a publication a projected
+		// body. (The credential legitimately crosses in the connect.)
 		for _, line := range hostLines {
 			outside := withoutPublicationBody(t, line)
 			for name, needle := range forbidden {
-				private := strings.HasPrefix(name, "the raw gate answer") ||
-					strings.HasPrefix(name, "a runtime session identity") ||
-					strings.HasPrefix(name, "a runtime command identity")
-				if private && strings.Contains(outside, needle) {
-					t.Errorf("LEAK: a HostLink frame carries %s (%q): %s", name, needle, line.Raw)
+				switch {
+				case strings.HasPrefix(name, "a runtime session identity") || strings.HasPrefix(name, "a runtime command identity"):
+					if strings.Contains(string(line.Raw), needle) {
+						t.Errorf("LEAK: a HostLink frame carries %s (%q): %s", name, needle, line.Raw)
+					}
+				case strings.HasPrefix(name, "the raw gate answer"):
+					if strings.Contains(outside, needle) {
+						t.Errorf("LEAK: a HostLink frame carries %s (%q): %s", name, needle, line.Raw)
+					}
 				}
 			}
 		}
 	})
 
-	// FINDING W1 (harness public projection, relayed by host and factory),
-	// PINNED AS A TRIP-WIRE. A harness runtime's committed public event body
-	// carries the RUNTIME session id ("session_id") and, on a command's
-	// events, the RUNTIME command id ("cause.command_id"). host's reference
-	// adapter publishes that body verbatim and factory v0.9.0 relays it -- and
-	// serves it from /journal through the resolver -- so every browser of a
-	// Host session holds the ids this suite's I0.2 row called private. It
-	// could not be seen before: the kit's synthetic bodies carried neither.
-	// Whether the runtime ids are private is an owner ruling; until one lands
-	// this row holds what ships. When it fires, update it.
-	t.Run("FINDING W1: a harness public body carries the runtime session and command ids", func(t *testing.T) {
+	// FINDING W1, CLOSED BY host v0.10.0 + factory v0.10.0 (this row was a
+	// trip-wire holding it). A harness public body names the RUNTIME session
+	// id and, on command-caused events, the RUNTIME command id. host v0.10.0
+	// projects every relayed body -- the runtime session id becomes the public
+	// one, an admitted runtime command id the public CommandID the client
+	// admitted -- and the kit's Factories read /journal through
+	// host.NewPublicJournals via factory.WithSessionJournalResolver, so the
+	// durable read is projected byte-for-byte the same.
+	t.Run("W1 closed: bodies carry public ids only, live and from /journal", func(t *testing.T) {
 		forbidden := wireForbidden(t, ctx, capture)
-		found := map[string]bool{}
-		for _, line := range viewLines {
-			if !line.FromServer || member(line.Object, "push", "pub") == nil {
-				continue
+		private := map[string]string{}
+		for name, needle := range forbidden {
+			if strings.HasPrefix(name, "a runtime session identity") || strings.HasPrefix(name, "a runtime command identity") {
+				private[name] = needle
 			}
-			for name, needle := range forbidden {
-				if (strings.HasPrefix(name, "a runtime session identity") || strings.HasPrefix(name, "a runtime command identity")) &&
-					strings.Contains(string(line.Raw), needle) {
-					found[name] = true
+		}
+		if len(private) == 0 {
+			t.Fatalf("no runtime identity to look for; the check is vacuous")
+		}
+		// Every public CommandID the scenario admitted.
+		admitted := map[string]bool{}
+		for _, command := range wireCommands {
+			admitted[string(command)] = true
+		}
+		checkBody := func(where string, session sessionwire.SessionID, body map[string]any, raw string) (sawCause bool) {
+			for name, needle := range private {
+				if strings.Contains(raw, needle) {
+					t.Errorf("W1: %s carries %s (%q): %s", where, name, needle, raw)
 				}
 			}
+			if named, ok := body["session_id"]; ok && named != string(session) {
+				t.Errorf("W1: %s names session_id %v, want the public %q: %s", where, named, session, raw)
+			}
+			cause, _ := body["cause"].(map[string]any)
+			if id, ok := cause["command_id"]; ok {
+				if !admitted[fmt.Sprint(id)] {
+					t.Errorf("W1: %s names cause.command_id %v, not a CommandID the client admitted: %s", where, id, raw)
+				}
+				return true
+			}
+			return false
 		}
-		if len(found) == 0 {
-			t.Fatalf("no ClientLink publication body carries a runtime session or command id any more -- FINDING W1 is fixed; update this row")
+
+		// Live: every enduring publication a viewer received.
+		live, causes := 0, 0
+		for _, line := range viewLines {
+			if !line.FromServer {
+				continue
+			}
+			data, ok := member(line.Object, "push", "pub", "data").(map[string]any)
+			if !ok || data["type"] != string(sessionwire.SessionRecordTypeEnduringPublication) {
+				continue
+			}
+			body, _ := data["body"].(map[string]any)
+			session := sessionwire.SessionID(fmt.Sprint(data["session_id"]))
+			encoded, _ := json.Marshal(body)
+			live++
+			if checkBody("a live publication body", session, body, string(encoded)) {
+				causes++
+			}
 		}
-		t.Logf("FINDING W1: ClientLink publication bodies carry %v", keysOf(found))
+
+		// Durable: every page of each session's /journal, through the replica.
+		durable := 0
+		for _, session := range []sessionwire.SessionID{wireSessionA, wireSessionB} {
+			var cursor sessionwire.Cursor
+			for {
+				path := "/v1/sessions/" + string(session) + "/journal"
+				if cursor != "" {
+					path += "?cursor=" + url.QueryEscape(string(cursor))
+				}
+				status, raw := capture.factory.Get(t, ctx, wireTenant, path)
+				if status != http.StatusOK {
+					t.Fatalf("GET %s answered %d: %s", path, status, raw)
+				}
+				for name, needle := range private {
+					if strings.Contains(string(raw), needle) {
+						t.Errorf("W1: /journal of %s carries %s (%q)", session, name, needle)
+					}
+				}
+				var page sessionwire.JournalPage
+				if err := json.Unmarshal(raw, &page); err != nil {
+					t.Fatalf("the journal page is not a Core JournalPage: %v", err)
+				}
+				for _, e := range page.Events {
+					var body map[string]any
+					if err := json.Unmarshal(e.Body, &body); err != nil {
+						t.Fatalf("a /journal body is not a JSON object: %v", err)
+					}
+					durable++
+					if checkBody("a /journal body of "+string(session), session, body, string(e.Body)) {
+						causes++
+					}
+				}
+				if page.NextCursor == "" {
+					break
+				}
+				cursor = page.NextCursor
+			}
+		}
+		if live == 0 || durable == 0 || causes == 0 {
+			t.Fatalf("vacuous: %d live bodies, %d /journal bodies, %d carrying a command cause", live, durable, causes)
+		}
+		t.Logf("W1: %d live and %d /journal bodies carry only public ids; %d name an admitted CommandID as their cause", live, durable, causes)
 	})
 
 	t.Run("a reconnect re-presents the frozen connect and rebinds before subscribing", func(t *testing.T) {
