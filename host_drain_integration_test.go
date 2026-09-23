@@ -647,12 +647,15 @@ func TestDrainingAPooledHostParkedAtAGateIsCrashEquivalentAndBounded(t *testing.
 
 	t.Run("case 3: no test answers a cold gate -- Factory refuses one whose owner is gone", func(t *testing.T) {
 		page := served.OpenGates(t, ctx, tenant, s)
-		// FINDING (sessionstore/host), pinned as a trip-wire: the gate
-		// projection outlives its owner. After a crash-equivalent drain the
-		// gates read still offers the gate as RESIDENT-answerable, though no
-		// Host holds the session; only Factory's write path knows better.
-		if len(page.Gates) != 1 || page.Gates[0].Answerability != sessionwire.GateAnswerabilityResident {
-			t.Fatalf("after the drain the gates read is %+v: the projection no longer outlives its owner -- the finding is fixed; update this row", page)
+		// CLOSED BY factory v0.9.0 (this row was a trip-wire holding the
+		// finding). The gate projection still outlives its owner in the store
+		// -- no Host holds the session after a crash-equivalent drain -- but
+		// Factory's gates read now makes the same owner check its write does
+		// (AdmitGateResponse), so a gate stored `resident` with no fresh
+		// matching owner reads UNAVAILABLE: the read no longer offers an
+		// answer the write would refuse.
+		if len(page.Gates) != 1 || page.Gates[0].Answerability != sessionwire.GateAnswerabilityUnavailable {
+			t.Fatalf("after the drain the gates read is %+v, want the one gate reported unavailable: no Host holds the session", page)
 		}
 		status, body := served.Post(t, ctx, tenant, "/v1/sessions/"+string(s)+"/gates/"+string(projected.GateID),
 			sessionwire.GateResponseRequest{
