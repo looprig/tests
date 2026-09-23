@@ -1,6 +1,6 @@
 //go:build integration && kind
 
-// Command kindhost is the D3.1 lane's PRODUCT Host: the released host v0.8.1
+// Command kindhost is the D3.1 lane's PRODUCT Host: the released host (the version go.mod pins)
 // run through host.Run -- compose, start, serve, drain on SIGTERM -- exactly as
 // a product main would, over the orchestration kit's real harness rig.
 //
