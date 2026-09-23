@@ -47,6 +47,11 @@ import (
 // PooledHostConfig is the lifecycle knobs of one pooled Host. The zero value is
 // exactly the Host every earlier lane composes.
 type PooledHostConfig struct {
+	// ID and Generation name the Host for StartSizedPooledHost. The other
+	// constructors take them as arguments and ignore these.
+	ID         sessionwire.HostID
+	Generation uint64
+
 	// Capacity, when positive, is a POOLED Host's advertised capacity. Zero
 	// keeps the kit's 8. Placement skips a full Host, so capacity one is how
 	// a case puts its next session on another Host (see StartPooledHostSized).
@@ -74,6 +79,13 @@ type PooledHostConfig struct {
 	// death can cut (PooledHost.Kill) or that can be PAUSED and resumed
 	// (HostProcess.Pause/Resume), as a stopped process would be.
 	Mortal bool
+	// MaxBindingsPerLink and MaxBindings bound the Host's HostLink routing
+	// table; zero keeps 16 and 32. They must be sized with Capacity or a
+	// Factory's bind is refused.
+	MaxBindingsPerLink int
+	MaxBindings        int
+	// CommandQueueSize is the Host's local command buffer; zero keeps 16.
+	CommandQueueSize int
 }
 
 // StartLifecycleHost is StartPooledHost with lifecycle knobs.
