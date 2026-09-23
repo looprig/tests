@@ -18,15 +18,15 @@
 //     FIRED on the factory v0.5.0 pin; it is deleted, and the cases below drive
 //     the behaviour for real.
 //
-// # What "exactly once and in order" means here, and why it is not a count
+// # What "exactly once and in order" means here
 //
-// A ClientLink stream is not a replay: a client is covered through a sequence
-// EITHER by receiving each enduring publication OR by a session.reset naming
-// that tip, which tells it to read the journal through it. A reset is how a
-// client is TOLD about a gap, so it is not one. What must never happen is a
-// SILENT gap -- an enduring record that is neither the next sequence nor one
-// the client already holds. PooledCoveredThrough is that rule, and it is the
-// assertion these cases make.
+// Both cases run in a DurableTail world, where the product's committed stream
+// is a real SessionStore journal that Factory's journal route reads, and the
+// client is orchestrationtest.PooledBrowser: it holds a position, applies the
+// next enduring record, skips one it already holds, repairs from the journal
+// route on every (re)subscribe and every session.reset, and FAILS on a silent
+// gap. So the assertion is the records themselves -- EventIDs and journal
+// sequences, in order, once each -- not a count and not a tip.
 
 package tests
 
@@ -36,7 +36,6 @@ import (
 	"fmt"
 	"io"
 	"net/http"
-	"strings"
 	"testing"
 	"time"
 
@@ -162,27 +161,6 @@ func TestFactoryClientLinkIsComposedButNotYetDrivable(t *testing.T) {
 	})
 }
 
-// reconnectWorld stands up one durable plane, one pooled Host and TWO Factory
-// replicas, and returns them with a session id that does not exist yet.
-//
-// TWO REPLICAS OVER ONE DURABLE PLANE is the whole point of cases 3 and 4: a
-// browser that comes back must be repaired by WHICHEVER replica it reaches,
-// from durable state alone, because nothing is shared between them but the
-// store. A single-replica case would prove only that one process remembers.
-func reconnectWorld(t *testing.T) (context.Context, *orchestrationtest.PooledWorld, *orchestrationtest.PooledFactory, *orchestrationtest.PooledFactory, sessionwire.SessionID) {
-	t.Helper()
-	ctx := placementContext(t)
-	world := orchestrationtest.NewPooledWorld(t, ctx, orchestrationtest.PooledWorldOptions{
-		Tenants: []sessionwire.TenantID{orchestrationtest.PooledTenantA},
-	})
-	pooled := orchestrationtest.StartPooledHost(t, ctx, world, "orchestrationtest-reconnect-host", 4)
-	orchestrationtest.AwaitAdvertised(t, world, pooled.ID)
-
-	replicaA := orchestrationtest.StartPooledFactory(t, ctx, world, "orchestrationtest-reconnect-a", nil)
-	replicaB := orchestrationtest.StartPooledFactory(t, ctx, world, "orchestrationtest-reconnect-b", nil)
-	return ctx, world, replicaA, replicaB, sessionwire.SessionID("session-reconnect")
-}
-
 // reconnectCreate posts the create and waits for it to apply.
 func reconnectCreate(t *testing.T, ctx context.Context, world *orchestrationtest.PooledWorld, f *orchestrationtest.PooledFactory, session sessionwire.SessionID) {
 	t.Helper()
@@ -216,141 +194,188 @@ func reconnectInput(t *testing.T, ctx context.Context, world *orchestrationtest.
 	})
 }
 
-// reconnectCapturedTip reads one session's journal page through a replica and
-// returns the captured tip it reports.
+// TestFactoryRepairsAReconnectedBrowserAcrossReplicas is I1.1 CASE 3, in full.
 //
-// THIS IS HALF OF WHAT A RECONNECTING BROWSER DOES, and the half that carries
-// the events it missed. Measured here: a ClientLink subscribe to a QUIET
-// session delivers NOTHING -- not a publication, not even a journal-tip hint --
-// because the link is a live tail and nothing is being published. A client
-// learns where it is by reading the journal, and the live tail continues from
-// there. A case that waited on the socket alone would wait forever, which is
-// what the first draft of this file did.
+// A browser holding a cursor disconnects, EXACTLY THREE enduring events are
+// committed while it is away, and it reconnects TO THE OTHER REPLICA with its
+// OLD CURSOR. It must then hold every one of the three -- by EventID and
+// journal sequence, exactly once and in order -- followed by the live tail,
+// with nothing shared between the replicas but the durable plane.
 //
-// # THE LIMITATION THIS PUTS ON I1.1 CASE 3, STATED
+// # Why this is no longer the weaker case it was
 //
-// The acceptance row asks the reconnected browser to "observe ALL THREE
-// exactly once and in order". THIS FIXTURE CANNOT SHOW IT THE THREE. It can
-// only show it a NUMBER, and the reason is structural rather than lazy:
-// PooledTails is the PRODUCT's committed stream and SessionStore's journal
-// holds none of it, so orchestrationtest.pooledTipReader reports the product's
-// tip and CLEARS page.Events whenever that tip is above the store's. A
-// reconnecting browser here therefore learns `CapturedTip` and nothing else.
-//
-// So case 3 proves two things and not the third: that the tip the missed events
-// left is reachable THROUGH THE OTHER REPLICA, and that the live tail then
-// continues exactly once and in order from it. That the three missed events
-// themselves can be read back is NOT proven here, and needs a fixture whose
-// product events are in SessionStore's own journal.
-func reconnectCapturedTip(t *testing.T, ctx context.Context, f *orchestrationtest.PooledFactory, session sessionwire.SessionID) uint64 {
-	t.Helper()
-	status, body := f.Get(t, ctx, orchestrationtest.PooledTenantA, "/v1/sessions/"+string(session)+"/journal")
-	if status != http.StatusOK {
-		t.Fatalf("the journal read answered %d: %s", status, body)
-		return 0
-	}
-	var page sessionwire.JournalPage
-	if err := json.Unmarshal(body, &page); err != nil {
-		t.Fatalf("the journal page is not a Core JournalPage (%s): %v", body, err)
-		return 0
-	}
-	return page.CapturedTip
-}
-
-// assertLiveTailIsExactlyOnceInOrder holds a viewer's stream to the rule: no
-// silent gap, no stray, and no enduring sequence delivered twice.
-func assertLiveTailIsExactlyOnceInOrder(t *testing.T, viewer *orchestrationtest.PooledViewer, from, through uint64) {
-	t.Helper()
-	covered, err := orchestrationtest.PooledCoveredThroughFrom(viewer.Records(), from)
-	if err != nil || covered < through {
-		t.Fatalf("the stream %v covers through %d (%v) from %d, want %d with no silent gap", viewer.Records(), covered, err, from, through)
-	}
-	if strays := viewer.Strays(); len(strays) != 0 {
-		t.Fatalf("the viewer received records naming another session: %v", strays)
-	}
-	// PooledCoveredThrough tolerates a duplicate the client already holds,
-	// because a repair may legitimately re-send one; what it cannot tolerate is
-	// the same NEW sequence twice, which is checked here.
-	seen := map[string]int{}
-	for _, record := range viewer.Records() {
-		if strings.HasPrefix(record, "E") {
-			seen[record]++
-		}
-	}
-	for record, count := range seen {
-		if count > 1 {
-			t.Fatalf("the viewer received %s %d times: %v", record, count, viewer.Records())
-		}
-	}
-}
-
-// TestFactoryRepairsAReconnectedBrowserAcrossReplicas is I1.1 CASE 3.
-//
-// A browser disconnects, exactly three enduring events are committed while it
-// is away, and it reconnects TO THE OTHER REPLICA. It must learn the tip those
-// three left behind, and its live tail must then continue exactly once and in
-// order -- with nothing shared between the replicas but the durable plane.
-//
-// IT IS WEAKER THAN THE ACCEPTANCE ROW, which asks the browser to observe the
-// three missed events themselves. That is not reachable in this fixture, for a
-// structural reason stated in full at reconnectCapturedTip. Read the limitation
-// there before treating this case as covering the row.
+// It runs in a DurableTail world: the product's committed stream IS
+// a real SessionStore public journal (world.ProductJournal; each event
+// appended through a real sessionstore.JournalWriter before it is published),
+// and Factory's journal route reads that store, so replica B answers the
+// reconnecting browser with the three events themselves, read from it. The browser is PooledBrowser, which repairs from
+// that route on every (re)subscribe and fails the case on any silent gap.
+// Nothing in the kit answers for a recovered event: the EXPECTATION is what
+// the product committed (PooledTails.Committed), cross-checked against the
+// store read directly, and the OBSERVATION is what the browser applied from
+// Factory's route and ClientLink.
 func TestFactoryRepairsAReconnectedBrowserAcrossReplicas(t *testing.T) {
-	ctx, world, replicaA, replicaB, session := reconnectWorld(t)
-	const perInput = orchestrationtest.PooledPublicationsPerInput
-
-	first := orchestrationtest.ConnectPooledViewer(t, ctx, replicaA, orchestrationtest.PooledTenantA)
-	if err := first.Watch(t, ctx, orchestrationtest.PooledTenantA, session); err != nil {
-		t.Fatalf("the first viewer's subscribe was refused: %v", err)
-	}
-	reconnectCreate(t, ctx, world, replicaA, session)
-	orchestrationtest.PooledWait(t, "the first viewer is covered through the create", 60*time.Second, func() bool {
-		covered, err := orchestrationtest.PooledCoveredThrough(first.Records())
-		return err == nil && covered >= perInput
+	ctx := placementContext(t)
+	world := orchestrationtest.NewPooledWorld(t, ctx, orchestrationtest.PooledWorldOptions{
+		Tenants:     []sessionwire.TenantID{orchestrationtest.PooledTenantA},
+		DurableTail: true,
 	})
-	t.Logf("case 3: the first viewer on replica A: %v", first.Records())
+	pooled := orchestrationtest.StartPooledHost(t, ctx, world, "orchestrationtest-reconnect-host", 4)
+	orchestrationtest.AwaitAdvertised(t, world, pooled.ID)
+	replicaA := orchestrationtest.StartPooledFactory(t, ctx, world, "orchestrationtest-reconnect-a", nil)
+	replicaB := orchestrationtest.StartPooledFactory(t, ctx, world, "orchestrationtest-reconnect-b", nil)
+	const tenant = orchestrationtest.PooledTenantA
+	session := sessionwire.SessionID("session-reconnect-durable")
+	const perInput = orchestrationtest.PooledPublicationsPerInput
+	committed := func() []orchestrationtest.PooledCommitted { return world.Tails.Committed(tenant, session) }
+	settledThrough := func(b *orchestrationtest.PooledBrowser, want int) func() bool {
+		return func() bool {
+			all := committed()
+			if len(all) < want {
+				return false
+			}
+			_, position := b.Settle(t, ctx)
+			return position >= all[want-1].JournalSeq
+		}
+	}
 
-	// THE DISCONNECT. A browser tab closing, not a network fault: the client
-	// goes away and this replica's demand for the session is released. What
-	// happens next must be repairable from durable state alone.
+	// A browser on replica A, holding the session from its first event and
+	// then streaming live.
+	reconnectCreate(t, ctx, world, replicaA, session)
+	first := orchestrationtest.OpenPooledBrowser(t, ctx, replicaA, tenant, orchestrationtest.PooledBrowserOptions{})
+	if err := first.Watch(t, ctx, session, 0); err != nil {
+		t.Fatalf("the first browser's subscribe was refused: %v", err)
+	}
+	first.Settle(t, ctx) // the join read, made at subscribe as a browser makes it
+	reconnectInput(t, ctx, world, replicaA, session, "command-reconnect-before")
+	orchestrationtest.PooledWait(t, "the first browser holds the create and the first input", 60*time.Second, settledThrough(first, 2*perInput))
+	held, cursor := first.Settle(t, ctx)
+	assertHoldsExactly(t, "the first browser", held, committed()[:2*perInput])
+	if live := first.LiveEnduring(); len(live) == 0 {
+		t.Fatalf("the first browser received nothing live (log %v): it never streamed, so its disconnect proves nothing", first.Log())
+	}
+	t.Logf("case 3: the first browser on replica A holds through %d: %v", cursor, held)
+
+	// THE DISCONNECT, with the cursor the browser holds.
 	first.Close()
 
-	// EXACTLY THREE enduring events while it is away: one applied input,
-	// PooledPublicationsPerInput publications.
-	reconnectInput(t, ctx, world, replicaA, session, "command-reconnect-input")
+	// EXACTLY THREE enduring events while it is away.
+	reconnectInput(t, ctx, world, replicaA, session, "command-reconnect-while-away")
 	orchestrationtest.PooledWait(t, "the three events were committed", 60*time.Second, func() bool {
-		return world.Tails.Tip(orchestrationtest.PooledTenantA, session) == 2*perInput
+		return len(committed()) == 3*perInput
 	})
-
-	// THE RECONNECT, to the OTHER replica: subscribe, then read the journal,
-	// which is what a browser does and where the missed events are.
-	second := orchestrationtest.ConnectPooledViewer(t, ctx, replicaB, orchestrationtest.PooledTenantA)
-	if err := second.Watch(t, ctx, orchestrationtest.PooledTenantA, session); err != nil {
-		t.Fatalf("the reconnected viewer's subscribe to replica B was refused: %v", err)
+	missed := committed()[2*perInput : 3*perInput]
+	if len(missed) != 3 || missed[0].JournalSeq <= cursor {
+		t.Fatalf("the events committed while away are %v, want three above the cursor %d", missed, cursor)
 	}
-	resumed := reconnectCapturedTip(t, ctx, replicaB, session)
-	if resumed < 2*perInput {
-		t.Fatalf("replica B reported captured tip %d, want at least %d: the three events committed while the browser was away are not reachable through the replica it came back to",
-			resumed, 2*perInput)
-	}
+	// The expectation is not the kit's word alone: the three are in the REAL
+	// product journal store, at those sequences, before anyone reads them back.
+	assertStoreJournalHolds(t, ctx, world, tenant, session, cursor, missed)
 
-	// AND THE LIVE TAIL CONTINUES. Three more events, delivered to a browser
-	// attached to a replica that has never seen this session before.
+	// THE RECONNECT, to the OTHER replica, with the OLD CURSOR.
+	second := orchestrationtest.OpenPooledBrowser(t, ctx, replicaB, tenant, orchestrationtest.PooledBrowserOptions{})
+	if err := second.Watch(t, ctx, session, cursor); err != nil {
+		t.Fatalf("the reconnected browser's subscribe to replica B was refused: %v", err)
+	}
+	// The join read, made at subscribe from the old cursor -- BEFORE anything
+	// more is committed, so the live tail has something left to carry.
+	second.Settle(t, ctx)
 	reconnectInput(t, ctx, world, replicaB, session, "command-reconnect-after-return")
-	orchestrationtest.PooledWait(t, "the reconnected viewer received the continued stream", 60*time.Second, func() bool {
-		covered, err := orchestrationtest.PooledCoveredThroughFrom(second.Records(), resumed)
-		return err == nil && covered >= 3*perInput
-	})
-	t.Logf("case 3: the reconnected viewer on replica B resumed at %d and received %v", resumed, second.Records())
-	assertLiveTailIsExactlyOnceInOrder(t, second, resumed, 3*perInput)
+	orchestrationtest.PooledWait(t, "the reconnected browser holds everything through the continued stream", 60*time.Second, settledThrough(second, 4*perInput))
+	got, _ := second.Settle(t, ctx)
+	t.Logf("case 3: the reconnected browser on replica B resumed at %d, repaired %+v, and holds %v (log %v)",
+		cursor, second.Repairs(), got, second.Log())
+
+	// ALL THREE MISSED, EXACTLY ONCE AND IN ORDER, then the live tail: the
+	// browser holds precisely what was committed after its cursor.
+	assertHoldsExactly(t, "the reconnected browser", got, committed()[2*perInput:4*perInput])
+
+	// AND THE THREE CAME FROM THE DURABLE REPAIR, from the old cursor: the
+	// first journal read started at cursor+1 -- not a replay from the head,
+	// not a tail that happened to include them -- and carried all three. They
+	// were committed before the browser subscribed, so no live record could
+	// have supplied them.
+	repairs := second.Repairs()
+	if len(repairs) == 0 || repairs[0].From != cursor+1 {
+		t.Fatalf("the reconnected browser's first repair is %+v, want a read from the old cursor %d", repairs, cursor+1)
+	}
+	var repaired []orchestrationtest.PooledCommitted
+	for _, event := range repairs[0].Events {
+		if event.JournalSeq > cursor {
+			repaired = append(repaired, event)
+		}
+	}
+	assertHoldsExactly(t, "the repair from the old cursor", repaired, missed)
+	// AND THE TAIL CONTINUED LIVE: the three committed after the return
+	// arrived as publications on replica B's ClientLink, in order.
+	var live []orchestrationtest.PooledCommitted
+	for _, event := range second.LiveEnduring() {
+		if event.JournalSeq > missed[2].JournalSeq {
+			live = append(live, event)
+		}
+	}
+	assertHoldsExactly(t, "the reconnected browser's live tail", live, committed()[3*perInput:4*perInput])
+	for _, event := range second.LiveEnduring() {
+		for _, lost := range missed {
+			if event.EventID == lost.EventID {
+				t.Fatalf("the missed event %s arrived LIVE, so the repair is not what recovered it", lost.EventID)
+			}
+		}
+	}
+	if duplicates := second.LiveDuplicates(); len(duplicates) != 0 {
+		t.Fatalf("the reconnected browser received sequences live more than once: %v", duplicates)
+	}
+	if failures := world.Tails.DurableFailures(); len(failures) != 0 {
+		t.Fatalf("the product failed to commit durably: %v", failures)
+	}
 }
 
-// TestFactoryBRepairsABrowserAfterFactoryADies is I1.1 CASE 4.
+// assertHoldsExactly holds a browser's applied stream to an exact sequence of
+// committed events: same EventIDs, same journal sequences, same order, and
+// nothing else.
+func assertHoldsExactly(t *testing.T, who string, got, want []orchestrationtest.PooledCommitted) {
+	t.Helper()
+	if len(got) != len(want) {
+		t.Fatalf("%s holds %d events %v, want exactly %d %v", who, len(got), got, len(want), want)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("%s holds %v at position %d, want %v (got %v, want %v)", who, got[i], i, want[i], got, want)
+		}
+	}
+}
+
+// assertStoreJournalHolds reads the REAL store's public journal directly --
+// no Factory, no kit reader -- and requires it to hold want, in order, right
+// after the sequence after.
+func assertStoreJournalHolds(t *testing.T, ctx context.Context, world *orchestrationtest.PooledWorld, tenant sessionwire.TenantID, session sessionwire.SessionID, after uint64, want []orchestrationtest.PooledCommitted) {
+	t.Helper()
+	page, err := world.ProductJournal.ReadPublicJournal(ctx, sessionstore.ReadPublicJournalRequest{
+		TenantID: tenant, SessionID: session, FromSeq: after + 1,
+	})
+	if err != nil {
+		t.Fatalf("reading the store's journal after %d: %v", after, err)
+	}
+	var got []orchestrationtest.PooledCommitted
+	for _, event := range page.Events {
+		got = append(got, orchestrationtest.PooledCommitted{EventID: event.EventID, JournalSeq: event.JournalSeq})
+	}
+	if len(got) < len(want) {
+		t.Fatalf("the store's journal after %d holds %v, want %v first", after, got, want)
+	}
+	assertHoldsExactly(t, "the store's own journal", got[:len(want)], want)
+}
+
+// TestFactoryBRepairsABrowserAfterFactoryADies is I1.1 CASE 4, with exact
+// records.
 //
-// Factory A is killed while a browser is attached to it and events are
-// committed with nothing delivering them. The browser reconnects to Factory B,
-// which must repair it from the JOURNAL SEQUENCE -- it shares no buffer, no
-// cursor and no connection with A.
+// Factory A is killed while a browser is attached to it; events are committed
+// with nothing delivering them; the browser reconnects to Factory B with the
+// cursor it held, and B must repair it from the JOURNAL SEQUENCE -- it shares no
+// buffer, no cursor and no connection with A. The assertion is the records
+// themselves: the browser ends holding exactly what was committed after its
+// cursor, by EventID and sequence, and the events A never delivered came from
+// B's journal read from that cursor.
 //
 // # The approximation, stated
 //
@@ -359,49 +384,91 @@ func TestFactoryRepairsAReconnectedBrowserAcrossReplicas(t *testing.T) {
 // buffer is internal and the delivery is a goroutine. What is driven instead is
 // the STATE that window produces and that a replica must recover from -- a
 // replica gone, a browser that was attached to it, and committed events nobody
-// delivered. A narrower test would be a test of this module's timing.
+// delivered. What the browser held when A died is read from the browser, not
+// assumed, so a record A buffered and never sent is simply one the browser does
+// not hold, and B must supply it.
 func TestFactoryBRepairsABrowserAfterFactoryADies(t *testing.T) {
-	ctx, world, replicaA, replicaB, session := reconnectWorld(t)
-	const perInput = orchestrationtest.PooledPublicationsPerInput
-
-	attached := orchestrationtest.ConnectPooledViewer(t, ctx, replicaA, orchestrationtest.PooledTenantA)
-	if err := attached.Watch(t, ctx, orchestrationtest.PooledTenantA, session); err != nil {
-		t.Fatalf("the viewer's subscribe to replica A was refused: %v", err)
-	}
-	reconnectCreate(t, ctx, world, replicaA, session)
-	orchestrationtest.PooledWait(t, "the viewer is covered through the create", 60*time.Second, func() bool {
-		covered, err := orchestrationtest.PooledCoveredThrough(attached.Records())
-		return err == nil && covered >= perInput
+	ctx := placementContext(t)
+	world := orchestrationtest.NewPooledWorld(t, ctx, orchestrationtest.PooledWorldOptions{
+		Tenants:     []sessionwire.TenantID{orchestrationtest.PooledTenantA},
+		DurableTail: true,
 	})
+	pooled := orchestrationtest.StartPooledHost(t, ctx, world, "orchestrationtest-reconnect-host", 4)
+	orchestrationtest.AwaitAdvertised(t, world, pooled.ID)
+	replicaA := orchestrationtest.StartPooledFactory(t, ctx, world, "orchestrationtest-reconnect-a", nil)
+	replicaB := orchestrationtest.StartPooledFactory(t, ctx, world, "orchestrationtest-reconnect-b", nil)
+	const tenant = orchestrationtest.PooledTenantA
+	session := sessionwire.SessionID("session-reconnect-death")
+	const perInput = orchestrationtest.PooledPublicationsPerInput
+	committed := func() []orchestrationtest.PooledCommitted { return world.Tails.Committed(tenant, session) }
+	settledThrough := func(b *orchestrationtest.PooledBrowser, want int) func() bool {
+		return func() bool {
+			all := committed()
+			if len(all) < want {
+				return false
+			}
+			_, position := b.Settle(t, ctx)
+			return position >= all[want-1].JournalSeq
+		}
+	}
 
-	// KILL A, with the browser still attached to it.
+	reconnectCreate(t, ctx, world, replicaA, session)
+	attached := orchestrationtest.OpenPooledBrowser(t, ctx, replicaA, tenant, orchestrationtest.PooledBrowserOptions{})
+	if err := attached.Watch(t, ctx, session, 0); err != nil {
+		t.Fatalf("the browser's subscribe to replica A was refused: %v", err)
+	}
+	attached.Settle(t, ctx)
+	reconnectInput(t, ctx, world, replicaA, session, "command-reconnect-before-death")
+	orchestrationtest.PooledWait(t, "the browser on A holds the create and the first input", 60*time.Second, settledThrough(attached, 2*perInput))
+
+	// KILL A, with the browser still attached to it. What the browser holds
+	// is read AFTER the kill, so anything A had in flight and never sent is
+	// counted as not held.
 	stopCtx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	if err := replicaA.Server.Stop(stopCtx); err != nil {
 		t.Logf("case 4: replica A stopped with %v", err)
 	}
 	cancel()
+	held, cursor := attached.Settle(t, ctx)
+	assertHoldsExactly(t, "the browser on A", held, committed()[:len(held)])
+	attached.Close()
 
 	// Events committed with the browser's replica gone.
 	reconnectInput(t, ctx, world, replicaB, session, "command-reconnect-after-death")
 	orchestrationtest.PooledWait(t, "the events were committed with A gone", 60*time.Second, func() bool {
-		return world.Tails.Tip(orchestrationtest.PooledTenantA, session) == 2*perInput
+		return len(committed()) == 3*perInput
 	})
+	undelivered := committed()[len(held):]
+	assertStoreJournalHolds(t, ctx, world, tenant, session, cursor, undelivered)
 
-	// THE REPAIR, on B: the journal sequence carries what A never delivered.
-	repaired := orchestrationtest.ConnectPooledViewer(t, ctx, replicaB, orchestrationtest.PooledTenantA)
-	if err := repaired.Watch(t, ctx, orchestrationtest.PooledTenantA, session); err != nil {
-		t.Fatalf("the repaired viewer's subscribe to replica B was refused: %v", err)
+	// THE REPAIR, on B, from the cursor the browser held.
+	repaired := orchestrationtest.OpenPooledBrowser(t, ctx, replicaB, tenant, orchestrationtest.PooledBrowserOptions{})
+	if err := repaired.Watch(t, ctx, session, cursor); err != nil {
+		t.Fatalf("the repaired browser's subscribe to replica B was refused: %v", err)
 	}
-	resumed := reconnectCapturedTip(t, ctx, replicaB, session)
-	if resumed < 2*perInput {
-		t.Fatalf("replica B reported captured tip %d, want at least %d: what replica A never delivered is unreachable",
-			resumed, 2*perInput)
-	}
+	repaired.Settle(t, ctx)
 	reconnectInput(t, ctx, world, replicaB, session, "command-reconnect-recovered")
-	orchestrationtest.PooledWait(t, "replica B delivered the continued stream", 60*time.Second, func() bool {
-		covered, err := orchestrationtest.PooledCoveredThroughFrom(repaired.Records(), resumed)
-		return err == nil && covered >= 3*perInput
-	})
-	t.Logf("case 4: the repaired viewer on replica B resumed at %d and received %v", resumed, repaired.Records())
-	assertLiveTailIsExactlyOnceInOrder(t, repaired, resumed, 3*perInput)
+	orchestrationtest.PooledWait(t, "replica B delivered the continued stream", 60*time.Second, settledThrough(repaired, 4*perInput))
+	got, _ := repaired.Settle(t, ctx)
+	t.Logf("case 4: the browser held through %d when A died; on B it repaired %+v and holds %v", cursor, repaired.Repairs(), got)
+
+	assertHoldsExactly(t, "the browser repaired on B", got, committed()[len(held):4*perInput])
+	repairs := repaired.Repairs()
+	if len(repairs) == 0 || repairs[0].From != cursor+1 {
+		t.Fatalf("the first repair on B is %+v, want a read from the held cursor %d", repairs, cursor+1)
+	}
+	assertHoldsExactly(t, "B's repair of what A never delivered", repairs[0].Events, undelivered)
+	var live []orchestrationtest.PooledCommitted
+	for _, event := range repaired.LiveEnduring() {
+		if event.JournalSeq > undelivered[len(undelivered)-1].JournalSeq {
+			live = append(live, event)
+		}
+	}
+	assertHoldsExactly(t, "B's live tail after the repair", live, committed()[3*perInput:4*perInput])
+	if duplicates := repaired.LiveDuplicates(); len(duplicates) != 0 {
+		t.Fatalf("the repaired browser received sequences live more than once: %v", duplicates)
+	}
+	if failures := world.Tails.DurableFailures(); len(failures) != 0 {
+		t.Fatalf("the product failed to commit durably: %v", failures)
+	}
 }

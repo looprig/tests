@@ -47,6 +47,10 @@ import (
 // PooledHostConfig is the lifecycle knobs of one pooled Host. The zero value is
 // exactly the Host every earlier lane composes.
 type PooledHostConfig struct {
+	// Capacity, when positive, is a POOLED Host's advertised capacity. Zero
+	// keeps the kit's 8. Placement skips a full Host, so capacity one is how
+	// a case puts its next session on another Host (see StartPooledHostSized).
+	Capacity uint64
 	// WarmTTL is how long a session must stay idle before a pooled Host
 	// releases it. Zero keeps the kit's 90s, which no earlier case reaches.
 	WarmTTL time.Duration

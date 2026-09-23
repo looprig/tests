@@ -91,6 +91,19 @@ type PooledFactoryConfig struct {
 	// Factory's ClientLink below HTTP (HostLinkTap.WrapListener), since
 	// factory.Server serves its own router and offers no handler to wrap.
 	Listener func(net.Listener) net.Listener
+
+	// PerConnectionQueueBytes overrides the ClientLink's per-connection
+	// outbound queue budget, in BYTES. Zero takes Factory's default. It is how
+	// a case configures the slow-consumer threshold it then measures.
+	PerConnectionQueueBytes int
+
+	// WriteTimeout, PingInterval and PongTimeout override the ClientLink's
+	// liveness bounds. Zero takes Factory's default. Factory requires
+	// WriteTimeout <= PongTimeout < PingInterval. A slow-consumer case raises
+	// them so that the QUEUE BUDGET is the only bound its stall can reach.
+	WriteTimeout time.Duration
+	PingInterval time.Duration
+	PongTimeout  time.Duration
 }
 
 // StartPooledFactoryWith composes, starts and serves a real pooled Factory
@@ -106,6 +119,16 @@ func StartPooledFactoryWith(tb TB, ctx context.Context, world *PooledWorld, cfg 
 func StartPooledHostWith(tb TB, ctx context.Context, world *PooledWorld, id sessionwire.HostID, generation uint64, wrap func(http.Handler) http.Handler) *PooledHost {
 	tb.Helper()
 	return startHostWrapped(tb, ctx, world, id, generation, "", wrap)
+}
+
+// StartPooledHostSized is StartPooledHostWith with the Host's advertised
+// capacity chosen. Placement skips a Host with no available capacity and ranks
+// the rest by free capacity, so a Host of capacity one that already holds a
+// session is how a case puts its NEXT session on a different Host without any
+// placement seam.
+func StartPooledHostSized(tb TB, ctx context.Context, world *PooledWorld, id sessionwire.HostID, generation, capacity uint64, wrap func(http.Handler) http.Handler) *PooledHost {
+	tb.Helper()
+	return startHostConfigured(tb, ctx, world, id, generation, "", wrap, PooledHostConfig{Capacity: capacity})
 }
 
 // PostRaw is Post without a test handle, for use from racing goroutines: a
