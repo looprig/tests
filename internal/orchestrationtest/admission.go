@@ -68,6 +68,11 @@ type PooledFactoryConfig struct {
 	// reports as its Directory.
 	Directory func(factory.Directory) factory.Directory
 
+	// Authorizer, when set, replaces the permit-everything authorizer. It is
+	// how a case freezes Factory's answer to an authenticated principal that
+	// is NOT authorized (identity.ErrUnauthorized).
+	Authorizer factory.Authorizer
+
 	// ServiceToken is the HostLink credential this replica presents. Empty
 	// takes PooledServiceToken, which the world's Hosts accept; anything else
 	// is refused by every Host.
@@ -81,6 +86,11 @@ type PooledFactoryConfig struct {
 	// lifetime. Zero takes ReconcileSweepInterval and ReconcileClaimTTL.
 	Interval time.Duration
 	ClaimTTL time.Duration
+
+	// Listener, when set, wraps the replica's TCP listener -- how a case taps
+	// Factory's ClientLink below HTTP (HostLinkTap.WrapListener), since
+	// factory.Server serves its own router and offers no handler to wrap.
+	Listener func(net.Listener) net.Listener
 }
 
 // StartPooledFactoryWith composes, starts and serves a real pooled Factory

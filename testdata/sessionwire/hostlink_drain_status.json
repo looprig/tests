@@ -1,0 +1,31 @@
+{
+  "source": "controller drain client -> host (both pinned in go.mod), captured live",
+  "method": "hostlink.drain_status",
+  "request": {
+    "id": 0,
+    "rpc": {
+      "data": {
+        "host_generation": 3,
+        "host_id": "orchestrationtest-wire-dedicated",
+        "idempotency_key": "${idempotency_key}",
+        "session_id": "${session}",
+        "tenant_id": "orchestrationtest-tenant-a",
+        "version": 1
+      },
+      "method": "hostlink.drain_status"
+    }
+  },
+  "reply": {
+    "id": 0,
+    "rpc": {
+      "data": {
+        "drain_generation": 3,
+        "host_generation": 3,
+        "host_id": "orchestrationtest-wire-dedicated",
+        "session_id": "${session}",
+        "state": "drained",
+        "tenant_id": "orchestrationtest-tenant-a"
+      }
+    }
+  }
+}

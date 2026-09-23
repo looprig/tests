@@ -1782,6 +1782,9 @@ func startPooledFactory(tb TB, ctx context.Context, world *PooledWorld, cfg Pool
 		return nil
 	}
 	base := "http://" + listener.Addr().String()
+	if cfg.Listener != nil {
+		listener = cfg.Listener(listener)
+	}
 
 	reconcile := factory.DefaultReconcileLimits()
 	reconcile.Interval = ReconcileSweepInterval
@@ -1818,13 +1821,17 @@ func startPooledFactory(tb TB, ctx context.Context, world *PooledWorld, cfg Pool
 	if cfg.Commands != nil {
 		commands = cfg.Commands
 	}
+	var authorizer factory.Authorizer = pooledAuthorizer{}
+	if cfg.Authorizer != nil {
+		authorizer = cfg.Authorizer
+	}
 	var pending factory.PendingCommands = world.Store
 	if cfg.Pending != nil {
 		pending = cfg.Pending
 	}
 	opts := []factory.Option{
 		factory.WithCredentialVerifier(pooledVerifier{}),
-		factory.WithAuthorizer(pooledAuthorizer{}),
+		factory.WithAuthorizer(authorizer),
 		factory.WithSessionReader(pooledTipReader{Store: world.Store, tails: world.Tails}),
 		factory.WithCommands(commands),
 		factory.WithDirectory(directory),
@@ -2310,4 +2317,29 @@ func AwaitAdvertised(tb TB, world *PooledWorld, id sessionwire.HostID) sessionwi
 		return false
 	})
 	return found
+}
+
+// DenySessionAuthorizer permits everything the pooled authorizer does, except
+// reading or subscribing to one session, which it refuses with Factory's
+// public identity.ErrUnauthorized -- the sentinel Factory maps to 403 over
+// HTTP and permission-denied (103) over ClientLink.
+type DenySessionAuthorizer struct {
+	pooledAuthorizer
+	Session sessionwire.SessionID
+}
+
+// AuthorizeSessionRead refuses the denied session.
+func (a DenySessionAuthorizer) AuthorizeSessionRead(_ context.Context, _ identity.Principal, s sessionwire.SessionID) error {
+	if s == a.Session {
+		return identity.ErrUnauthorized
+	}
+	return nil
+}
+
+// AuthorizeSubscribe refuses the denied session's ClientLink channel.
+func (a DenySessionAuthorizer) AuthorizeSubscribe(_ context.Context, _ identity.Principal, channel string) error {
+	if strings.HasSuffix(channel, ":"+string(a.Session)) {
+		return identity.ErrUnauthorized
+	}
+	return nil
 }

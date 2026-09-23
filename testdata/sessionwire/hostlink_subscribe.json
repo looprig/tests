@@ -1,0 +1,15 @@
+{
+  "source": "factory -> host (released versions pinned in go.mod), captured live",
+  "method": "subscribe",
+  "request": {
+    "id": 0,
+    "subscribe": {
+      "channel": "${hostlink_channel}",
+      "flag": 1
+    }
+  },
+  "reply": {
+    "id": 0,
+    "subscribe": {}
+  }
+}

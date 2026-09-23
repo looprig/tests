@@ -1,0 +1,18 @@
+{
+  "source": "factory ClientLink/HTTP (version pinned in go.mod), an authenticated principal refused",
+  "method": "subscribe",
+  "request": {
+    "id": 0,
+    "subscribe": {
+      "channel": "session:orchestrationtest-tenant-a:${session}",
+      "flag": 1
+    }
+  },
+  "reply": {
+    "error": {
+      "code": 103,
+      "message": "permission denied"
+    },
+    "id": 0
+  }
+}

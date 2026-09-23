@@ -1,0 +1,28 @@
+{
+  "source": "a Core-framed probe -> host (pinned in go.mod); the reply is Host's",
+  "method": "hostlink.bind",
+  "request": {
+    "id": 0,
+    "rpc": {
+      "data": {
+        "host_generation": 3,
+        "host_id": "orchestrationtest-wire-dedicated",
+        "idempotency_key": "${idempotency_key}",
+        "lease_epoch": 0,
+        "runtime_compatibility_id": "orchestrationtest-pooled-compat",
+        "session_id": "${session}",
+        "tenant_id": "orchestrationtest-tenant-a",
+        "version": 1
+      },
+      "method": "hostlink.bind"
+    }
+  },
+  "reply": {
+    "id": 0,
+    "rpc": {
+      "data": {
+        "code": "not_admitting"
+      }
+    }
+  }
+}

@@ -1,0 +1,43 @@
+{
+  "source": "factory -> host (released versions pinned in go.mod), captured live",
+  "method": "hostlink.attach",
+  "request": {
+    "id": 0,
+    "rpc": {
+      "data": {
+        "actor_id": "orchestrationtest-sweeper",
+        "agent_id": "orchestrationtest-pooled-agent",
+        "host_generation": 7,
+        "host_id": "orchestrationtest-wire-host",
+        "idempotency_key": "${idempotency_key}",
+        "mode": "create",
+        "runtime_compatibility_id": "orchestrationtest-pooled-compat",
+        "session_id": "${session}",
+        "tenant_id": "orchestrationtest-tenant-a",
+        "version": 1
+      },
+      "method": "hostlink.attach"
+    }
+  },
+  "reply": {
+    "id": 0,
+    "rpc": {
+      "data": {
+        "accepting": true,
+        "agent_id": "orchestrationtest-pooled-agent",
+        "expires_at": "${time}",
+        "host_generation": 7,
+        "host_id": "orchestrationtest-wire-host",
+        "internal_endpoint": "${host_base}",
+        "lease_epoch": 0,
+        "observed_at": "${time}",
+        "placement": "pooled",
+        "residency": "resident",
+        "runtime_compatibility_id": "orchestrationtest-pooled-compat",
+        "session_id": "${session}",
+        "tenant_id": "orchestrationtest-tenant-a",
+        "version": 1
+      }
+    }
+  }
+}

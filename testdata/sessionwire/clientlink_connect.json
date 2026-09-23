@@ -1,0 +1,27 @@
+{
+  "source": "factory ClientLink (pinned in go.mod) -> centrifuge-go viewer, captured live",
+  "method": "connect",
+  "request": {
+    "connect": {
+      "data": {
+        "protocol_version": "1"
+      },
+      "name": "orchestrationtest-pooled-viewer",
+      "token": "${bearer}"
+    },
+    "id": 0
+  },
+  "reply": {
+    "connect": {
+      "client": "${client_id}",
+      "data": {
+        "factory_version": "factory",
+        "protocol_version": "1"
+      },
+      "ping": 25,
+      "pong": true,
+      "version": "factory"
+    },
+    "id": 0
+  }
+}

@@ -1,0 +1,15 @@
+{
+  "source": "factory ClientLink (pinned in go.mod) -> centrifuge-go viewer, captured live",
+  "method": "subscribe",
+  "request": {
+    "id": 0,
+    "subscribe": {
+      "channel": "session:orchestrationtest-tenant-a:${session}",
+      "flag": 1
+    }
+  },
+  "reply": {
+    "id": 0,
+    "subscribe": {}
+  }
+}

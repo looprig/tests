@@ -1,0 +1,30 @@
+{
+  "source": "a Core-framed probe -> host (pinned in go.mod); the reply is Host's",
+  "method": "hostlink.attach",
+  "request": {
+    "id": 0,
+    "rpc": {
+      "data": {
+        "actor_id": "orchestrationtest-wire-probe",
+        "agent_id": "orchestrationtest-pooled-agent",
+        "host_generation": 7,
+        "host_id": "orchestrationtest-wire-host",
+        "idempotency_key": "${idempotency_key}",
+        "mode": "create",
+        "runtime_compatibility_id": "orchestrationtest-pooled-compat",
+        "session_id": "${session}",
+        "tenant_id": "orchestrationtest-tenant-a",
+        "version": 1
+      },
+      "method": "hostlink.attach"
+    }
+  },
+  "reply": {
+    "id": 0,
+    "rpc": {
+      "data": {
+        "code": "no_capacity"
+      }
+    }
+  }
+}

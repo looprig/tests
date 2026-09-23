@@ -1,0 +1,23 @@
+{
+  "source": "factory -> host (released versions pinned in go.mod), captured live",
+  "method": "hostlink.unbind",
+  "request": {
+    "id": 0,
+    "rpc": {
+      "data": {
+        "host_generation": 7,
+        "host_id": "orchestrationtest-wire-host",
+        "idempotency_key": "${idempotency_key}",
+        "lease_epoch": 0,
+        "session_id": "${session}",
+        "tenant_id": "orchestrationtest-tenant-a",
+        "version": 1
+      },
+      "method": "hostlink.unbind"
+    }
+  },
+  "reply": {
+    "id": 0,
+    "rpc": {}
+  }
+}

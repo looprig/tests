@@ -1,0 +1,22 @@
+{
+  "source": "factory -> host (released versions pinned in go.mod), captured live",
+  "push": {
+    "push": {
+      "channel": "${hostlink_channel}",
+      "pub": {
+        "data": {
+          "body": {
+            "seq": 0,
+            "tenant": "orchestrationtest-tenant-a"
+          },
+          "covered_through": 0,
+          "event_id": "${event_id}",
+          "journal_seq": 0,
+          "session_id": "${session}",
+          "tenant_id": "orchestrationtest-tenant-a",
+          "type": "enduring_publication"
+        }
+      }
+    }
+  }
+}

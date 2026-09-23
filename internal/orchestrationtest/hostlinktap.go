@@ -47,13 +47,19 @@ type TappedConn struct {
 	Path         string
 	Subprotocols []string // the request's Sec-WebSocket-Protocol values
 
-	mu       sync.Mutex
-	status   int         // the status line Host WROTE, read off the connection
-	headers  http.Header // the response headers Host wrote
-	toHost   frameReader
-	fromHost frameReader
-	messages []TappedMessage
-	faults   []string
+	mu sync.Mutex
+	// requestHead is set on a connection tapped at the LISTENER (see
+	// WrapListener): its client bytes begin with the HTTP request head, which
+	// must be read before any frame. plain marks a connection whose answer was
+	// not 101: it carries HTTP, not WebSocket frames, and is not parsed further.
+	requestHead bool
+	plain       bool
+	status      int         // the status line Host WROTE, read off the connection
+	headers     http.Header // the response headers Host wrote
+	toHost      frameReader
+	fromHost    frameReader
+	messages    []TappedMessage
+	faults      []string
 }
 
 // TappedMessage is one WebSocket data message, or a close, in one direction.
@@ -206,10 +212,18 @@ func (c *tappedNetConn) Write(p []byte) (int, error) {
 func (c *TappedConn) observe(fromHost bool, p []byte) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	if c.plain {
+		return
+	}
 	if fromHost {
 		c.fromHost.buf = append(c.fromHost.buf, p...)
 		if c.status == 0 {
 			if !c.parseResponseHead() {
+				return
+			}
+			if c.requestHead && c.status != http.StatusSwitchingProtocols {
+				c.plain = true
+				c.fromHost.buf, c.toHost.buf = nil, nil
 				return
 			}
 		}
@@ -217,7 +231,72 @@ func (c *TappedConn) observe(fromHost bool, p []byte) {
 		return
 	}
 	c.toHost.buf = append(c.toHost.buf, p...)
+	if c.requestHead {
+		end := bytes.Index(c.toHost.buf, []byte("\r\n\r\n"))
+		if end < 0 {
+			return
+		}
+		head := string(c.toHost.buf[:end])
+		c.toHost.buf = c.toHost.buf[end+4:]
+		c.requestHead = false
+		lines := strings.Split(head, "\r\n")
+		if fields := strings.Fields(lines[0]); len(fields) >= 2 {
+			c.Path = fields[1]
+		}
+		header := http.Header{}
+		for _, line := range lines[1:] {
+			if name, value, found := strings.Cut(line, ":"); found {
+				header.Add(strings.TrimSpace(name), strings.TrimSpace(value))
+			}
+		}
+		c.Subprotocols = subprotocols(header)
+	}
 	c.drain(&c.toHost, false)
+}
+
+// WrapListener taps every connection ln accepts, below HTTP.
+//
+// It exists for a server whose handler cannot be wrapped -- factory.Server
+// serves its own router on the listener it is handed -- and it is as PASSIVE
+// as Wrap: every byte is copied, none is changed. "FromHost" then means "from
+// the SERVER", whichever service that is. A connection answered with anything
+// but 101 is plain HTTP and is recorded with its status only.
+func (t *HostLinkTap) WrapListener(ln net.Listener) net.Listener {
+	return &tapListener{Listener: ln, tap: t}
+}
+
+type tapListener struct {
+	net.Listener
+	tap *HostLinkTap
+}
+
+func (l *tapListener) Accept() (net.Conn, error) {
+	raw, err := l.Listener.Accept()
+	if err != nil {
+		return raw, err
+	}
+	l.tap.mu.Lock()
+	l.tap.next++
+	conn := &TappedConn{ID: l.tap.next, requestHead: true}
+	l.tap.conns = append(l.tap.conns, conn)
+	l.tap.mu.Unlock()
+	return &tappedNetConn{Conn: raw, conn: conn}, nil
+}
+
+// Upgraded reports whether this connection was answered 101: only an upgraded
+// connection carries frames.
+func (c *TappedConn) Upgraded() bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.status == http.StatusSwitchingProtocols
+}
+
+// RequestPath is the request path, read off the wire for a listener-tapped
+// connection.
+func (c *TappedConn) RequestPath() string {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.Path
 }
 
 // parseResponseHead reads the HTTP status line and headers Host wrote to the
@@ -442,4 +521,19 @@ func ReplyTo(replies []WireReply, id uint32) (WireReply, bool) {
 		}
 	}
 	return WireReply{}, false
+}
+
+// TapOf views one tapped connection as a tap of its own, so a case can read a
+// single connection with the same helpers it reads a whole tap with.
+func TapOf(conn *TappedConn) *HostLinkTap {
+	return &HostLinkTap{conns: []*TappedConn{conn}, next: conn.ID}
+}
+
+// TapOfConns views several tapped connections as a tap of their own.
+func TapOfConns(conns []*TappedConn) *HostLinkTap {
+	tap := &HostLinkTap{conns: append([]*TappedConn(nil), conns...)}
+	if len(conns) > 0 {
+		tap.next = conns[len(conns)-1].ID
+	}
+	return tap
 }

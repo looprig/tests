@@ -1,0 +1,6 @@
+{
+  "source": "factory ClientLink (pinned in go.mod), a connect presenting an unknown bearer",
+  "reply": {
+    "http_status": 401
+  }
+}

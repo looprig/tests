@@ -1,0 +1,17 @@
+{
+  "source": "factory -> host (released versions pinned in go.mod), captured live",
+  "method": "${hostlink_channel}",
+  "request": {
+    "id": 0,
+    "rpc": {
+      "data": {
+        "command_id": "${command_id}"
+      },
+      "method": "${hostlink_channel}"
+    }
+  },
+  "reply": {
+    "id": 0,
+    "rpc": {}
+  }
+}
