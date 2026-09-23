@@ -131,7 +131,14 @@ func TestDedicatedPlacementInDisposableNamespace(t *testing.T) {
 		if controlErr != nil {
 			t.Fatalf("the control attach for the fixed session failed at the transport: %v", controlErr)
 		}
-		lane.Log("control attach for the fixed session %s: refusal=%v reply=%s", placed, controlRefusal, controlReply)
+		if controlRefusal != nil {
+			t.Fatalf("the control attach for the Host's OWN fixed session was refused %+v: %s", *controlRefusal, controlReply)
+		}
+		var observed sessionwire.HostLinkRegistryObservation
+		if err := json.Unmarshal([]byte(controlReply), &observed); err != nil || observed.SessionID != placed {
+			t.Fatalf("the control attach answered %s (%v), want a registry observation for %s", controlReply, err, placed)
+		}
+		lane.Log("control attach for the fixed session %s accepted: %s", placed, controlReply)
 
 		const foreign = sessionwire.SessionID("d31-not-the-fixed-session")
 		reply, refusal, transportErr := attach(foreign, "d31-probe-foreign")
@@ -258,6 +265,10 @@ func TestDedicatedPlacementInDisposableNamespace(t *testing.T) {
 			t.Fatalf("after the kill: pods %v, want one replacement (not %s)", podUIDs(now), victim.Metadata.UID)
 		}
 		termination, err := lane.Store.GetPlacementTermination(ctx, sessionstore.GetPlacementTerminationRequest{TenantID: kindlane.Tenant, SessionID: killed, Generation: 1})
+		if err != nil || termination.Termination.Kind != sessionstore.PlacementTerminationForced ||
+			termination.Termination.ForcedReason != sessionstore.PlacementForcedWorkloadTerminated || termination.Termination.Generation != 1 {
+			t.Fatalf("termination row %+v (%v), want forced workload_terminated at generation 1", termination.Termination, err)
+		}
 		lane.Log("replacement pod %s uid=%s; lease epoch %d -> %d; termination record %+v (err %v)",
 			now[0].Metadata.Name, now[0].Metadata.UID, before.Registration.LeaseEpoch, after.Registration.LeaseEpoch, termination.Termination, err)
 	})
@@ -403,7 +414,14 @@ var forwarding = regexp.MustCompile(`Forwarding from 127\.0\.0\.1:(\d+)`)
 
 func (l *kindLane) portForward(ctx context.Context, pod string, port int) string {
 	l.t.Helper()
-	cmd := exec.CommandContext(ctx, "kubectl", "--context", l.kubeContext, "-n", l.Namespace, "port-forward", "pod/"+pod, fmt.Sprintf(":%d", port))
+	return l.portForwardTarget(ctx, "pod/"+pod, port)
+}
+
+// portForwardTarget forwards a local port to target (pod/<name>, svc/<name>)
+// for the life of the current (sub)test and returns the local address.
+func (l *kindLane) portForwardTarget(ctx context.Context, target string, port int) string {
+	l.t.Helper()
+	cmd := exec.CommandContext(ctx, "kubectl", "--context", l.kubeContext, "-n", l.Namespace, "port-forward", target, fmt.Sprintf(":%d", port))
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {
 		l.t.Fatal(err)

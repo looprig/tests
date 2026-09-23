@@ -8,7 +8,7 @@
 //
 // IN the cluster: a dedicated Host Pod per session, rendered by the released
 // controller's Kubernetes adapter and running cmd/kindhost (released host
-// v0.6.0's host.Run over the orchestration kit's REAL harness rig and a
+// v0.7.1's host.Run over the orchestration kit's REAL harness rig and a
 // scripted model); two replicas of cmd/kindcontrol, each a released Factory
 // (factory.New) sharing one released controller adapter with a released
 // controller driver; and two NATS JetStream servers -- one the SessionStore

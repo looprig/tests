@@ -52,10 +52,14 @@ import (
 	sessionwire "github.com/looprig/core/sessionwire/v1"
 	"github.com/looprig/natsstore"
 	"github.com/looprig/sessionstore"
+	"github.com/looprig/storage"
 	"github.com/looprig/tests/internal/kindlane"
 	"github.com/looprig/tests/internal/orchestrationtest"
 )
 
+// The NodePorts are FIXED (the kind config maps them to the host), so runs are
+// SERIAL: two cases cannot overlap on one cluster, and a namespace a failed
+// run leaked keeps the ports until it is deleted.
 const (
 	kindStoreNodePort   = 30422
 	kindFactoryNodePort = 30480
@@ -78,6 +82,13 @@ type kindLane struct {
 	FactoryURL   string
 	HostImage    string
 	Replicas     int
+
+	// Backend is the durable plane's storage composite (through the NodePort).
+	Backend *storage.Composite
+
+	// root is the case's own *testing.T. Subtests reassign t; cleanup, which
+	// runs after they have finished, reports through root.
+	root *testing.T
 
 	kubeContext string
 	http        *http.Client
@@ -109,6 +120,7 @@ func newKindLane(t *testing.T, ctx context.Context, sessions []sessionwire.Sessi
 	run := hex.EncodeToString(raw)
 	lane := &kindLane{
 		t:            t,
+		root:         t,
 		RunID:        run,
 		Namespace:    "looprig-d31-" + run,
 		ControllerID: "d31-" + run,
@@ -158,6 +170,7 @@ func newKindLane(t *testing.T, ctx context.Context, sessions []sessionwire.Sessi
 	}
 	t.Cleanup(func() { _ = store.Close(context.Background()) })
 	lane.Store = store
+	lane.Backend = backend.Composite
 
 	payload, err := json.Marshal(lane.payload())
 	if err != nil {
@@ -498,7 +511,7 @@ func (l *kindLane) Log(format string, args ...any) {
 
 func (l *kindLane) cleanup() {
 	if os.Getenv("KIND_KEEP") == "1" {
-		l.t.Logf("KIND_KEEP=1: leaving namespace %s", l.Namespace)
+		l.root.Logf("KIND_KEEP=1: leaving namespace %s", l.Namespace)
 		return
 	}
 	// The controller README's removal procedure, verbatim in effect: stop the
@@ -511,7 +524,7 @@ func (l *kindLane) cleanup() {
 		_, _ = l.TryKubectl(nil, "-n", l.Namespace, "patch", name, "--type=merge", "-p", `{"metadata":{"finalizers":null}}`)
 	}
 	if out, err := l.TryKubectl(nil, "delete", "namespace", l.Namespace, "--wait=true", "--timeout=180s"); err != nil {
-		l.t.Errorf("deleting namespace %s: %v\n%s", l.Namespace, err, out)
+		l.root.Errorf("deleting namespace %s: %v\n%s", l.Namespace, err, out)
 	}
 }
 

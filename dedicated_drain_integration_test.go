@@ -18,6 +18,7 @@ package tests
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"net/http"
@@ -29,7 +30,11 @@ import (
 
 	controllerk8s "github.com/looprig/controller/kubernetes"
 	sessionwire "github.com/looprig/core/sessionwire/v1"
+	"github.com/looprig/core/uuid"
+	"github.com/looprig/harness/pkg/event"
+	"github.com/looprig/natsstore"
 	"github.com/looprig/sessionstore"
+	"github.com/looprig/storage"
 	"github.com/looprig/tests/internal/kindlane"
 	"github.com/looprig/tests/internal/orchestrationtest"
 )
@@ -105,6 +110,20 @@ func TestDedicatedDrainInDisposableNamespace(t *testing.T) {
 		}
 		runtimeID := entry.Record.Binding.RuntimeSessionID
 
+		// THE HARNESS JOURNAL IS THE AUTHORITY on restore-versus-restart.
+		// Factory's /journal is SessionStore's public journal, which is empty
+		// for a disposition session, and every check below it would also hold
+		// if the Host had silently started the session over under the same
+		// runtime id (a second SessionStarted). So the journal the Host wrote
+		// is read directly, through a port-forward to the nats-journal Service.
+		journal := lane.openJournal(ctx)
+		runtimeUUID := journal.RuntimeSessionID(t, ctx, kindlane.Tenant, released)
+		before := lane.journalSummary(journal, runtimeUUID)
+		if before.started != 1 || !before.sawText("a session to release") {
+			t.Fatalf("before the restore the harness journal holds %+v; want one SessionStarted and the first message", before)
+		}
+		lane.Log("harness journal before the restore: %s", before)
+
 		status, body := lane.Post(ctx, "/v1/sessions/"+string(released)+"/restore", sessionwire.RestoreRequest{
 			CommandEnvelope: orchestrationtest.PooledEnvelope("d31-released-restore"), SessionID: released,
 		})
@@ -129,6 +148,21 @@ func TestDedicatedDrainInDisposableNamespace(t *testing.T) {
 		if after.Record.Binding.RuntimeSessionID != runtimeID {
 			t.Fatalf("runtime session id changed %s -> %s", runtimeID, after.Record.Binding.RuntimeSessionID)
 		}
+		var after2 journalSummary
+		lane.WaitFor("the restored session's later turn is journalled", time.Minute, func() bool {
+			after2 = lane.journalSummary(journal, runtimeUUID)
+			return after2.sawText("after the restore")
+		})
+		if after2.started != 1 {
+			t.Fatalf("after the restore the journal holds %d SessionStarted: the session was started over, not restored (%s)", after2.started, after2)
+		}
+		if after2.restored < 1 {
+			t.Fatalf("after the restore the journal holds no RestoreDone (%s)", after2)
+		}
+		if !after2.sawText("a session to release") {
+			t.Fatalf("after the restore the pre-release first message is gone from the journal (%s)", after2)
+		}
+		lane.Log("harness journal after the restore: %s", after2)
 		lane.Log("Factory revived the session: desired generation %d -> %d, idempotency key %q", entry.Record.DesiredGeneration, after.Record.DesiredGeneration, after.Record.DesiredIdempotencyKey)
 		lane.Log("restore applied %s after admission on pod %s (generation label %s, desired generation %d); same runtime session %s; a later input applied",
 			took.Round(time.Millisecond), pod.Metadata.Name, pod.Metadata.Labels[controllerk8s.LabelGeneration], after.Record.DesiredGeneration, runtimeID)
@@ -414,6 +448,65 @@ func truncate(s string, n int) string {
 	return s[:n] + "..."
 }
 
+// openJournal opens the harness journal (the nats-journal Service, reached
+// by port-forward) through the kit's world, so its journal helpers apply.
+func (l *kindLane) openJournal(ctx context.Context) *orchestrationtest.PooledWorld {
+	l.t.Helper()
+	address := l.portForwardTarget(ctx, "svc/nats-journal", 4222)
+	var backend *natsstore.Store
+	var err error
+	for deadline := time.Now().Add(30 * time.Second); ; time.Sleep(500 * time.Millisecond) {
+		backend, err = natsstore.Open(ctx, natsstore.Options{URL: "nats://" + address})
+		if err == nil || time.Now().After(deadline) {
+			break
+		}
+	}
+	if err != nil {
+		l.t.Fatalf("opening the harness journal through %s: %v", address, err)
+	}
+	l.t.Cleanup(func() { _ = backend.Close(context.Background()) })
+	return orchestrationtest.NewPooledWorld(l.t, ctx, orchestrationtest.PooledWorldOptions{
+		Tenants:         []sessionwire.TenantID{kindlane.Tenant},
+		Backend:         l.Backend,
+		JournalBackends: map[sessionwire.TenantID]*storage.Composite{kindlane.Tenant: backend.Composite},
+	})
+}
+
+// journalSummary is what the harness journal says about one runtime session.
+type journalSummary struct {
+	started, restored, turns int
+	messages                 []string
+}
+
+func (j journalSummary) sawText(needle string) bool {
+	for _, m := range j.messages {
+		if strings.Contains(m, needle) {
+			return true
+		}
+	}
+	return false
+}
+
+func (j journalSummary) String() string {
+	return fmt.Sprintf("SessionStarted=%d RestoreDone=%d TurnStarted=%d user messages=%q", j.started, j.restored, j.turns, j.messages)
+}
+
+func (l *kindLane) journalSummary(world *orchestrationtest.PooledWorld, id uuid.UUID) journalSummary {
+	l.t.Helper()
+	summary := journalSummary{
+		started:  orchestrationtest.CountJournalEvents[event.SessionStarted](l.t, world, kindlane.Tenant, id),
+		restored: orchestrationtest.CountJournalEvents[event.RestoreDone](l.t, world, kindlane.Tenant, id),
+	}
+	for _, turn := range orchestrationtest.JournalEvents[event.TurnStarted](l.t, world, kindlane.Tenant, id) {
+		summary.turns++
+		if turn.Message != nil {
+			raw, _ := json.Marshal(turn.Message)
+			summary.messages = append(summary.messages, string(raw))
+		}
+	}
+	return summary
+}
+
 // auditDelete is one Pod delete as the API server's audit log recorded it.
 type auditDelete struct {
 	User            string
@@ -471,8 +564,10 @@ func (l *kindLane) requireOneControllerDelete(pod, uid string) {
 	l.t.Helper()
 	deletes, ok := l.podDeletes(pod)
 	if !ok {
-		l.Log("no API-server audit log on this cluster; the UID precondition was not observed")
-		return
+		// scripts/kind-d31.sh up always enables the audit log; a cluster
+		// without one cannot close F3, so this is a failure, not a skip.
+		l.t.Fatalf("cannot read the API-server audit log on %s (KIND_AUDIT_NODE); create the cluster with scripts/kind-d31.sh up",
+			envOr("KIND_AUDIT_NODE", "looprig-d31-control-plane"))
 	}
 	controller := "system:serviceaccount:" + l.Namespace + ":looprig-controller"
 	var mine []auditDelete
