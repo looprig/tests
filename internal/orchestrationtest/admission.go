@@ -81,6 +81,19 @@ type PooledFactoryConfig struct {
 	// lifetime. Zero takes ReconcileSweepInterval and ReconcileClaimTTL.
 	Interval time.Duration
 	ClaimTTL time.Duration
+
+	// PerConnectionQueueBytes overrides the ClientLink's per-connection
+	// outbound queue budget, in BYTES. Zero takes Factory's default. It is how
+	// a case configures the slow-consumer threshold it then measures.
+	PerConnectionQueueBytes int
+
+	// WriteTimeout, PingInterval and PongTimeout override the ClientLink's
+	// liveness bounds. Zero takes Factory's default. Factory requires
+	// WriteTimeout <= PongTimeout < PingInterval. A slow-consumer case raises
+	// them so that the QUEUE BUDGET is the only bound its stall can reach.
+	WriteTimeout time.Duration
+	PingInterval time.Duration
+	PongTimeout  time.Duration
 }
 
 // StartPooledFactoryWith composes, starts and serves a real pooled Factory

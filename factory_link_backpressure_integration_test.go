@@ -17,7 +17,9 @@
 //	        and nothing outside it can fill that buffer on purpose without also
 //	        being a test of this module's timing. The repair half reconnects the
 //	        dead client and holds it to the same rule every reconnect in this
-//	        lane is held to.
+//	        lane is held to. A GENUINE overflow -- a consumer that stops
+//	        reading and is closed by the queue budget -- is now driven by
+//	        case 3 below, with the same two halves asserted.
 //	case 2  "a HostBinding failure repairs every local DeliveryBinding
 //	        independently WHILE A SESSION ON ANOTHER HOST CONTINUES."
 //	        FIRST HALF DRIVEN by severing the HostLink at TCP -- the one
@@ -33,10 +35,16 @@
 //	        compatibility in the pooled kit, which StartPooledHost does not carry
 //	        yet. Not done here; do not read its absence as impossible.
 //	case 3  the SELECTED Centrifuge slow-consumer threshold, and whether it
-//	        closes a subscription or the physical link. NOT MEASURED. It needs
-//	        the buffer to actually overflow, which is case 1's unreachable
-//	        window, and the runbook is explicit that an assumed library
-//	        behaviour must not be encoded. Owed, and deliberately not guessed.
+//	        closes a subscription or the physical link. MEASURED, in
+//	        TestCentrifugeSlowConsumerThresholdAndItsBlastRadius: a real
+//	        centrifuge-go client whose socket stops being read, against two
+//	        replicas that differ only in PerConnectionQueueBytes. Measured
+//	        outcome: the tight replica closes the slow client's PHYSICAL LINK
+//	        with DisconnectSlow (3008) and the client redials; the loose one
+//	        never closes it. The recovery asserted is for that measured blast
+//	        radius: the slow client repairs from the durable journal with no
+//	        record lost, and a fast peer of the same session and a viewer of
+//	        another session on the same replica stream on untouched.
 //	case 4  "enduring frames are never oldest-dropped AND ephemeral coalescing
 //	        remains bounded."
 //	        FIRST CLAUSE DRIVEN, and it is the rule every case in this lane
@@ -54,6 +62,7 @@
 package tests
 
 import (
+	"context"
 	"encoding/json"
 	"net/http"
 	"strings"
@@ -66,6 +75,7 @@ import (
 )
 
 // TestRealtimeFailureBlastRadiusIsBoundedByTheSession is I1.4 cases 1, 2 and 4.
+// Case 3 is TestCentrifugeSlowConsumerThresholdAndItsBlastRadius.
 func TestRealtimeFailureBlastRadiusIsBoundedByTheSession(t *testing.T) {
 	ctx := placementContext(t)
 	world := orchestrationtest.NewPooledWorld(t, ctx, orchestrationtest.PooledWorldOptions{})
@@ -273,4 +283,270 @@ func TestRealtimeFailureBlastRadiusIsBoundedByTheSession(t *testing.T) {
 			}
 		}
 	})
+}
+
+// slowConsumer* size I1.4 case 3's load. The tight budget is far below the
+// load and the loose one far above it, so the queue budget -- and nothing
+// else -- separates the two replicas' outcomes.
+const (
+	slowConsumerPadBytes    = 4 << 10
+	slowConsumerLoad        = 1024 // publications, ~4 MiB of bodies
+	slowConsumerBatch       = 16
+	slowConsumerTightBudget = 512 << 10
+	slowConsumerLooseBudget = 256 << 20
+	slowConsumerReadBuffer  = 4 << 10
+)
+
+// TestCentrifugeSlowConsumerThresholdAndItsBlastRadius is I1.4 CASE 3,
+// MEASURED rather than assumed.
+//
+// # What is driven
+//
+// A genuinely slow ClientLink consumer: a real centrifuge-go client whose TCP
+// connection STOPS BEING READ (PooledBrowser's stallable socket, with a small
+// kernel receive buffer), so the bytes a real Factory sends pile up in the
+// kernel and then in centrifuge's own per-connection queue. It is not a client
+// that is slow in a callback: centrifuge-go reads its socket on its own
+// goroutine into an unbounded callback queue, so a slow callback never reaches
+// the server at all.
+//
+// # Sizing, and a finding it came from
+//
+// The budget bounds a BURST, not only a stall. At a 64 KiB budget with the
+// load committed 64 records (256 KiB) at a time, the FAST peer -- a prompt
+// reader on loopback -- was closed with 3008 too, twice, and repaired. That is
+// the threshold working, not the slow client's blast radius, so the case
+// commits 16 records (64 KiB) at a time against a 512 KiB budget: above any
+// burst a prompt reader queues, far below the ~4 MiB a stalled one does. A
+// deployment sizing PerConnectionQueueBytes must size it above its own
+// largest burst for the same reason.
+//
+// TWO REPLICAS, IDENTICAL BUT FOR THE BUDGET. Factory's
+// ClientLinkLimits.PerConnectionQueueBytes is the only thing that feeds
+// centrifuge's ClientQueueMaxSize, and it is set to 512 KiB on one replica and
+// 256 MiB on the other. The same stalled consumer, under the same ~4 MiB load,
+// watches the same session on each. What differs in the outcome is therefore
+// the configured threshold. The liveness bounds are raised on both, so the
+// stall cannot reach a ping or write deadline instead -- the queue budget is
+// the only bound in play.
+//
+// # What is measured, and asserted only after it was measured
+//
+// On the tight replica the server closes the slow client's PHYSICAL LINK --
+// the transport reports a disconnect carrying centrifuge's DisconnectSlow
+// (3008), and the client dials a new TCP connection -- rather than
+// unsubscribing it from a channel. 3008 is in centrifuge-go's reconnect band,
+// so the client comes back by itself and re-subscribes; PooledBrowser then
+// repairs from the durable journal from the position it held. On the loose
+// replica the same client, stalled the same way, is never closed and receives
+// every record live.
+//
+// The blast radius asserted is the measured one: the link of the slow client
+// and nothing else. A fast viewer of the SAME session on the SAME replica, and
+// a viewer of ANOTHER tenant's session on it, keep streaming live throughout
+// with no close, no reset and no repair.
+func TestCentrifugeSlowConsumerThresholdAndItsBlastRadius(t *testing.T) {
+	ctx := placementContext(t)
+	world := orchestrationtest.NewPooledWorld(t, ctx, orchestrationtest.PooledWorldOptions{
+		DurableTail:  true,
+		TailPadBytes: slowConsumerPadBytes,
+	})
+	pooled := orchestrationtest.StartPooledHost(t, ctx, world, "orchestrationtest-slowconsumer-host", 4)
+	orchestrationtest.AwaitAdvertised(t, world, pooled.ID)
+	replica := func(name string, budget int) *orchestrationtest.PooledFactory {
+		return orchestrationtest.StartPooledFactoryWith(t, ctx, world, orchestrationtest.PooledFactoryConfig{
+			Replica:                 name,
+			PerConnectionQueueBytes: budget,
+			PingInterval:            2 * time.Minute,
+			PongTimeout:             time.Minute,
+			WriteTimeout:            time.Minute,
+		})
+	}
+	tight := replica("orchestrationtest-slowconsumer-tight", slowConsumerTightBudget)
+	loose := replica("orchestrationtest-slowconsumer-loose", slowConsumerLooseBudget)
+
+	const tenant, otherTenant = orchestrationtest.PooledTenantA, orchestrationtest.PooledTenantB
+	const session, otherSession = sessionwire.SessionID("session-slow"), sessionwire.SessionID("session-slow-other")
+	create := func(tn sessionwire.TenantID, s sessionwire.SessionID) {
+		command := "command-slow-create-" + string(s)
+		status, body := tight.Post(t, ctx, tn, "/v1/sessions", sessionwire.CreateRequest{
+			CommandEnvelope: orchestrationtest.PooledEnvelope(command),
+			SessionID:       s,
+			AgentID:         orchestrationtest.PooledAgent,
+			Blocks:          json.RawMessage(`[{"type":"text","text":"hello"}]`),
+		})
+		if status != http.StatusCreated {
+			t.Fatalf("the create of %s answered %d: %s", s, status, body)
+		}
+		orchestrationtest.PooledWait(t, "the create of "+string(s)+" applied", 90*time.Second, func() bool {
+			return world.CommandState(ctx, tn, s, sessionwire.CommandID(command)) == sessionstore.InboxStateApplied
+		})
+	}
+	create(tenant, session)
+	create(otherTenant, otherSession)
+
+	watch := func(f *orchestrationtest.PooledFactory, tn sessionwire.TenantID, s sessionwire.SessionID, options orchestrationtest.PooledBrowserOptions) *orchestrationtest.PooledBrowser {
+		b := orchestrationtest.OpenPooledBrowser(t, ctx, f, tn, options)
+		if err := b.Watch(t, ctx, s, 0); err != nil {
+			t.Fatalf("a browser of %s was refused: %v", s, err)
+		}
+		b.Settle(t, ctx)
+		return b
+	}
+	stalled := orchestrationtest.PooledBrowserOptions{Stallable: true, ReadBufferBytes: slowConsumerReadBuffer}
+	slowTight := watch(tight, tenant, session, stalled)
+	slowLoose := watch(loose, tenant, session, stalled)
+	peer := watch(tight, tenant, session, orchestrationtest.PooledBrowserOptions{})
+	other := watch(tight, otherTenant, otherSession, orchestrationtest.PooledBrowserOptions{})
+
+	holdsThrough := func(b *orchestrationtest.PooledBrowser, tn sessionwire.TenantID, s sessionwire.SessionID) func() bool {
+		return func() bool {
+			all := world.Tails.Committed(tn, s)
+			_, position := b.Settle(t, ctx)
+			return len(all) > 0 && position >= all[len(all)-1].JournalSeq
+		}
+	}
+	// Every browser holds the create before the stall, so what follows is
+	// measured from a quiet, fully delivered start.
+	for _, b := range []*orchestrationtest.PooledBrowser{slowTight, slowLoose, peer} {
+		orchestrationtest.PooledWait(t, "a browser holds the create", 60*time.Second, holdsThrough(b, tenant, session))
+	}
+	orchestrationtest.PooledWait(t, "the other session's browser holds its create", 60*time.Second, holdsThrough(other, otherTenant, otherSession))
+	before := len(world.Tails.Committed(tenant, session))
+
+	// THE STALL, and the load. It is paced by the FAST peer, so the product's
+	// own subscriber channel never overflows and every record reaches Factory:
+	// whatever the slow client loses, it loses at Factory's edge.
+	slowTight.Stall()
+	slowLoose.Stall()
+	for sent := 0; sent < slowConsumerLoad; sent += slowConsumerBatch {
+		for range slowConsumerBatch {
+			world.Tails.Hint(tenant, session)
+		}
+		// The other tenant's session keeps committing too, a little.
+		world.Tails.Hint(otherTenant, otherSession)
+		orchestrationtest.PooledWait(t, "the fast peer kept up with the load", 60*time.Second, holdsThrough(peer, tenant, session))
+	}
+	orchestrationtest.PooledWait(t, "the other session's browser kept up", 60*time.Second, holdsThrough(other, otherTenant, otherSession))
+	loaded := world.Tails.Committed(tenant, session)
+	if got := len(loaded) - before; got != slowConsumerLoad {
+		t.Fatalf("the product committed %d of the %d-record load (failures %v)", got, slowConsumerLoad, world.Tails.DurableFailures())
+	}
+
+	// RELEASE BEFORE THE VERDICT. A server close issued from the publish path
+	// cannot unwind while its write is blocked on a socket nobody drains, so
+	// the outcome is read only once both slow clients read again.
+	slowTight.Release()
+	slowLoose.Release()
+	orchestrationtest.PooledWait(t, "the slow client on the TIGHT replica repaired through the load", 90*time.Second, holdsThrough(slowTight, tenant, session))
+	orchestrationtest.PooledWait(t, "the slow client on the LOOSE replica received the load", 90*time.Second, holdsThrough(slowLoose, tenant, session))
+
+	closes := func(b *orchestrationtest.PooledBrowser) []orchestrationtest.PooledBrowserEntry {
+		var out []orchestrationtest.PooledBrowserEntry
+		for _, entry := range b.Log() {
+			switch entry.Kind {
+			case "connecting", "disconnected", "subscribing", "unsubscribed", "R":
+				// The first connect and subscribe carry code 0 ("called"), and
+				// are the client's own doing.
+				if entry.Code != 0 || entry.Kind == "R" {
+					out = append(out, entry)
+				}
+			}
+		}
+		return out
+	}
+	tightCloses := closes(slowTight)
+	t.Logf("case 3 MEASURED: tight replica (%d B budget): dials=%d closes=%v repairs=%d",
+		slowConsumerTightBudget, slowTight.Dials(), tightCloses, len(slowTight.Repairs()))
+	t.Logf("case 3 MEASURED: loose replica (%d B budget): dials=%d closes=%v repairs=%d",
+		slowConsumerLooseBudget, slowLoose.Dials(), closes(slowLoose), len(slowLoose.Repairs()))
+
+	t.Run("the configured threshold closes the slow client's LINK with DisconnectSlow", func(t *testing.T) {
+		slow := false
+		for _, entry := range tightCloses {
+			if entry.Kind == "connecting" && entry.Code == 3008 {
+				slow = true
+			}
+		}
+		if !slow {
+			t.Fatalf("the slow client on the tight replica saw %v, want a transport close carrying DisconnectSlow (3008)", tightCloses)
+		}
+		// THE PHYSICAL LINK, not a subscription: the client had to dial again.
+		if slowTight.Dials() < 2 {
+			t.Fatalf("the slow client dialed %d time(s): the close did not take its link", slowTight.Dials())
+		}
+	})
+
+	t.Run("below the threshold the same stall is never closed", func(t *testing.T) {
+		if got := closes(slowLoose); len(got) != 0 || slowLoose.Dials() != 1 {
+			t.Fatalf("the slow client on the loose replica saw %v over %d dial(s), want no close at all", got, slowLoose.Dials())
+		}
+		// Everything live: the only repair is the join read.
+		assertOnlyJoinRepair(t, "the loose replica's slow client", slowLoose)
+		assertHoldsAll(t, "the loose replica's slow client", slowLoose, world.Tails.Committed(tenant, session))
+	})
+
+	t.Run("the slow client repairs on reconnect with no record lost", func(t *testing.T) {
+		assertHoldsAll(t, "the tight replica's slow client", slowTight, world.Tails.Committed(tenant, session))
+		// The repair is what recovered the tail of the load: at least one
+		// journal read after the join, and it carried records.
+		repairs := slowTight.Repairs()
+		recovered := 0
+		for _, repair := range repairs[1:] {
+			recovered += len(repair.Events)
+		}
+		if len(repairs) < 2 || recovered == 0 {
+			t.Fatalf("the slow client's repairs are %d reads recovering %d records, want a durable repair after the reconnect", len(repairs), recovered)
+		}
+		t.Logf("case 3: the slow client recovered %d records from the journal over %d repair(s)", recovered, len(repairs)-1)
+	})
+
+	t.Run("the peer on the same session and replica, and another session, are untouched", func(t *testing.T) {
+		for _, c := range []struct {
+			who     string
+			b       *orchestrationtest.PooledBrowser
+			tn      sessionwire.TenantID
+			session sessionwire.SessionID
+		}{
+			{"the fast peer of the same session", peer, tenant, session},
+			{"the viewer of another tenant's session", other, otherTenant, otherSession},
+		} {
+			if got := closes(c.b); len(got) != 0 {
+				t.Fatalf("%s saw %v: the slow client's close reached it", c.who, got)
+			}
+			assertOnlyJoinRepair(t, c.who, c.b)
+			assertHoldsAll(t, c.who, c.b, world.Tails.Committed(c.tn, c.session))
+		}
+	})
+
+	if failures := world.Tails.DurableFailures(); len(failures) != 0 {
+		t.Fatalf("the product failed to commit durably: %v", failures)
+	}
+}
+
+// assertHoldsAll requires a browser to hold exactly every committed event, in
+// order, once each, and to have received no sequence twice live.
+func assertHoldsAll(t *testing.T, who string, b *orchestrationtest.PooledBrowser, want []orchestrationtest.PooledCommitted) {
+	t.Helper()
+	got, _ := b.Settle(t, context.Background())
+	if len(got) != len(want) {
+		t.Fatalf("%s holds %d events, want exactly the %d committed", who, len(got), len(want))
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("%s holds %v at position %d, want %v", who, got[i], i, want[i])
+		}
+	}
+	if duplicates := b.LiveDuplicates(); len(duplicates) != 0 {
+		t.Fatalf("%s received sequences live more than once: %v", who, duplicates)
+	}
+}
+
+// assertOnlyJoinRepair requires a browser to have read the journal once, at
+// its join, and to have received everything after that live.
+func assertOnlyJoinRepair(t *testing.T, who string, b *orchestrationtest.PooledBrowser) {
+	t.Helper()
+	if repairs := b.Repairs(); len(repairs) != 1 {
+		t.Fatalf("%s made %d journal reads, want only its join: %+v", who, len(repairs), repairs)
+	}
 }

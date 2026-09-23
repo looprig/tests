@@ -439,6 +439,23 @@ type PooledTails struct {
 	subs      []pooledTailKey
 	dropped   int
 	notes     []string
+
+	// durable is set in a DurableTail world: every publication is first
+	// appended to SessionStore's own public journal and carries the sequence
+	// the STORE assigned. See PooledWorldOptions.DurableTail.
+	durable  *sessionstore.Store
+	writers  map[pooledTailKey]*sessionstore.JournalWriter
+	ordinals map[pooledTailKey]uint64
+	history  map[pooledTailKey][]PooledCommitted
+	failures []error
+	pad      int
+}
+
+// PooledCommitted is one publication the product runtime committed: its
+// identity and the sequence it was published under.
+type PooledCommitted struct {
+	EventID    sessionwire.EventID
+	JournalSeq uint64
 }
 
 // bridgeNote records one bridge lifecycle observation.
@@ -495,15 +512,28 @@ func (t *PooledTails) Emit(key pooledTailKey, n int) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	for range n {
-		t.committed[key]++
-		seq := t.committed[key]
-		publication := sessionwire.EnduringPublication{
-			TenantID:       key.tenant,
-			SessionID:      key.session,
-			EventID:        sessionwire.EventID(fmt.Sprintf("event-%s-%d", key.session, seq)),
-			JournalSeq:     seq,
-			CoveredThrough: seq,
-			Body:           json.RawMessage(fmt.Sprintf(`{"tenant":%q,"seq":%d}`, key.tenant, seq)),
+		var publication sessionwire.EnduringPublication
+		if t.durable != nil {
+			committed, ok := t.commitDurable(key)
+			if !ok {
+				// Nothing was committed, so nothing is published: a live
+				// record the journal does not hold would be exactly the lie
+				// this mode exists to rule out. The failure is reported by
+				// DurableFailures.
+				continue
+			}
+			publication = committed
+		} else {
+			t.committed[key]++
+			seq := t.committed[key]
+			publication = sessionwire.EnduringPublication{
+				TenantID:       key.tenant,
+				SessionID:      key.session,
+				EventID:        sessionwire.EventID(fmt.Sprintf("event-%s-%d", key.session, seq)),
+				JournalSeq:     seq,
+				CoveredThrough: seq,
+				Body:           json.RawMessage(fmt.Sprintf(`{"tenant":%q,"seq":%d}`, key.tenant, seq)),
+			}
 		}
 		subscribers := t.current[key]
 		if len(subscribers) == 0 {
@@ -518,6 +548,106 @@ func (t *PooledTails) Emit(key pooledTailKey, n int) {
 			}
 		}
 	}
+}
+
+// commitDurable appends the session's next product event to SessionStore's
+// public journal and returns the publication that carries it, under the
+// sequence THE STORE assigned. Called with t.mu held.
+//
+// The order is the product's obligation and the whole point: an event is
+// durable BEFORE it is published, so a client that misses the live record can
+// always read it back. The EventID is the product's own ordinal rather than
+// the store's sequence, because the ledger's first record is the writer's
+// opening fence -- a PRIVATE record -- so public sequences do not start at one
+// and are not the product's count.
+func (t *PooledTails) commitDurable(key pooledTailKey) (sessionwire.EnduringPublication, bool) {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	writer := t.writers[key]
+	if writer == nil {
+		opened, err := t.durable.OpenJournal(ctx, sessionstore.OpenJournalRequest{TenantID: key.tenant, SessionID: key.session})
+		if err != nil {
+			t.failures = append(t.failures, fmt.Errorf("opening the product journal for %s/%s: %w", key.tenant, key.session, err))
+			return sessionwire.EnduringPublication{}, false
+		}
+		writer = opened
+		t.writers[key] = writer
+	}
+	ordinal := t.ordinals[key] + 1
+	eventID := sessionwire.EventID(fmt.Sprintf("event-%s-%d", key.session, ordinal))
+	// ASCII padding only: Core requires a public body to be a fixed point of
+	// json.Marshal, and 'x' is.
+	body := []byte(fmt.Sprintf(`{"tenant":%q,"ordinal":%d,"pad":%q}`, key.tenant, ordinal, strings.Repeat("x", t.pad)))
+	seq, err := writer.Append(ctx, sessionstore.Envelope{
+		Kind:    sessionstore.EnvelopeKindPublicEvent,
+		EventID: eventID,
+		Public:  sessionstore.BodySlot{Inline: body},
+	})
+	if err != nil {
+		t.failures = append(t.failures, fmt.Errorf("appending %s: %w", eventID, err))
+		return sessionwire.EnduringPublication{}, false
+	}
+	t.ordinals[key] = ordinal
+	t.committed[key] = seq
+	t.history[key] = append(t.history[key], PooledCommitted{EventID: eventID, JournalSeq: seq})
+	return sessionwire.EnduringPublication{
+		TenantID:       key.tenant,
+		SessionID:      key.session,
+		EventID:        eventID,
+		JournalSeq:     seq,
+		CoveredThrough: seq,
+		Body:           json.RawMessage(body),
+	}, true
+}
+
+func (t *PooledTails) productJournal() *sessionstore.Store {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	return t.durable
+}
+
+// makeDurable switches this tail set to DurableTail mode over store.
+func (t *PooledTails) makeDurable(store *sessionstore.Store, pad int) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	t.durable, t.pad = store, pad
+	t.writers = map[pooledTailKey]*sessionstore.JournalWriter{}
+	t.ordinals = map[pooledTailKey]uint64{}
+	t.history = map[pooledTailKey][]PooledCommitted{}
+}
+
+// closeDurable closes every product journal writer. It must run before the
+// store closes.
+func (t *PooledTails) closeDurable(ctx context.Context) error {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	var errs []error
+	for key, writer := range t.writers {
+		if err := writer.Close(ctx); err != nil {
+			errs = append(errs, err)
+		}
+		delete(t.writers, key)
+	}
+	return errors.Join(errs...)
+}
+
+// Committed reports, in order, every publication the product committed for one
+// session in a DurableTail world. It is what was COMMITTED -- the expectation a
+// case holds a client's view against -- and never evidence of what a client
+// received.
+func (t *PooledTails) Committed(tenant sessionwire.TenantID, s sessionwire.SessionID) []PooledCommitted {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	return append([]PooledCommitted(nil), t.history[pooledTailKey{tenant, s}]...)
+}
+
+// DurableFailures reports every durable append that failed. A case in a
+// DurableTail world must assert it is empty: a failed append publishes
+// nothing, so it would otherwise surface only as a missing record.
+func (t *PooledTails) DurableFailures() []error {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	return append([]error(nil), t.failures...)
 }
 
 // Hint commits ONE publication for a session whose tail is driven by the
@@ -1141,6 +1271,12 @@ type PooledWorld struct {
 	Tails    *PooledTails
 	AskTool  *PooledAskTool
 
+	// ProductJournal is the product's own event journal in a DurableTail
+	// world: a real SessionStore every committed publication is appended to
+	// before it is published, and the store Factory's journal route reads.
+	// Nil otherwise.
+	ProductJournal *sessionstore.Store
+
 	tenants []sessionwire.TenantID
 	gated   bool
 }
@@ -1155,6 +1291,24 @@ type PooledWorldOptions struct {
 	// world shares. Nil takes a fresh memstore. The harness journals are
 	// unaffected: they are a different module's keyspace.
 	Backend *storage.Composite
+
+	// DurableTail makes the product's committed stream A REAL SESSIONSTORE
+	// PUBLIC JOURNAL (PooledWorld.ProductJournal): every publication is
+	// appended through a real sessionstore.JournalWriter before it is
+	// published, and carries the sequence the store assigned. Factory's journal route then answers a
+	// reconnecting client with the very events it missed, read from the real
+	// store -- nothing in the kit answers for them.
+	//
+	// It is opt-in because it changes the sequence numbering every other case
+	// asserts on: the writer's opening fence is a private ledger record, so a
+	// session's first public event is sequence 2, not 1. A client in this
+	// world must position itself from a journal read's covered_through, as a
+	// real browser does, not from zero.
+	DurableTail bool
+
+	// TailPadBytes pads each durable publication's body with that many ASCII
+	// bytes, so a case can put real bytes on a ClientLink. DurableTail only.
+	TailPadBytes int
 }
 
 // NewPooledWorld opens the shared durable plane and one harness journal per
@@ -1206,6 +1360,37 @@ func NewPooledWorld(tb TB, ctx context.Context, options PooledWorldOptions) *Poo
 			tb.Errorf("orchestrationtest: closing the pooled store: %v", err)
 		}
 	})
+	if options.DurableTail {
+		// The product journal is its OWN SessionStore, over its own backend.
+		// It cannot be world.Store: a session Factory created is bound to the
+		// DISPOSITION protocol there, and SessionStore refuses a journal
+		// writer on it (catalog conflict (binding.protocol_mode)) -- measured.
+		// A real product's event journal is likewise its own keyspace (harness
+		// keeps its journal apart for the same reason), and Factory reaches it
+		// through the one seam it offers for this, WithSessionReader.
+		product, err := sessionstore.Open(ctx, memstore.New())
+		if err != nil {
+			tb.Fatalf("orchestrationtest: opening the product journal store: %v", err)
+			return nil
+		}
+		world.ProductJournal = product
+		tb.Cleanup(func() {
+			closeCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+			defer cancel()
+			if err := product.Close(closeCtx); err != nil {
+				tb.Errorf("orchestrationtest: closing the product journal store: %v", err)
+			}
+		})
+		world.Tails.makeDurable(product, options.TailPadBytes)
+		// Registered AFTER the store's close, so it runs BEFORE it.
+		tb.Cleanup(func() {
+			closeCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+			defer cancel()
+			if err := world.Tails.closeDurable(closeCtx); err != nil {
+				tb.Errorf("orchestrationtest: closing the product journals: %v", err)
+			}
+		})
+	}
 	return world
 }
 
@@ -1617,6 +1802,12 @@ type pooledTipReader struct {
 }
 
 func (r pooledTipReader) ReadPublicJournal(ctx context.Context, req sessionstore.ReadPublicJournalRequest) (sessionwire.JournalPage, error) {
+	if product := r.tails.productJournal(); product != nil {
+		// In a DurableTail world the product's stream lives in its own real
+		// SessionStore journal, and that store's answer is the whole answer:
+		// nothing is substituted or cleared.
+		return product.ReadPublicJournal(ctx, req)
+	}
 	page, err := r.Store.ReadPublicJournal(ctx, req)
 	if err != nil {
 		return page, err
@@ -1679,6 +1870,18 @@ func startPooledFactory(tb TB, ctx context.Context, world *PooledWorld, cfg Pool
 	clientLink.DemandReleaseDebounce = reconcileDebounce
 	if cfg.DemandTimeout > 0 {
 		clientLink.DemandTimeout = cfg.DemandTimeout
+	}
+	if cfg.PerConnectionQueueBytes > 0 {
+		clientLink.PerConnectionQueueBytes = cfg.PerConnectionQueueBytes
+	}
+	if cfg.WriteTimeout > 0 {
+		clientLink.WriteTimeout = cfg.WriteTimeout
+	}
+	if cfg.PingInterval > 0 {
+		clientLink.PingInterval = cfg.PingInterval
+	}
+	if cfg.PongTimeout > 0 {
+		clientLink.PongTimeout = cfg.PongTimeout
 	}
 	token := cfg.ServiceToken
 	if token == "" {
