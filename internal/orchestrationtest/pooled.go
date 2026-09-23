@@ -15,6 +15,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	centrifugego "github.com/centrifugal/centrifuge-go"
@@ -581,6 +582,10 @@ type PooledTails struct {
 	history  map[pooledTailKey][]PooledCommitted
 	failures []error
 	pad      int
+	// stamp adds "at" (Unix nanoseconds at commit) to every durable body;
+	// quiet stops the timeline. See PooledWorldOptions.
+	stamp bool
+	quiet bool
 
 	// timeline records, per session, when each sequence was committed and
 	// when each Host subscription was opened -- the evidence a gap report
@@ -604,6 +609,9 @@ func (t *PooledTails) Timeline(tenant sessionwire.TenantID, s sessionwire.Sessio
 }
 
 func (t *PooledTails) note(key pooledTailKey, what string) {
+	if t.quiet {
+		return
+	}
 	if t.timeline == nil {
 		t.timeline = map[pooledTailKey][]string{}
 	}
@@ -713,8 +721,13 @@ func (t *PooledTails) relay(key pooledTailKey, delivery event.Delivery) {
 func (t *PooledTails) emit(key pooledTailKey, n int) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
+	t.emitLocked(key, n, t.pad)
+}
+
+// emitLocked is emit with the body padded to pad bytes. Called with t.mu held.
+func (t *PooledTails) emitLocked(key pooledTailKey, n, pad int) {
 	for range n {
-		committed, ok := t.commitDurable(key)
+		committed, ok := t.commitDurable(key, pad)
 		if !ok {
 			// Nothing was committed, so nothing is published: a live record
 			// the journal does not hold would be exactly the lie this mode
@@ -741,6 +754,22 @@ func (t *PooledTails) Commit(tenant sessionwire.TenantID, s sessionwire.SessionI
 	t.emit(key, 1)
 }
 
+// CommitPadded is Commit with this one record's body padded to pad bytes
+// instead of the world's TailPadBytes: how a case bursts a session with real
+// bytes without making every record that large.
+func (t *PooledTails) CommitPadded(tenant sessionwire.TenantID, s sessionwire.SessionID, pad int) {
+	key := pooledTailKey{tenant, s}
+	if t.productJournal() == nil {
+		t.mu.Lock()
+		t.failures = append(t.failures, fmt.Errorf("orchestrationtest: CommitPadded(%s/%s) outside a DurableTail world", tenant, s))
+		t.mu.Unlock()
+		return
+	}
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	t.emitLocked(key, 1, pad)
+}
+
 // commitDurable appends the session's next product event to the product
 // journal, under the session's RUNTIME id, and returns the publication that
 // carries it under the sequence THE STORE assigned. Called with t.mu held.
@@ -751,7 +780,7 @@ func (t *PooledTails) Commit(tenant sessionwire.TenantID, s sessionwire.SessionI
 // the store's sequence, because the ledger's first record is the writer's
 // opening fence -- a PRIVATE record -- so public sequences do not start at one
 // and are not the product's count.
-func (t *PooledTails) commitDurable(key pooledTailKey) (sessionwire.EnduringPublication, bool) {
+func (t *PooledTails) commitDurable(key pooledTailKey, pad int) (sessionwire.EnduringPublication, bool) {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 	writer := t.writers[key]
@@ -773,7 +802,10 @@ func (t *PooledTails) commitDurable(key pooledTailKey) (sessionwire.EnduringPubl
 	eventID := sessionwire.EventID(fmt.Sprintf("event-%s-%d", key.session, ordinal))
 	// ASCII padding only: Core requires a public body to be a fixed point of
 	// json.Marshal, and 'x' is.
-	body := []byte(fmt.Sprintf(`{"tenant":%q,"ordinal":%d,"pad":%q}`, key.tenant, ordinal, strings.Repeat("x", t.pad)))
+	body := []byte(fmt.Sprintf(`{"tenant":%q,"ordinal":%d,"pad":%q}`, key.tenant, ordinal, strings.Repeat("x", pad)))
+	if t.stamp {
+		body = []byte(fmt.Sprintf(`{"tenant":%q,"ordinal":%d,"at":%d,"pad":%q}`, key.tenant, ordinal, time.Now().UnixNano(), strings.Repeat("x", pad)))
+	}
 	seq, err := writer.Append(ctx, sessionstore.Envelope{
 		Kind:    sessionstore.EnvelopeKindPublicEvent,
 		EventID: eventID,
@@ -1557,6 +1589,15 @@ type PooledWorldOptions struct {
 	// TailPadBytes pads each durable publication's body with that many ASCII
 	// bytes, so a case can put real bytes on a ClientLink. DurableTail only.
 	TailPadBytes int
+	// TailStampBodies adds the commit's wall-clock time, in Unix nanoseconds,
+	// to each durable publication's body as "at", so a client in ANOTHER
+	// process can measure commit-to-delivery latency from the record alone.
+	// DurableTail only.
+	TailStampBodies bool
+	// TailQuiet stops the tail set keeping its per-session timeline, which
+	// grows by one line per commit. A long soak that never reads Timeline
+	// sets it, so the kit's own bookkeeping is not measured as growth.
+	TailQuiet bool
 
 	// JournalBackends, when set, supplies each tenant's harness journal
 	// backend. A missing tenant takes a fresh memstore. The kind lane uses it
@@ -1605,6 +1646,7 @@ func NewPooledWorld(tb TB, ctx context.Context, options PooledWorldOptions) *Poo
 		hostLogs:        options.HostLogs,
 		journalOptions:  options.JournalOptions,
 	}
+	world.Tails.quiet = options.TailQuiet
 	if options.WithAskTool {
 		world.AskTool = &PooledAskTool{}
 	}
@@ -1669,6 +1711,7 @@ func NewPooledWorld(tb TB, ctx context.Context, options PooledWorldOptions) *Poo
 			}
 		})
 		world.Tails.makeDurable(product, options.TailPadBytes)
+		world.Tails.stamp = options.TailStampBodies
 		// Registered AFTER the store's close, so it runs BEFORE it.
 		tb.Cleanup(func() {
 			closeCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
@@ -1795,17 +1838,39 @@ type pooledTrackingListener struct {
 
 	mu    sync.Mutex
 	conns []net.Conn
+
+	// written counts every byte the Host wrote to any accepted connection:
+	// its HostLink OUTBOUND volume, which a soak divides a Factory's
+	// ClientLink volume by to measure fan-out amplification.
+	written atomic.Int64
 }
 
 func (l *pooledTrackingListener) Accept() (net.Conn, error) {
 	conn, err := l.Listener.Accept()
 	if err == nil {
+		conn = &pooledCountingConn{Conn: conn, written: &l.written}
 		l.mu.Lock()
 		l.conns = append(l.conns, conn)
 		l.mu.Unlock()
 	}
 	return conn, err
 }
+
+// pooledCountingConn counts the bytes written through it.
+type pooledCountingConn struct {
+	net.Conn
+	written *atomic.Int64
+}
+
+func (c *pooledCountingConn) Write(p []byte) (int, error) {
+	n, err := c.Conn.Write(p)
+	c.written.Add(int64(n))
+	return n, err
+}
+
+// BytesOut reports every byte this Host has written to its accepted
+// connections -- its HostLink outbound volume -- since it started.
+func (h *PooledHost) BytesOut() int64 { return h.tracker.written.Load() }
 
 // Sever closes every connection accepted so far and reports how many.
 func (l *pooledTrackingListener) Sever() int {
