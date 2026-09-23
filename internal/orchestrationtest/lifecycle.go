@@ -20,7 +20,11 @@ import (
 	"github.com/looprig/core/content"
 	sessionwire "github.com/looprig/core/sessionwire/v1"
 	"github.com/looprig/core/uuid"
+	"github.com/looprig/harness/pkg/event"
+	"github.com/looprig/harness/pkg/journal"
 	"github.com/looprig/harness/pkg/rig"
+	"github.com/looprig/harness/pkg/session"
+	harnessstore "github.com/looprig/harness/pkg/sessionstore"
 	"github.com/looprig/harness/pkg/tool"
 	"github.com/looprig/harness/pkg/workspacestore"
 	"github.com/looprig/host"
@@ -58,8 +62,9 @@ type PooledHostConfig struct {
 	Drain *host.DrainOptions
 	// WrapCheckpointer, when set, wraps the product's checkpointer.
 	WrapCheckpointer func(host.Checkpointer) host.Checkpointer
-	// Mortal gives this Host a durable-plane view its death can cut. See
-	// PooledHost.Kill.
+	// Mortal gives this Host a durable-plane view (HostProcess) that its
+	// death can cut (PooledHost.Kill) or that can be PAUSED and resumed
+	// (HostProcess.Pause/Resume), as a stopped process would be.
 	Mortal bool
 }
 
@@ -67,318 +72,6 @@ type PooledHostConfig struct {
 func StartLifecycleHost(tb TB, ctx context.Context, world *PooledWorld, id sessionwire.HostID, generation uint64, cfg PooledHostConfig) *PooledHost {
 	tb.Helper()
 	return startHostConfigured(tb, ctx, world, id, generation, "", nil, cfg)
-}
-
-// ---- a Host process that can die --------------------------------------------
-
-// ErrHostProcessDead is what every durable-plane call from a dead Host answers.
-var ErrHostProcessDead = errors.New("orchestrationtest: this Host process is dead")
-
-// HostProcess is ONE Host process's view of the shared durable plane.
-//
-// # Why a view, and not Stop
-//
-// Stop DRAINS: it releases every lease and tombstones every registration, which
-// is the graceful path and proves nothing about takeover. A process that dies
-// does none of that. Its leases lapse when their provider's TTL runs out, its
-// registrations expire when it stops heartbeating, and it writes nothing ever
-// again. memstore never lapses a lease, so a dead in-process Host would hold
-// its session forever; this view is what makes death look like death:
-//
-//   - every call through the view fails ErrHostProcessDead, so the corpse's
-//     goroutines -- which are still running in this test binary -- can write no
-//     journal frame, no registration, no command state;
-//   - every lease it acquired is RELEASED ON THE UNDERLYING PROVIDER and its
-//     Lost channel closes, which is exactly a TTL lapse: the next Acquire, by
-//     anyone, is granted at a strictly greater epoch.
-//
-// The lapse is immediate rather than after a TTL. That shortens the case; it
-// does not change what a successor sees.
-type HostProcess struct {
-	mu     sync.Mutex
-	dead   bool
-	leases []*processLease
-}
-
-// View wraps inner so this process's death can cut it.
-func (p *HostProcess) View(tb TB, inner *storage.Composite) *storage.Composite {
-	tb.Helper()
-	blobs := storage.Blobs(processBlobs{inner: inner.Blobs, process: p})
-	if lifecycle, ok := inner.Blobs.(storage.BlobReaderLifecycle); ok {
-		// PRESERVED, not invented: sessionstore refuses a Blobs provider that
-		// does not implement the bounded reader lifecycle, and this view must
-		// not claim a lifecycle the provider underneath does not have.
-		blobs = processLifecycleBlobs{processBlobs: processBlobs{inner: inner.Blobs, process: p}, bound: lifecycle.BlobReaderCloseBound()}
-	}
-	view, err := storage.NewCompositeWithOrderedIndex(
-		processLedger{inner: inner.Ledger, process: p},
-		processLeaser{inner: inner.Leaser, process: p},
-		processKV{inner: inner.KV, process: p},
-		blobs,
-		processOrdered{OrderedIndex: inner.OrderedIndex, process: p},
-	)
-	if err != nil {
-		tb.Fatalf("orchestrationtest: composing a Host process view: %v", err)
-		return nil
-	}
-	return view
-}
-
-func (p *HostProcess) check() error {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	if p.dead {
-		return ErrHostProcessDead
-	}
-	return nil
-}
-
-// kill marks the process dead and lapses every lease it holds.
-func (p *HostProcess) kill() int {
-	p.mu.Lock()
-	p.dead = true
-	leases := p.leases
-	p.leases = nil
-	p.mu.Unlock()
-	for _, lease := range leases {
-		lease.lapse()
-	}
-	return len(leases)
-}
-
-type processLedger struct {
-	inner   storage.Ledger
-	process *HostProcess
-}
-
-func (l processLedger) Append(ctx context.Context, name string, expected uint64, payload []byte) error {
-	if err := l.process.check(); err != nil {
-		return err
-	}
-	return l.inner.Append(ctx, name, expected, payload)
-}
-
-func (l processLedger) Read(ctx context.Context, name string, from uint64) (storage.Cursor, error) {
-	if err := l.process.check(); err != nil {
-		return nil, err
-	}
-	return l.inner.Read(ctx, name, from)
-}
-
-func (l processLedger) Tip(ctx context.Context, name string) (uint64, error) {
-	if err := l.process.check(); err != nil {
-		return 0, err
-	}
-	return l.inner.Tip(ctx, name)
-}
-
-func (l processLedger) Delete(ctx context.Context, name string) error {
-	if err := l.process.check(); err != nil {
-		return err
-	}
-	return l.inner.Delete(ctx, name)
-}
-
-type processLeaser struct {
-	inner   storage.Leaser
-	process *HostProcess
-}
-
-func (l processLeaser) Acquire(ctx context.Context, name string) (storage.Lease, error) {
-	if err := l.process.check(); err != nil {
-		return nil, err
-	}
-	inner, err := l.inner.Acquire(ctx, name)
-	if err != nil {
-		return nil, err
-	}
-	lease := &processLease{inner: inner, lost: make(chan struct{})}
-	go func() {
-		select {
-		case <-inner.Lost():
-			lease.closeLost()
-		case <-lease.lost:
-		}
-	}()
-	l.process.mu.Lock()
-	dead := l.process.dead
-	if !dead {
-		l.process.leases = append(l.process.leases, lease)
-	}
-	l.process.mu.Unlock()
-	if dead {
-		lease.lapse()
-		return nil, ErrHostProcessDead
-	}
-	return lease, nil
-}
-
-type processLease struct {
-	inner storage.Lease
-	lost  chan struct{}
-	once  sync.Once
-}
-
-func (l *processLease) Epoch() uint64         { return l.inner.Epoch() }
-func (l *processLease) Lost() <-chan struct{} { return l.lost }
-func (l *processLease) closeLost()            { l.once.Do(func() { close(l.lost) }) }
-func (l *processLease) Release(ctx context.Context) error {
-	return l.inner.Release(ctx)
-}
-
-// lapse is what a provider's TTL does to a dead holder's grant.
-func (l *processLease) lapse() {
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-	_ = l.inner.Release(ctx)
-	l.closeLost()
-}
-
-type processKV struct {
-	inner   storage.KV
-	process *HostProcess
-}
-
-func (k processKV) Get(ctx context.Context, key string) ([]byte, uint64, error) {
-	if err := k.process.check(); err != nil {
-		return nil, 0, err
-	}
-	return k.inner.Get(ctx, key)
-}
-
-func (k processKV) Put(ctx context.Context, key string, expectedRev uint64, val []byte) (uint64, error) {
-	if err := k.process.check(); err != nil {
-		return 0, err
-	}
-	return k.inner.Put(ctx, key, expectedRev, val)
-}
-
-func (k processKV) Keys(ctx context.Context, prefix string) ([]string, error) {
-	if err := k.process.check(); err != nil {
-		return nil, err
-	}
-	return k.inner.Keys(ctx, prefix)
-}
-
-func (k processKV) Delete(ctx context.Context, key string) error {
-	if err := k.process.check(); err != nil {
-		return err
-	}
-	return k.inner.Delete(ctx, key)
-}
-
-type processBlobs struct {
-	inner   storage.Blobs
-	process *HostProcess
-}
-
-func (b processBlobs) Put(ctx context.Context, key string, r io.Reader) error {
-	if err := b.process.check(); err != nil {
-		return err
-	}
-	return b.inner.Put(ctx, key, r)
-}
-
-func (b processBlobs) Get(ctx context.Context, key string) (io.ReadCloser, error) {
-	if err := b.process.check(); err != nil {
-		return nil, err
-	}
-	return b.inner.Get(ctx, key)
-}
-
-func (b processBlobs) Delete(ctx context.Context, key string) error {
-	if err := b.process.check(); err != nil {
-		return err
-	}
-	return b.inner.Delete(ctx, key)
-}
-
-func (b processBlobs) List(ctx context.Context, prefix string) ([]string, error) {
-	if err := b.process.check(); err != nil {
-		return nil, err
-	}
-	return b.inner.List(ctx, prefix)
-}
-
-type processLifecycleBlobs struct {
-	processBlobs
-	bound time.Duration
-}
-
-func (b processLifecycleBlobs) BlobReaderCloseBound() time.Duration { return b.bound }
-
-type processOrdered struct {
-	storage.OrderedIndex
-	process *HostProcess
-}
-
-func (o processOrdered) Get(ctx context.Context, id storage.OrderedID) (storage.OrderedRecord, error) {
-	if err := o.process.check(); err != nil {
-		return storage.OrderedRecord{}, err
-	}
-	return o.OrderedIndex.Get(ctx, id)
-}
-
-func (o processOrdered) Create(ctx context.Context, id storage.OrderedID, rankingScope string, value []byte, rank storage.Rank, due storage.Due) (storage.OrderedRecord, bool, error) {
-	if err := o.process.check(); err != nil {
-		return storage.OrderedRecord{}, false, err
-	}
-	return o.OrderedIndex.Create(ctx, id, rankingScope, value, rank, due)
-}
-
-func (o processOrdered) Update(ctx context.Context, id storage.OrderedID, expectedRevision uint64, value []byte, rank storage.Rank, due storage.Due) (storage.OrderedRecord, error) {
-	if err := o.process.check(); err != nil {
-		return storage.OrderedRecord{}, err
-	}
-	return o.OrderedIndex.Update(ctx, id, expectedRevision, value, rank, due)
-}
-
-func (o processOrdered) Delete(ctx context.Context, id storage.OrderedID, expectedRevision uint64) (storage.OrderedRecord, error) {
-	if err := o.process.check(); err != nil {
-		return storage.OrderedRecord{}, err
-	}
-	return o.OrderedIndex.Delete(ctx, id, expectedRevision)
-}
-
-func (o processOrdered) ListOrdered(ctx context.Context, namespace string, orderingScope string, afterOrder uint64, limit int) (storage.OrderedPage, error) {
-	if err := o.process.check(); err != nil {
-		return storage.OrderedPage{}, err
-	}
-	return o.OrderedIndex.ListOrdered(ctx, namespace, orderingScope, afterOrder, limit)
-}
-
-func (o processOrdered) ListRanked(ctx context.Context, namespace string, rankingScope string, after storage.RankedCursor, limit int) (storage.RankedPage, error) {
-	if err := o.process.check(); err != nil {
-		return storage.RankedPage{}, err
-	}
-	return o.OrderedIndex.ListRanked(ctx, namespace, rankingScope, after, limit)
-}
-
-func (o processOrdered) ListDue(ctx context.Context, namespace string, dueAtOrBefore int64, after storage.DueCursor, limit int) (storage.DuePage, error) {
-	if err := o.process.check(); err != nil {
-		return storage.DuePage{}, err
-	}
-	return o.OrderedIndex.ListDue(ctx, namespace, dueAtOrBefore, after, limit)
-}
-
-// Kill is this Host's PROCESS DYING: nothing is drained, released, checkpointed
-// or tombstoned. Its durable plane is cut and its leases lapse (see
-// HostProcess), and its listener and every accepted connection close, so no
-// Factory can reach it. The in-memory corpse is left running, as a paused or
-// partitioned process would be; it can no longer write anything durable.
-//
-// Only a Host started with PooledHostConfig.Mortal can die. It reports how many
-// leases lapsed.
-func (h *PooledHost) Kill(tb TB) int {
-	tb.Helper()
-	if h.process == nil {
-		tb.Fatalf("orchestrationtest: host %s is not mortal; start it with PooledHostConfig.Mortal", h.ID)
-		return 0
-	}
-	lapsed := h.process.kill()
-	_ = h.tracker.Close()
-	h.tracker.Sever()
-	return lapsed
 }
 
 // ---- the Host's own metrics --------------------------------------------------
@@ -781,8 +474,10 @@ func (p *PooledRig) RuntimeEnded(tenant sessionwire.TenantID, s sessionwire.Sess
 // physical root and the bytes are right; the path harness promises is stable
 // across Hosts ("a journalled instruction naming a file must still resolve")
 // is simply absent after every restore. Still present on harness main at
-// cf01e492. Until a release fixes it, an empty restored LogicalRoot is logged,
-// not failed; a NON-empty one must equal the first generation's, and the
+// cf01e492. harness's own session report (session.WorkspaceStatus) DOES carry
+// the right LogicalRoot after a restore, so the cases assert the model-visible
+// path hard against THAT, and this helper covers the binding: until a release
+// fixes it, an empty restored binding LogicalRoot is logged, not failed; a NON-empty one must equal the first generation's, and the
 // physical root -- the same base path on every Host -- must match.
 func AssertModelVisiblePathStable(tb TB, written, restored PooledWorkspaceRead) {
 	tb.Helper()
@@ -801,4 +496,132 @@ func AssertModelVisiblePathStable(tb TB, written, restored PooledWorkspaceRead) 
 	if restored.LogicalRoot != written.LogicalRoot {
 		tb.Fatalf("orchestrationtest: the model-visible workspace path moved from %q to %q", written.LogicalRoot, restored.LogicalRoot)
 	}
+}
+
+// WorkspaceStatus reads harness's own workspace report off the latest runtime
+// this Host launched for a session: where the workspace is, which checkpoint
+// the live tree came up on, and whether journalled work followed it. found is
+// false when this Host launched none, or its runtime reports no workspace.
+func (p *PooledRig) WorkspaceStatus(tenant sessionwire.TenantID, s sessionwire.SessionID) (status session.WorkspaceStatus, found bool) {
+	live := p.liveSession(tenant, s)
+	if live == nil {
+		return session.WorkspaceStatus{}, false
+	}
+	reporter, ok := live.controller.(session.WorkspaceReporter)
+	if !ok {
+		return session.WorkspaceStatus{}, false
+	}
+	return reporter.WorkspaceStatus(), true
+}
+
+// CheckpointWorkspace asks the latest runtime this Host launched for a session
+// to checkpoint its workspace, as the product's release checkpointer does.
+func (p *PooledRig) CheckpointWorkspace(ctx context.Context, tenant sessionwire.TenantID, s sessionwire.SessionID) error {
+	live := p.liveSession(tenant, s)
+	if live == nil {
+		return fmt.Errorf("orchestrationtest: no live runtime for %s/%s", tenant, s)
+	}
+	_, err := live.controller.CheckpointWorkspace(ctx)
+	return err
+}
+
+// JournalSeqs returns every event of one type in a tenant's journal with the
+// JOURNAL SEQUENCE it was committed at.
+func JournalSeqs[E event.Event](tb TB, world *PooledWorld, tenant sessionwire.TenantID, id uuid.UUID) ([]E, []uint64) {
+	tb.Helper()
+	var found []E
+	var seqs []uint64
+	walkJournal(tb, world, tenant, id, func(next event.Event, seq uint64) {
+		if typed, ok := next.(E); ok {
+			found = append(found, typed)
+			seqs = append(seqs, seq)
+		}
+	})
+	return found, seqs
+}
+
+// JournalHoldsEventID reports whether any event in a tenant's journal carries
+// the event id.
+func JournalHoldsEventID(tb TB, world *PooledWorld, tenant sessionwire.TenantID, id uuid.UUID, eventID string) bool {
+	tb.Helper()
+	held := false
+	walkJournal(tb, world, tenant, id, func(next event.Event, _ uint64) {
+		if next.EventHeader().EventID.String() == eventID {
+			held = true
+		}
+	})
+	return held
+}
+
+func walkJournal(tb TB, world *PooledWorld, tenant sessionwire.TenantID, id uuid.UUID, visit func(event.Event, uint64)) {
+	tb.Helper()
+	replayer, err := world.Journals[tenant].OpenInternalEventReplayer(id, harnessstore.ReplayRequest{FromSeq: 0})
+	if err != nil {
+		tb.Fatalf("orchestrationtest: opening a replayer for %s: %v", id, err)
+		return
+	}
+	cursor, err := replayer.Open(context.Background(), journal.ReplayRequest{From: journal.Beginning()})
+	if err != nil {
+		tb.Fatalf("orchestrationtest: opening a replay cursor for %s: %v", id, err)
+		return
+	}
+	defer cursor.Close()
+	for {
+		next, seq, err := cursor.Next(context.Background())
+		if errors.Is(err, io.EOF) {
+			return
+		}
+		if err != nil {
+			tb.Fatalf("orchestrationtest: replaying %s: %v", id, err)
+			return
+		}
+		visit(next, seq)
+	}
+}
+
+// LastCheckpointSeq is the journal sequence and ref of the last
+// WorkspaceCheckpointed in a session's journal. found is false when there is
+// none.
+func LastCheckpointSeq(tb TB, world *PooledWorld, tenant sessionwire.TenantID, id uuid.UUID) (seq uint64, ref string, found bool) {
+	tb.Helper()
+	events, seqs := JournalSeqs[event.WorkspaceCheckpointed](tb, world, tenant, id)
+	if len(events) == 0 {
+		return 0, "", false
+	}
+	return seqs[len(seqs)-1], events[len(events)-1].Ref, true
+}
+
+// AwaitWorkspaceStatus waits for the Host's latest runtime for a session to
+// report a workspace, and returns what it reports.
+func AwaitWorkspaceStatus(tb TB, host *PooledHost, tenant sessionwire.TenantID, s sessionwire.SessionID) session.WorkspaceStatus {
+	tb.Helper()
+	var status session.WorkspaceStatus
+	PooledWait(tb, "host "+string(host.ID)+" reported "+string(s)+"'s workspace", 30*time.Second, func() bool {
+		reported, found := host.Rig.WorkspaceStatus(tenant, s)
+		status = reported
+		return found && reported.Root != ""
+	})
+	return status
+}
+
+// AwaitJournalQuiet waits until a session's journal tip has not moved for
+// quiet, and returns that tip. A turn's trailing loop records land
+// asynchronously after TurnDone, so "the turn finished" is not "the journal
+// stopped".
+func AwaitJournalQuiet(tb TB, world *PooledWorld, tenant sessionwire.TenantID, id uuid.UUID, quiet time.Duration) uint64 {
+	tb.Helper()
+	tip := func() uint64 {
+		var last uint64
+		walkJournal(tb, world, tenant, id, func(_ event.Event, seq uint64) { last = seq })
+		return last
+	}
+	current, since := tip(), time.Now()
+	PooledWait(tb, "the journal went quiet", 30*time.Second, func() bool {
+		if next := tip(); next != current {
+			current, since = next, time.Now()
+			return false
+		}
+		return time.Since(since) >= quiet
+	})
+	return current
 }

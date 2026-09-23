@@ -125,6 +125,10 @@ type PooledTurn struct {
 	// instead. The turn AFTER a tool call is the model's reply to the result.
 	ToolName  string
 	ToolInput string
+
+	// Hold, when set, keeps the model's answer back until it is closed: the
+	// turn is MID-WAY for as long as the case wants it to be.
+	Hold <-chan struct{}
 }
 
 // PooledLLM is the harness's inference client: a queue of scripted turns, with
@@ -157,7 +161,7 @@ func (*PooledLLM) Invoke(context.Context, inference.Request) (*inference.Respons
 }
 
 // Stream satisfies inference.Client.
-func (l *PooledLLM) Stream(_ context.Context, request inference.Request) (*stream.StreamReader[content.Chunk], error) {
+func (l *PooledLLM) Stream(ctx context.Context, request inference.Request) (*stream.StreamReader[content.Chunk], error) {
 	l.mu.Lock()
 	l.requests = append(l.requests, request)
 	var turn PooledTurn
@@ -167,6 +171,13 @@ func (l *PooledLLM) Stream(_ context.Context, request inference.Request) (*strea
 	l.next++
 	call := l.next
 	l.mu.Unlock()
+	if turn.Hold != nil {
+		select {
+		case <-turn.Hold:
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		}
+	}
 
 	chunks := []content.Chunk{}
 	if turn.ToolName != "" {
@@ -1430,7 +1441,7 @@ func startHostConfigured(tb TB, ctx context.Context, world *PooledWorld, id sess
 	var process *HostProcess
 	if cfg.Mortal {
 		process = &HostProcess{}
-		backend = process.View(tb, world.Backend)
+		backend = process.View(tb, PlaneStore, world.Backend)
 	}
 	for _, tenant := range world.tenants {
 		journal := world.Journals[tenant]
@@ -1438,7 +1449,7 @@ func startHostConfigured(tb TB, ctx context.Context, world *PooledWorld, id sess
 			// A MORTAL Host opens its own harness store over a view of the
 			// shared journal bytes, so its death can lapse the journal lease
 			// its runtime holds -- which is what a dead process's lease does.
-			opened, err := harnessstore.Open(process.View(tb, world.journalBackends[tenant]), harnessstore.WithTenant(tenant))
+			opened, err := harnessstore.Open(process.View(tb, PlaneJournal, world.journalBackends[tenant]), harnessstore.WithTenant(tenant))
 			if err != nil {
 				_ = listener.Close()
 				tb.Fatalf("orchestrationtest: opening %s's harness journal for %q: %v", id, tenant, err)
@@ -1450,7 +1461,7 @@ func startHostConfigured(tb TB, ctx context.Context, world *PooledWorld, id sess
 		// PooledWorld.WipeWorkspaceDisk for why.
 		durable := world.workspaces
 		if process != nil && durable != nil {
-			durable = process.View(tb, durable)
+			durable = process.View(tb, PlaneWorkspace, durable)
 		}
 		rigs[tenant] = world.defineRig(tb, tenant, journal, durable, world.workspaceBase)
 		journals[host.EvidenceKey{TenantID: tenant, StorageBindingID: PooledBinding}] =
