@@ -111,14 +111,15 @@ func TestFactoryServesRetainedObjectsWithEveryHostStopped(t *testing.T) {
 		// The status is asserted EXACTLY, and 500 is what it measures -- which
 		// is a finding rather than a preference.
 		//
-		// A denial by an external ObjectPolicy cannot render as 403. Factory's
-		// public identity package exports no authorization sentinel (the one a
-		// denial must wrap, internal/identity.ErrUnauthorized, is unreachable
-		// from another module), so authorizationFailure classifies any other
-		// error as an internal failure. A deployment's own policy therefore
-		// cannot tell a caller "you may not read this"; it can only produce
-		// "the request could not be completed". That is the A9.1 authorization
-		// sentinel gap, observed live on the object route.
+		// Factory HAS exported an authorization sentinel since v0.1.0
+		// (identity.ErrUnauthorized), and as of v0.11.0 a denial that wraps it
+		// renders 404, not 403. The 500 here is not that gap: it is that the
+		// kit's own AllowListObjectPolicy returns a bare ErrObjectNotPermitted,
+		// which wraps nothing Factory recognizes as a denial, so
+		// authorizationFailure classifies it as an internal failure. This row
+		// therefore measures the kit's test double, not Factory's contract; a
+		// policy that wraps identity.ErrUnauthorized gets the 404 treatment
+		// (see internal/toolresultobjects/policy.go's deny()).
 		//
 		// Asserting merely "not 200" would NOT discriminate: measured by
 		// mutation, disabling the policy-error check entirely still refuses,
@@ -126,8 +127,8 @@ func TestFactoryServesRetainedObjectsWithEveryHostStopped(t *testing.T) {
 		// The row would have passed with authorization switched off.
 		if status != http.StatusInternalServerError {
 			t.Fatalf("an unpermitted object reference answered %d (%s), want the measured 500. "+
-				"If it is now 403 the authorization sentinel has been exported and this row should "+
-				"assert the denial properly", status, body)
+				"If AllowListObjectPolicy now wraps identity.ErrUnauthorized this row should assert "+
+				"the 404 denial properly", status, body)
 		}
 		asked := policy.Asked()
 		if len(asked) != 1 || asked[0].ObjectID != legacyMeta.Reference.ObjectID {

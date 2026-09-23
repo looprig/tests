@@ -647,7 +647,6 @@ type soak struct {
 	// bodyBytes approximates the durable bytes committed: every record's
 	// body, which the in-process durable plane legitimately keeps.
 	bodyBytes atomic.Int64
-	commitMu  sync.Mutex
 
 	checkpoints []soakCheckpoint
 	phases      []map[string]any

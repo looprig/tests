@@ -272,6 +272,20 @@ func TestPolicyTypedNilEvidenceIsRefused(t *testing.T) {
 	}
 }
 
+// A lookup that answers (nil, true) -- a BARE nil Evidence interface, not a
+// typed nil pointer wrapped in one -- exercises isNil's fast `v == nil` path
+// rather than the reflect.Pointer path TestPolicyTypedNilEvidenceIsRefused
+// covers. Without the nil guard this would call a method on a nil interface
+// and panic rather than refuse.
+func TestPolicyBareNilEvidenceLookupIsRefused(t *testing.T) {
+	policy := newTestPolicy(t, map[sessionwire.TenantID]Evidence{testTenant: nil})
+	kind, err := policy.AuthorizeReference(context.Background(), principal(t, testTenant),
+		entry(testTenant, testBinding, testVersion, testRuntime.String()), sessionwire.ObjectReference{ObjectID: testRef})
+	if kind != "" || !errors.Is(err, identity.ErrUnauthorized) || !errors.Is(err, ErrUnknownBinding) {
+		t.Fatalf("AuthorizeReference = (%q, %v), want an unknown-binding denial", kind, err)
+	}
+}
+
 type nopReader struct{ tenant sessionwire.TenantID }
 
 func (nopReader) GetObjectMetadata(context.Context, sessionstore.GetObjectMetadataRequest) (sessionwire.ObjectMetadata, error) {
