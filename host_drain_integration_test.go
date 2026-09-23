@@ -21,6 +21,9 @@
 // model's own requests (what the agent actually saw), the Host's DrainReport and
 // its /metrics. The kit's HoldingCheckpointer is a PAUSE, not a witness: it holds
 // the drain at a step so the case can read the durable plane at that instant.
+// HostProcess.HeldLeases is kit bookkeeping (which grants the process released
+// itself), so every lease claim it makes is corroborated by a STORE probe --
+// ResidencyHeld and JournalLeaseHeld take the lease as a successor would.
 
 package tests
 
@@ -177,15 +180,24 @@ func TestDrainingAPooledHostStopsAdmissionFirstAndHandsItsSessionsToASuccessor(t
 	// way Factory's placement reads it. A Host that stopped admitting in
 	// process but published nonaccepting only on a later heartbeat would still
 	// be listed here, even though it leaves the target eventually.
+	//
+	// The hook runs on the Host's own drain goroutine, so it only RECORDS; the
+	// test goroutine asserts.
 	var (
 		orderMu              sync.Mutex
 		listedAtFirstRelease *bool
+		witnessErr           error
 	)
 	holding.OnEnter = func(sessionwire.SessionID) {
-		_, listed := orchestrationtest.PooledCandidates(t, ctx, world)[drainee.ID]
+		candidates, err := orchestrationtest.ListPooledCandidates(ctx, world)
+		_, listed := candidates[drainee.ID]
 		orderMu.Lock()
 		defer orderMu.Unlock()
-		if listedAtFirstRelease == nil {
+		if listedAtFirstRelease == nil && witnessErr == nil {
+			if err != nil {
+				witnessErr = err
+				return
+			}
 			listedAtFirstRelease = &listed
 		}
 	}
@@ -207,8 +219,11 @@ func TestDrainingAPooledHostStopsAdmissionFirstAndHandsItsSessionsToASuccessor(t
 			return len(holding.Entered()) >= 1
 		})
 		orderMu.Lock()
-		listed := listedAtFirstRelease
+		listed, readErr := listedAtFirstRelease, witnessErr
 		orderMu.Unlock()
+		if readErr != nil {
+			t.Fatalf("the ordering witness could not read the pooled target: %v", readErr)
+		}
 		if listed == nil || *listed {
 			t.Fatal("when the drain reached its first session's checkpoint the drainee was still (or was never read as) a placement candidate: capacity was not unranked before release began")
 		}
@@ -272,7 +287,23 @@ func TestDrainingAPooledHostStopsAdmissionFirstAndHandsItsSessionsToASuccessor(t
 	// row fails, and the input must instead be applied by the successor.
 	t.Run("FINDING: a releasing session's consumer still applies input during the drain", func(t *testing.T) {
 		inputPooled(t, ctx, served, tenant, idle, "idle-drain-input", "during the drain: what was the remembered word?")
-		orchestrationtest.PooledWait(t, "the input admitted during the drain applied", 20*time.Second, func() bool {
+		// A BOUNDED WINDOW, well under the busy session's idle boundary (15s),
+		// so that when the finding is fixed this row fails with its own
+		// message and leaves the drain's timing to case 2. Today the drainee's
+		// consumer claims the input within a poll or two.
+		const window = 3 * time.Second
+		deadline := time.Now().Add(window)
+		state := world.CommandState(ctx, tenant, idle, "idle-drain-input")
+		for (state == "" || state == sessionstore.InboxStatePending) && time.Now().Before(deadline) {
+			time.Sleep(20 * time.Millisecond)
+			state = world.CommandState(ctx, tenant, idle, "idle-drain-input")
+		}
+		if state == "" || state == sessionstore.InboxStatePending {
+			t.Fatalf("the input admitted during the drain is still %q after %v while the drain is parked at the checkpoint: "+
+				"Host now halts consumption before the drain's checkpoint -- the finding is fixed; update this row "+
+				"(the input must now be applied by the successor, exactly once)", state, window)
+		}
+		orchestrationtest.PooledWait(t, "the input the drainee claimed applied", 10*time.Second, func() bool {
 			return world.CommandState(ctx, tenant, idle, "idle-drain-input") == sessionstore.InboxStateApplied
 		})
 		entry, err := world.Store.GetDispositionCommand(ctx, sessionstore.GetDispositionCommandRequest{TenantID: tenant, SessionID: idle, CommandID: "idle-drain-input"})
@@ -319,20 +350,31 @@ func TestDrainingAPooledHostStopsAdmissionFirstAndHandsItsSessionsToASuccessor(t
 			t.Fatalf("the drain reports generation %d, want the Host's incarnation 4", report.Generation)
 		}
 		// Every grant the Host process took -- residency and harness journal
-		// -- it released itself: this is the graceful path.
+		// -- it released itself: this is the graceful path. The process view
+		// says so, and the STORE corroborates it for the journal (the
+		// residency is probed per session below): a successor's take of each
+		// runtime's journal lease succeeds. Nothing is restoring either
+		// session at this instant; the next input is sent only later.
 		for _, plane := range []string{orchestrationtest.PlaneStore, orchestrationtest.PlaneJournal} {
 			if held := drainee.Process().HeldLeases(plane); len(held) != 0 {
 				t.Fatalf("after a graceful drain the Host process still holds %s leases %v", plane, held)
+			}
+		}
+		for _, id := range []uuid.UUID{idleRuntime, busyRuntime} {
+			if held, holder := world.JournalLeaseHeld(t, ctx, tenant, id); held {
+				t.Fatalf("after a graceful drain %s's journal lease is still held on the store at epoch %d", id, holder)
 			}
 		}
 		for _, s := range []sessionwire.SessionID{idle, busy} {
 			if world.ResidencyHeld(t, ctx, tenant, s) {
 				t.Fatalf("after the drain %s's residency lease is still held", s)
 			}
-			// THE REGISTRY ENTRY IS GONE: the epoch-fenced tombstone removed
-			// the visible registration, so Factory's owner check finds no owner.
-			if owner, found := world.Registration(t, ctx, tenant, s); found {
-				t.Fatalf("after the drain %s still has a visible registration: %+v", s, owner)
+			// THE REGISTRY ENTRY IS TOMBSTONED, not merely absent: Factory's
+			// owner check reads a retained, epoch-fenced `released` record
+			// naming the residency epoch the drain gave up.
+			epoch, released, got := world.ReleasedTombstone(t, ctx, tenant, s)
+			if !released || epoch != firstOwner[s].LeaseEpoch {
+				t.Fatalf("after the drain %s's registration reads as %s, want a released tombstone at the drained epoch %d", s, got, firstOwner[s].LeaseEpoch)
 			}
 		}
 		for _, id := range []uuid.UUID{idleRuntime, busyRuntime} {
@@ -557,18 +599,26 @@ func TestDrainingAPooledHostParkedAtAGateIsCrashEquivalentAndBounded(t *testing.
 		if world.ResidencyHeld(t, ctx, tenant, s) {
 			t.Fatal("after the drain the residency lease is still held; FinishRelease must release it even when the runtime refused")
 		}
-		if owner, found := world.Registration(t, ctx, tenant, s); found {
-			t.Fatalf("after the drain the session still has a visible registration: %+v", owner)
+		// THE DURABLE RECORD OF THE AFFECTED SESSION AND EPOCH: the forced
+		// release still wrote the retained, epoch-fenced tombstone, and it
+		// names the residency epoch the drain gave up. (What was FORCED -- the
+		// wait_idle and release_residency steps -- is the DrainReport's, and
+		// is process-local: Core's two-valued drain state cannot carry it.)
+		epoch, released, got := world.ReleasedTombstone(t, ctx, tenant, s)
+		if !released || epoch != attached.LeaseEpoch {
+			t.Fatalf("after the forced drain the registration reads as %s, want a released tombstone at the drained epoch %d", got, attached.LeaseEpoch)
 		}
 		// The Host released its residency grant itself...
 		if held := drainee.Process().HeldLeases(orchestrationtest.PlaneStore); len(held) != 0 {
 			t.Fatalf("after the drain the Host process still holds residency leases %v", held)
 		}
 		// ...but the runtime keeps its harness journal lease until the
-		// process exits: read off the Host process's own provider view.
-		held := drainee.Process().HeldLeases(orchestrationtest.PlaneJournal)
-		if len(held) != 1 || !strings.Contains(held[0], runtimeID.String()) {
-			t.Fatalf("after the drain the Host process holds journal leases %v, want the parked runtime's %s", held, runtimeID)
+		// process exits. ON THE STORE: a successor runtime's take of it,
+		// through harness's own AcquireLease, is refused.
+		if held, holder := world.JournalLeaseHeld(t, ctx, tenant, runtimeID); !held {
+			t.Fatal("after the drain the parked runtime's journal lease is free on the store; a crash-equivalent drain leaves it held until the process exits")
+		} else {
+			t.Logf("the parked runtime's journal lease is held on the store at epoch %d", holder)
 		}
 		// PARKED, NOT CANCELLED: the journal is exactly what it was at the
 		// gate -- no GateResolved{abandoned}, no TurnInterrupted, no
@@ -612,8 +662,10 @@ func TestDrainingAPooledHostParkedAtAGateIsCrashEquivalentAndBounded(t *testing.
 		// host v0.4.0's obligation: a Host that drained with a gate open MUST
 		// exit. Its exit is what frees the parked runtime's journal lease.
 		drainee.Kill(t)
-		if held := drainee.Process().HeldLeases(orchestrationtest.PlaneJournal); len(held) != 0 {
-			t.Fatalf("after the exit the Host process still holds journal leases %v", held)
+		// On the store, not in the kit: the exit frees the journal lease.
+		// Nothing is restoring the session yet -- no input has been sent.
+		if held, holder := world.JournalLeaseHeld(t, ctx, tenant, runtimeID); held {
+			t.Fatalf("after the Host exited the parked runtime's journal lease is still held at epoch %d", holder)
 		}
 		requestsBefore := len(world.LLM.Requests())
 		inputPooled(t, ctx, served, tenant, s, "gated-resend", "my answer is "+gateAnswer)

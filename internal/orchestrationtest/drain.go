@@ -4,6 +4,7 @@ package orchestrationtest
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"sync"
 	"time"
@@ -11,6 +12,7 @@ import (
 	sessionwire "github.com/looprig/core/sessionwire/v1"
 	"github.com/looprig/core/uuid"
 	"github.com/looprig/harness/pkg/event"
+	"github.com/looprig/harness/pkg/journal"
 	"github.com/looprig/host"
 	"github.com/looprig/sessionstore"
 )
@@ -130,15 +132,25 @@ func (c *HoldingCheckpointer) Proceed() { c.opened.Do(func() { close(c.proceed) 
 
 // PooledCandidates pages the pooled target to exhaustion and reports every
 // Host it offers, with its advertisement, exactly as Factory's placement read
-// sees it.
+// sees it. A failed read fails the test, so call it on the test goroutine only.
 func PooledCandidates(tb TB, ctx context.Context, world *PooledWorld) map[sessionwire.HostID]sessionwire.HostLinkCapacityReport {
 	tb.Helper()
+	found, err := ListPooledCandidates(ctx, world)
+	if err != nil {
+		tb.Fatalf("orchestrationtest: %v", err)
+	}
+	return found
+}
+
+// ListPooledCandidates is PooledCandidates returning its error instead of
+// failing the test, for a caller on a goroutine that is not the test's -- a
+// Host's own drain goroutine, reached through a checkpointer hook.
+func ListPooledCandidates(ctx context.Context, world *PooledWorld) (map[sessionwire.HostID]sessionwire.HostLinkCapacityReport, error) {
 	found := map[sessionwire.HostID]sessionwire.HostLinkCapacityReport{}
 	var cursor sessionwire.Cursor
 	for pages := 0; ; pages++ {
 		if pages > 16 {
-			tb.Fatalf("orchestrationtest: the pooled target did not terminate after %d pages", pages)
-			return found
+			return found, fmt.Errorf("the pooled target did not terminate after %d pages", pages)
 		}
 		page, err := world.Store.ListCompatibleHosts(ctx, sessionstore.ListCompatibleHostsRequest{
 			Key: sessionstore.HostTargetKey{
@@ -150,14 +162,13 @@ func PooledCandidates(tb TB, ctx context.Context, world *PooledWorld) map[sessio
 			Limit:  8,
 		})
 		if err != nil {
-			tb.Fatalf("orchestrationtest: listing the pooled target: %v", err)
-			return found
+			return found, fmt.Errorf("listing the pooled target: %w", err)
 		}
 		for _, candidate := range page.Hosts {
 			found[candidate.HostID] = candidate
 		}
 		if page.NextCursor == "" {
-			return found
+			return found, nil
 		}
 		cursor = page.NextCursor
 	}
@@ -173,4 +184,54 @@ func JournalTrace(tb TB, world *PooledWorld, tenant sessionwire.TenantID, id uui
 		trace = append(trace, fmt.Sprintf("%d:%T", seq, e))
 	})
 	return trace
+}
+
+// ReleasedTombstone reads a session's durable Host registration exactly as
+// Factory's owner check does and reports the epoch of the RETAINED,
+// epoch-fenced tombstone a release wrote: sessionstore answers a released
+// route with *RegistryError{Code: released, Epoch: <fence>}, which is the
+// whole public account of a session that has no route.
+//
+// Unlike Registration, it does not fold every error into "not found": a
+// live registration, an expiry, a missing record and a store failure are all
+// reported as what they are, through the returned description.
+func (w *PooledWorld) ReleasedTombstone(tb TB, ctx context.Context, tenant sessionwire.TenantID, s sessionwire.SessionID) (epoch uint64, released bool, got string) {
+	tb.Helper()
+	entry, err := w.Store.GetHostRegistration(ctx, sessionstore.GetHostRegistrationRequest{TenantID: tenant, SessionID: s})
+	if err == nil {
+		return 0, false, fmt.Sprintf("a live registration %+v", entry.Registration)
+	}
+	var registry *sessionstore.RegistryError
+	if !errors.As(err, &registry) {
+		return 0, false, "a non-registry error: " + err.Error()
+	}
+	if registry.Code != sessionstore.RegistryErrorReleased {
+		return registry.Epoch, false, fmt.Sprintf("registry %s at epoch %d", registry.Code, registry.Epoch)
+	}
+	return registry.Epoch, true, fmt.Sprintf("registry released at epoch %d", registry.Epoch)
+}
+
+// JournalLeaseHeld probes a runtime's HARNESS JOURNAL lease on the store, by
+// trying to take it the way a successor's runtime would: through harness's own
+// sessionstore.AcquireLease over the world's journal backend. A refusal is
+// journal.LeaseHeldError carrying the holder's epoch; a successful take is
+// released at once.
+//
+// It is a probe that briefly holds the lease; a case calls it only when no
+// successor can be restoring the session at that instant.
+func (w *PooledWorld) JournalLeaseHeld(tb TB, ctx context.Context, tenant sessionwire.TenantID, id uuid.UUID) (held bool, holderEpoch uint64) {
+	tb.Helper()
+	lease, err := w.Journals[tenant].AcquireLease(ctx, id)
+	if err != nil {
+		var refused *journal.LeaseHeldError
+		if errors.As(err, &refused) {
+			return true, refused.Epoch
+		}
+		tb.Fatalf("orchestrationtest: probing the journal lease of %s: %v", id, err)
+		return false, 0
+	}
+	if err := lease.Release(ctx); err != nil {
+		tb.Fatalf("orchestrationtest: releasing the probe journal lease of %s: %v", id, err)
+	}
+	return false, 0
 }
