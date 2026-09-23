@@ -214,8 +214,8 @@ github.com/looprig/fsstore v0.5.1 h1:Q0zmD05kNzdVX20a5jLRRF17rf3ZkYlsZVk2gfEUVm0
 github.com/looprig/fsstore v0.5.1/go.mod h1:5JQJ4hVIX03mYvHGvk9RcMIjfBZDAIsWfqOSzfmDYC8=
 github.com/looprig/harness v0.39.0 h1:qgEubnFYoesRS/+Wy7wdBumumhfVsNinqKx4cisBAB8=
 github.com/looprig/harness v0.39.0/go.mod h1:a8r/sIfvfArcrS4RSi9Zyy5AyXE4onrdnB0vRzz/YjE=
-github.com/looprig/host v0.10.0 h1:HkEGMpbTEaAHrGUdDlCqidSHioaauanmhHJxlPUNuuo=
-github.com/looprig/host v0.10.0/go.mod h1:aU3oQOxvd+K+UmYr8kJi242vI+qIkjojZou7h0MGhv4=
+github.com/looprig/host v0.10.1 h1:/0AmRy74VYVXo2RYk/jzqVVXGkuCNNgwBFn+1cVJfkI=
+github.com/looprig/host v0.10.1/go.mod h1:aU3oQOxvd+K+UmYr8kJi242vI+qIkjojZou7h0MGhv4=
 github.com/looprig/inference v0.12.1 h1:LIQ9220cqFDLdaaxQFt0Gi4Ev/gkRqTsufDjLB99OEs=
 github.com/looprig/inference v0.12.1/go.mod h1:6Tsj9FX8RMrSeABbKxlYGfalELHoCxiRVpQX11yNWkU=
 github.com/looprig/llm v0.14.1 h1:RGme5p0aT7gtNeAq9xeyda8QAf7prYku+CLfYpj+YJ8=
