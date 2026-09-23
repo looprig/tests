@@ -104,6 +104,10 @@ type PooledFactoryConfig struct {
 	WriteTimeout time.Duration
 	PingInterval time.Duration
 	PongTimeout  time.Duration
+
+	// Workload, when set on a dedicated replica, is the launch template's
+	// platform payload in place of the kit's placeholder.
+	Workload *sessionstore.DesiredWorkload
 }
 
 // StartPooledFactoryWith composes, starts and serves a real pooled Factory
