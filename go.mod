@@ -10,7 +10,7 @@ require (
 	github.com/centrifugal/centrifuge-go v0.12.0
 	github.com/jackc/pgx/v5 v5.10.0
 	github.com/looprig/classifiers v0.2.2
-	github.com/looprig/controller v0.2.0
+	github.com/looprig/controller v0.2.1
 	github.com/looprig/core v0.11.0
 	github.com/looprig/credentials v0.2.1
 	github.com/looprig/eval v0.2.2
