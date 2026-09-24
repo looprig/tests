@@ -357,7 +357,11 @@ func TestRigPersistenceOutsideWorkspaceArchiveAndOverlapRejected(t *testing.T) {
 		t.Fatalf("journal layout missing: entries=%v err=%v", entries, err)
 	}
 	digest := strings.TrimPrefix(string(ref), "v1:sha256:")
-	if _, err := os.Stat(filepath.Join(persistence, "blobs", "workspaces", digest)); err != nil {
+	// fsstore v0.6.0 suffixes every leaf file with "@blob" (see fsstore's
+	// blobs.go) so a key and a key extending it with "/..." can coexist; the
+	// on-disk blob for "workspaces/<digest>" is therefore
+	// "workspaces/<digest>@blob", not "workspaces/<digest>".
+	if _, err := os.Stat(filepath.Join(persistence, "blobs", "workspaces", digest+"@blob")); err != nil {
 		t.Fatalf("workspace blob missing outside archive root: %v", err)
 	}
 	materialized := filepath.Join(t.TempDir(), "materialized")
