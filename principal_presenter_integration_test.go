@@ -468,6 +468,18 @@ func TestPresenterRenderingSurvivesRestoreFailoverAndRedelivery(t *testing.T) {
 				world.CommandState(ctx, tenant, s, "f-restore") == sessionstore.InboxStateApplied &&
 				orchestrationtest.CountJournalEvents[event.TurnInterrupted](t, world, tenant, runtime) >= 1
 		})
+		restored, err := world.Store.GetDispositionCommand(ctx, sessionstore.GetDispositionCommandRequest{
+			TenantID: tenant, SessionID: s, CommandID: "f-restore",
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		wantPrincipal := sessionwire.Principal{
+			Tenant: tenant, Subject: sessionwire.SubjectID("user-" + string(tenant)), Kind: sessionwire.PrincipalKindActor,
+		}
+		if restored.Record.Descriptor.Principal == nil || *restored.Record.Descriptor.Principal != wantPrincipal {
+			t.Fatalf("restore disposition principal = %+v, want %+v", restored.Record.Descriptor.Principal, wantPrincipal)
+		}
 		// A model call cut by process death is terminal on restore, not replayed
 		// as a new TurnDone. Prove the successor can advance with a fresh turn.
 		status, body = served.Post(t, ctx, tenant, "/v1/sessions/"+string(s)+"/input", sessionwire.InputRequest{
