@@ -120,6 +120,13 @@ var PooledBearers = map[sessionwire.TenantID]string{
 	PooledTenantB: "orchestrationtest-bearer-tenant-b",
 }
 
+// PooledBearersAlt identifies a second verified actor in each tenant. It does
+// not change the original credentials, which the old-Host probe also uses.
+var PooledBearersAlt = map[sessionwire.TenantID]string{
+	PooledTenantA: "orchestrationtest-bearer-alt-tenant-a",
+	PooledTenantB: "orchestrationtest-bearer-alt-tenant-b",
+}
+
 // ---- the scripted model ----------------------------------------------------
 
 // PooledTurn is one scripted model turn: either plain text, or a tool call.
@@ -2308,6 +2315,16 @@ func (pooledVerifier) VerifyCredential(_ context.Context, credential identity.Cr
 			return identity.Claims{
 				Tenant:    tenant,
 				Subject:   "user-" + string(tenant),
+				Kind:      identity.KindActor,
+				ExpiresAt: time.Now().Add(time.Hour),
+			}, nil
+		}
+	}
+	for tenant, bearer := range PooledBearersAlt {
+		if credential.Value() == bearer {
+			return identity.Claims{
+				Tenant:    tenant,
+				Subject:   "user-alt-" + string(tenant),
 				Kind:      identity.KindActor,
 				ExpiresAt: time.Now().Add(time.Hour),
 			}, nil
