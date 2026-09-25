@@ -8,6 +8,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"net/http"
 	"strings"
@@ -176,7 +177,7 @@ func TestPrincipalMetadataAndPresenterAcrossFactoryHostHarness(t *testing.T) {
 		if audit.Principal == nil || *audit.Principal != want || audit.Metadata["client"] != "lane" {
 			t.Fatalf("audit = %+v", audit)
 		}
-		if len(auditor.Audit) == 0 {
+		if auditor.AuditCount() == 0 {
 			t.Fatal("AuthorizeAuditRead was never consulted")
 		}
 		plain := orchestrationtest.StartPooledFactoryWith(t, ctx, world, orchestrationtest.PooledFactoryConfig{
@@ -200,8 +201,12 @@ func TestPrincipalMetadataAndPresenterAcrossFactoryHostHarness(t *testing.T) {
 		if status != http.StatusBadRequest || !strings.Contains(body, `"code":"invalid_request"`) {
 			t.Fatalf("forged principal answered %d: %s", status, body)
 		}
-		if world.CommandState(ctx, tenant, s, "p-forged") != "" {
-			t.Fatal("refused command left a durable record")
+		_, err := world.Store.GetDispositionCommand(ctx, sessionstore.GetDispositionCommandRequest{
+			TenantID: tenant, SessionID: s, CommandID: "p-forged",
+		})
+		var inboxErr *sessionstore.InboxError
+		if !errors.As(err, &inboxErr) || inboxErr.Code != sessionstore.InboxErrorNotFound {
+			t.Fatalf("refused command lookup = %v, want InboxErrorNotFound", err)
 		}
 	})
 

@@ -10,6 +10,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"net/http"
 	"os"
@@ -148,6 +149,17 @@ func assertOldHostNoAttempt(t *testing.T, ctx context.Context, world *orchestrat
 	}
 }
 
+func assertOldHostInputAbsent(t *testing.T, ctx context.Context, world *orchestrationtest.PooledWorld, tenant sessionwire.TenantID, session sessionwire.SessionID, command sessionwire.CommandID) {
+	t.Helper()
+	_, err := world.Store.GetDispositionCommand(ctx, sessionstore.GetDispositionCommandRequest{
+		TenantID: tenant, SessionID: session, CommandID: command,
+	})
+	var inboxErr *sessionstore.InboxError
+	if !errors.As(err, &inboxErr) || inboxErr.Code != sessionstore.InboxErrorNotFound {
+		t.Fatalf("refused input %s lookup = %v, want InboxErrorNotFound", command, err)
+	}
+}
+
 func TestOldHostNeverReceivesAStampedCommand(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 6*time.Minute)
 	t.Cleanup(cancel)
@@ -194,9 +206,7 @@ func TestOldHostNeverReceivesAStampedCommand(t *testing.T) {
 	if status != http.StatusUnprocessableEntity || !strings.Contains(body, "runtime_unavailable") {
 		t.Fatalf("input to incapable owner answered %d: %s", status, body)
 	}
-	if state := world.CommandState(ctx, tenant, resident, "old-input-1"); state != "" {
-		t.Fatalf("refused input left durable state %s", state)
-	}
+	assertOldHostInputAbsent(t, ctx, world, tenant, resident, "old-input-1")
 
 	const waiting = sessionwire.SessionID("old-waiting")
 	status, body = stamping.Post(t, ctx, tenant, "/v1/sessions", sessionwire.CreateRequest{
@@ -214,6 +224,11 @@ func TestOldHostNeverReceivesAStampedCommand(t *testing.T) {
 		time.Sleep(orchestrationtest.ReconcileSweepInterval / 2)
 	}
 	assertOldHostNoAttempt(t, ctx, world, tenant, waiting, "old-create-2")
+	// Keep the negative-placement window non-vacuous: the released Host must
+	// still answer a fresh HostLink connect just before the capable Host arrives.
+	if orchestrationtest.HostAdvertises(t, old.Base, tenant, sessionwire.HostLinkCapabilityAttributionPrincipal) {
+		t.Fatal("released host v0.10.3 gained the attribution token during the pending window")
+	}
 	capable := orchestrationtest.StartPooledHost(t, ctx, world, "i-newhost-v0110", 1)
 	orchestrationtest.PooledWait(t, "stamped create applied on capable Host", 120*time.Second, func() bool {
 		return world.CommandState(ctx, tenant, waiting, "old-create-2") == sessionstore.InboxStateApplied
@@ -225,8 +240,6 @@ func TestOldHostNeverReceivesAStampedCommand(t *testing.T) {
 	// the create had no Attempt before the capable Host arrived, and its
 	// terminal registration names the capable Host. Released v0.10.3 offers
 	// no attempt-begun operator log, so durable state is the evidence.
-	if state := world.CommandState(ctx, tenant, resident, "old-input-1"); state != "" {
-		t.Fatalf("old Host input acquired state %s after capable placement", state)
-	}
+	assertOldHostInputAbsent(t, ctx, world, tenant, resident, "old-input-1")
 	t.Logf("released old Host %s remained incapable; stamped create placed on %s", old.ID, capable.ID)
 }

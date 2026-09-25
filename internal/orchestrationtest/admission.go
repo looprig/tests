@@ -123,14 +123,21 @@ type PooledFactoryConfig struct {
 type AuditingAuthorizer struct {
 	pooledAuthorizer
 	mu    sync.Mutex
-	Audit []sessionwire.SessionID
+	audit []sessionwire.SessionID
 }
 
 func (a *AuditingAuthorizer) AuthorizeAuditRead(_ context.Context, _ identity.Principal, s sessionwire.SessionID) error {
 	a.mu.Lock()
-	a.Audit = append(a.Audit, s)
+	a.audit = append(a.audit, s)
 	a.mu.Unlock()
 	return nil
+}
+
+// AuditCount reports recorded authorizations without racing the HTTP handler.
+func (a *AuditingAuthorizer) AuditCount() int {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return len(a.audit)
 }
 
 // StartPooledFactoryWith composes, starts and serves a real pooled Factory
