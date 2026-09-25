@@ -26,8 +26,10 @@ import (
 	"github.com/looprig/factory/identity"
 	"github.com/looprig/harness/pkg/event"
 	"github.com/looprig/harness/pkg/gate"
+	"github.com/looprig/harness/pkg/hustle"
 	"github.com/looprig/harness/pkg/journal"
 	"github.com/looprig/harness/pkg/loop"
+	"github.com/looprig/harness/pkg/present"
 	"github.com/looprig/harness/pkg/rig"
 	"github.com/looprig/harness/pkg/runtimecommand"
 	"github.com/looprig/harness/pkg/session"
@@ -1233,57 +1235,13 @@ func (s *pooledSession) ApplyCommand(ctx context.Context, cmd department.Runtime
 	if !held {
 		return ErrRuntimeHoldsNoLease
 	}
-	admitted := runtimecommand.Admitted{
-		CommandID:        runtimecommand.CommandID(cmd.CommandID),
-		RuntimeCommandID: cmd.RuntimeCommandID,
-		LeaseEpoch:       epoch,
-		AttemptID:        runtimecommand.AttemptID(cmd.AttemptID),
+	if cmd.Kind == PooledKindCreate && s.rig != nil && s.rig.refusingCreates() {
+		return fmt.Errorf("%w: this runtime refuses %q, after the attempt is durable",
+			ErrUnknownCommandKind, cmd.Kind)
 	}
-	switch cmd.Kind {
-	case PooledKindCreate:
-		if s.rig != nil && s.rig.refusingCreates() {
-			return fmt.Errorf("%w: this runtime refuses %q, after the attempt is durable",
-				ErrUnknownCommandKind, cmd.Kind)
-		}
-		blocks, err := PooledCreateBlocks(cmd.Payload)
-		if err != nil {
-			return err
-		}
-		// A BARE create -- one carrying no first message -- crosses with no
-		// blocks and drives no turn. harness makes Blocks OPTIONAL for this
-		// kind precisely so an idle create can still settle; refusing one here
-		// would wedge every session created without an opening message.
-		admitted.Kind, admitted.Blocks = runtimecommand.KindCreate, blocks
-	case PooledKindRestore:
-		// A restore carries NOTHING. Core's RestoreRequest has no blocks member
-		// and Admitted.Validate refuses a restore that carries any, so a
-		// product that forwarded a stray payload here would be refused after
-		// the attempt was already durable.
-		admitted.Kind = runtimecommand.KindRestore
-	case PooledKindGateResponse:
-		answer, err := pooledGateAnswer(cmd)
-		if err != nil {
-			return err
-		}
-		admitted.Kind = runtimecommand.KindGateResponse
-		admitted.GateResponse = answer
-	case PooledKindInterrupt:
-		admitted.Kind = runtimecommand.KindInterrupt
-	case PooledKindInput:
-		blocks, err := PooledInputBlocks(cmd.Payload)
-		if err != nil {
-			return err
-		}
-		// Unlike a create, harness REQUIRES blocks for an input and refuses one
-		// carrying none, so this arm cannot fail open the way the create arm
-		// structurally can.
-		admitted.Kind, admitted.Blocks = runtimecommand.KindInput, blocks
-	default:
-		// A kind a newer Factory admits and this product does not know. It is
-		// REFUSED rather than guessed at: guessing is what silently dropped a
-		// create's first message for a whole release, and a refusal before any
-		// durable write leaves the record for a Host that understands it.
-		return fmt.Errorf("%w: %q", ErrUnknownCommandKind, cmd.Kind)
+	admitted, err := admittedFor(cmd, epoch)
+	if err != nil {
+		return err
 	}
 	if _, err := applier.ApplyRuntimeCommand(ctx, admitted); err != nil {
 		return err
@@ -1293,6 +1251,64 @@ func (s *pooledSession) ApplyCommand(ctx context.Context, cmd department.Runtime
 	}
 	s.recorder.add(cmd)
 	return nil
+}
+
+// admittedFor builds the harness command without a lease or runtime. Admitted
+// is assembled field by field: omitting Principal or Metadata drops attribution
+// silently instead of being refused by either side of this adapter.
+func admittedFor(cmd department.RuntimeCommand, epoch uint64) (runtimecommand.Admitted, error) {
+	admitted := runtimecommand.Admitted{
+		CommandID:        runtimecommand.CommandID(cmd.CommandID),
+		RuntimeCommandID: cmd.RuntimeCommandID,
+		LeaseEpoch:       epoch,
+		AttemptID:        runtimecommand.AttemptID(cmd.AttemptID),
+		Principal:        cmd.Principal,
+	}
+	switch cmd.Kind {
+	case PooledKindCreate:
+		blocks, err := PooledCreateBlocks(cmd.Payload)
+		if err != nil {
+			return runtimecommand.Admitted{}, err
+		}
+		// A BARE create -- one carrying no first message -- crosses with no
+		// blocks and drives no turn. harness makes Blocks OPTIONAL for this
+		// kind precisely so an idle create can still settle; refusing one here
+		// would wedge every session created without an opening message.
+		admitted.Kind, admitted.Blocks = runtimecommand.KindCreate, blocks
+		admitted.Metadata = cmd.Metadata
+	case PooledKindRestore:
+		// A restore carries NOTHING. Core's RestoreRequest has no blocks member
+		// and Admitted.Validate refuses a restore that carries any, so a
+		// product that forwarded a stray payload here would be refused after
+		// the attempt was already durable.
+		admitted.Kind = runtimecommand.KindRestore
+	case PooledKindGateResponse:
+		answer, err := pooledGateAnswer(cmd)
+		if err != nil {
+			return runtimecommand.Admitted{}, err
+		}
+		admitted.Kind = runtimecommand.KindGateResponse
+		admitted.GateResponse = answer
+	case PooledKindInterrupt:
+		admitted.Kind = runtimecommand.KindInterrupt
+	case PooledKindInput:
+		blocks, err := PooledInputBlocks(cmd.Payload)
+		if err != nil {
+			return runtimecommand.Admitted{}, err
+		}
+		// Unlike a create, harness REQUIRES blocks for an input and refuses one
+		// carrying none, so this arm cannot fail open the way the create arm
+		// structurally can.
+		admitted.Kind, admitted.Blocks = runtimecommand.KindInput, blocks
+		admitted.Metadata = cmd.Metadata
+	default:
+		// A kind a newer Factory admits and this product does not know. It is
+		// REFUSED rather than guessed at: guessing is what silently dropped a
+		// create's first message for a whole release, and a refusal before any
+		// durable write leaves the record for a Host that understands it.
+		return runtimecommand.Admitted{}, fmt.Errorf("%w: %q", ErrUnknownCommandKind, cmd.Kind)
+	}
+	return admitted, nil
 }
 
 // CloseAttempt satisfies department.AttemptCloser, which is the capability a
@@ -1557,6 +1573,10 @@ type PooledWorld struct {
 
 	// toolResults is PooledWorldOptions.ToolResults.
 	toolResults *ToolResultRetention
+	// presenter and hustles are registered on every tenant rig.
+	presenter  present.Presenter
+	hustles    []hustle.Definition
+	toolLimits loop.ToolLimits
 	// spillBases are the capture spill bases every rig in this world was
 	// composed with. See spillBase.
 	spillMu    sync.Mutex
@@ -1627,6 +1647,13 @@ type PooledWorldOptions struct {
 	// policy (package toolresultobjects). It needs WithWorkspace: Bash runs
 	// in the session's workspace. See ToolResultRetention.
 	ToolResults *ToolResultRetention
+
+	// Presenter is registered on every rig; nil keeps the legacy message path.
+	Presenter present.Presenter
+	// ToolLimits overrides loop limits when ToolResults is not composed.
+	ToolLimits loop.ToolLimits
+	// Hustles are registered on every rig.
+	Hustles []hustle.Definition
 }
 
 // NewPooledWorld opens the shared durable plane and one harness journal per
@@ -1660,6 +1687,9 @@ func NewPooledWorld(tb TB, ctx context.Context, options PooledWorldOptions) *Poo
 		gated:           options.WithAskTool,
 		hostLogs:        options.HostLogs,
 		journalOptions:  options.JournalOptions,
+		presenter:       options.Presenter,
+		hustles:         append([]hustle.Definition(nil), options.Hustles...),
+		toolLimits:      options.ToolLimits,
 	}
 	world.Tails.quiet = options.TailQuiet
 	if options.WithAskTool {
@@ -1794,6 +1824,8 @@ func (w *PooledWorld) defineRig(tb TB, tenant sessionwire.TenantID, journal *har
 	if w.toolResults != nil {
 		tools = append(tools, w.toolResults.definitions()...)
 		loopOptions = append(loopOptions, loop.WithToolLimits(w.toolResults.limits()))
+	} else if w.toolLimits != (loop.ToolLimits{}) {
+		loopOptions = append(loopOptions, loop.WithToolLimits(w.toolLimits))
 	}
 	if len(tools) > 0 {
 		loopOptions = append(loopOptions,
@@ -1821,6 +1853,12 @@ func (w *PooledWorld) defineRig(tb TB, tenant sessionwire.TenantID, journal *har
 		// The SAME store the rig journals into: a capture lives beside the
 		// journal that references it, in the tenant's runtime scope.
 		rigOptions = append(rigOptions, rig.WithToolResultObjects(journal.ToolResultObjects(), w.spillBase(tb)))
+	}
+	if w.presenter != nil {
+		rigOptions = append(rigOptions, rig.WithMessagePresenter(w.presenter))
+	}
+	if len(w.hustles) != 0 {
+		rigOptions = append(rigOptions, rig.WithHustles(w.hustles...))
 	}
 	defined, err := rig.Define(rigOptions...)
 	if err != nil {
@@ -2467,6 +2505,9 @@ func pooledFactoryOptions(tb TB, world *PooledWorld, cfg PooledFactoryConfig, pl
 	if cfg.Authorizer != nil {
 		authorizer = cfg.Authorizer
 	}
+	if cfg.AuditAuthorizer != nil {
+		authorizer = cfg.AuditAuthorizer
+	}
 	var pending factory.PendingCommands = world.Store
 	if cfg.Pending != nil {
 		pending = cfg.Pending
@@ -2495,6 +2536,9 @@ func pooledFactoryOptions(tb TB, world *PooledWorld, cfg PooledFactoryConfig, pl
 		factory.WithSessionBinding(PooledBinding, PooledBindingVersion),
 		factory.WithPublicCreates(world.Store),
 		factory.WithLogger(slog.New(slog.NewJSONHandler(logs, nil))),
+	}
+	if cfg.PrincipalStamping {
+		opts = append(opts, factory.WithPrincipalStamping())
 	}
 	objects := world.objectRouteOptions(tb)
 	if objects == nil {

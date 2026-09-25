@@ -21,6 +21,7 @@ import (
 	sessionwire "github.com/looprig/core/sessionwire/v1"
 	"github.com/looprig/core/uuid"
 	"github.com/looprig/factory"
+	"github.com/looprig/factory/identity"
 	"github.com/looprig/harness/pkg/event"
 	"github.com/looprig/harness/pkg/journal"
 	"github.com/looprig/harness/pkg/runtimecommand"
@@ -73,6 +74,13 @@ type PooledFactoryConfig struct {
 	// is NOT authorized (identity.ErrUnauthorized).
 	Authorizer factory.Authorizer
 
+	// PrincipalStamping adds Factory's verified principal to every admitted
+	// command. It is opt-in, matching the deployment contract.
+	PrincipalStamping bool
+	// AuditAuthorizer, when set, replaces Authorizer (or the default) and
+	// implements Factory's optional command-audit permission seam.
+	AuditAuthorizer factory.Authorizer
+
 	// ServiceToken is the HostLink credential this replica presents. Empty
 	// takes PooledServiceToken, which the world's Hosts accept; anything else
 	// is refused by every Host.
@@ -108,6 +116,21 @@ type PooledFactoryConfig struct {
 	// Workload, when set on a dedicated replica, is the launch template's
 	// platform payload in place of the kit's placeholder.
 	Workload *sessionstore.DesiredWorkload
+}
+
+// AuditingAuthorizer permits the kit's control operations and records each
+// audit authorization call. Factory still enforces session tenant isolation.
+type AuditingAuthorizer struct {
+	pooledAuthorizer
+	mu    sync.Mutex
+	Audit []sessionwire.SessionID
+}
+
+func (a *AuditingAuthorizer) AuthorizeAuditRead(_ context.Context, _ identity.Principal, s sessionwire.SessionID) error {
+	a.mu.Lock()
+	a.Audit = append(a.Audit, s)
+	a.mu.Unlock()
+	return nil
 }
 
 // StartPooledFactoryWith composes, starts and serves a real pooled Factory
