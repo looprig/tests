@@ -1865,7 +1865,14 @@ func (w *PooledWorld) defineRig(tb TB, tenant sessionwire.TenantID, journal *har
 		rigOptions = append(rigOptions, rig.WithMessagePresenter(w.presenter))
 	}
 	if len(w.hustles) != 0 {
-		rigOptions = append(rigOptions, rig.WithHustles(w.hustles...))
+		rigOptions = append(rigOptions,
+			rig.WithHustles(w.hustles...),
+			rig.WithHustleLimits(rig.HustleLimits{
+				BlockingConcurrent: 1, BackgroundConcurrent: 1,
+				AuditTimeout: time.Second, FinalizationTimeout: 2 * time.Second,
+				WorkerDrainTimeout: 3 * time.Second,
+			}),
+		)
 	}
 	defined, err := rig.Define(rigOptions...)
 	if err != nil {
