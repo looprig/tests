@@ -30,6 +30,7 @@ require (
 	github.com/looprig/sessionstore v0.14.0
 	github.com/looprig/storage v0.7.0
 	github.com/looprig/tools v0.14.1
+	github.com/nats-io/nats-server/v2 v2.14.5
 	k8s.io/client-go v0.37.0
 )
 
@@ -118,7 +119,6 @@ require (
 	github.com/modern-go/reflect2 v1.0.3-0.20250322232337-35a7c28c31ee // indirect
 	github.com/munnerz/goautoneg v0.0.0-20191010083416-a7dc8b61c822 // indirect
 	github.com/nats-io/jwt/v2 v2.8.2 // indirect
-	github.com/nats-io/nats-server/v2 v2.14.5 // indirect
 	github.com/nats-io/nats.go v1.53.1 // indirect
 	github.com/nats-io/nkeys v0.4.16 // indirect
 	github.com/nats-io/nuid v1.0.1 // indirect

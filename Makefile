@@ -71,8 +71,10 @@ sessionwire-goldens:
 
 mod-check:
 	@sh scripts/check-release-modfile.sh go.mod
+	@sh scripts/check-release-modfile.sh oldhostlane/go.mod
 	@test -z "$$(GOWORK=off go mod tidy -diff)" || (echo 'go.mod is not tidy' >&2; GOWORK=off go mod tidy -diff; exit 1)
 	GOWORK=off go mod verify
+	(cd oldhostlane && GOWORK=off go mod verify)
 
 # The P3.1 cloud composition lane (runbook 07): released pgstore + s3store
 # under a real Factory and pooled Hosts, against LOCAL digest-pinned

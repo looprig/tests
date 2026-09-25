@@ -10,15 +10,16 @@ import (
 
 func TestCanonicalGoModHasNoLocalReplacements(t *testing.T) {
 	t.Parallel()
-
-	contents, err := os.ReadFile("go.mod")
-	if err != nil {
-		t.Fatalf("read canonical go.mod: %v", err)
-	}
-	for _, line := range strings.Split(string(contents), "\n") {
-		trimmed := strings.TrimSpace(line)
-		if strings.HasPrefix(trimmed, "replace ") || trimmed == "replace" || trimmed == "replace (" {
-			t.Fatalf("canonical go.mod still contains a replace directive: %q", trimmed)
+	for _, modfile := range []string{"go.mod", "oldhostlane/go.mod"} {
+		contents, err := os.ReadFile(modfile)
+		if err != nil {
+			t.Fatalf("read %s: %v", modfile, err)
+		}
+		for _, line := range strings.Split(string(contents), "\n") {
+			trimmed := strings.TrimSpace(line)
+			if strings.HasPrefix(trimmed, "replace ") || trimmed == "replace" || trimmed == "replace (" {
+				t.Fatalf("%s contains a replace directive: %q", modfile, trimmed)
+			}
 		}
 	}
 }
@@ -36,6 +37,10 @@ func TestReleaseCheckUsesCanonicalGoMod(t *testing.T) {
 	}
 	if !strings.Contains(makefile, `scripts/check-release-modfile.sh go.mod`) {
 		t.Fatal("release-check must validate the canonical go.mod")
+	}
+	if !strings.Contains(makefile, `scripts/check-release-modfile.sh oldhostlane/go.mod`) ||
+		!strings.Contains(makefile, `(cd oldhostlane && GOWORK=off go mod verify)`) {
+		t.Fatal("release-check must validate and verify the oldhostlane module")
 	}
 }
 

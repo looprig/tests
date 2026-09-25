@@ -105,6 +105,31 @@ func ProbeHostCapabilities(tb TB, h *ComposedHost) sessionwire.VersionNegotiatio
 	return DecodeHostCapabilities(tb, result.ReplyData)
 }
 
+// HostAdvertises dials a tenant URL derived from a running Host's BARE base
+// and reads the exact capability token from Core's connect reply. The old-Host
+// probe uses this rather than inferring support from a registration record.
+func HostAdvertises(tb TB, base sessionwire.InternalEndpoint, tenant sessionwire.TenantID, token string) bool {
+	tb.Helper()
+	endpoint, err := sessionwire.HostLinkEndpoint(base, tenant)
+	if err != nil {
+		tb.Fatalf("orchestrationtest: deriving tenant HostLink endpoint from %q: %v", base, err)
+		return false
+	}
+	request, err := sessionwire.EncodeHostLinkConnectRequest(sessionwire.VersionNegotiationRequest{
+		SupportedVersions: []sessionwire.WireVersion{sessionwire.CurrentWireVersion},
+	})
+	if err != nil {
+		tb.Fatalf("orchestrationtest: encoding capability connect request: %v", err)
+		return false
+	}
+	result := RawHostLinkConnect(tb, endpoint, PooledServiceToken, "centrifuge-json", request, 10*time.Second)
+	if !result.Connected {
+		tb.Fatalf("orchestrationtest: capability probe did not connect to %q: %+v", endpoint, result)
+		return false
+	}
+	return DecodeHostCapabilities(tb, result.ReplyData).Supports(token)
+}
+
 // AssertHostCapabilities is the Host trip-wire. It fires when the capability set
 // a running Host advertises is not exactly want, in either direction, and says
 // which lane each difference moves.
