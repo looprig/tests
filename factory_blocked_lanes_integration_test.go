@@ -123,7 +123,7 @@ func TestIntegrationLaneBlockers(t *testing.T) {
 			Compatibility: blockedCompatibility, StorageBindingID: "orchestrationtest-blocked-binding",
 		})
 		negotiated := orchestrationtest.ProbeHostCapabilities(t, running)
-		orchestrationtest.AssertHostCapabilities(t, negotiated, orchestrationtest.HostLinkSurfaceAtV040())
+		orchestrationtest.AssertHostCapabilities(t, negotiated, orchestrationtest.HostLinkSurfaceAtV011())
 		if !negotiated.Supports(sessionwire.HostLinkMethodDrain) || !negotiated.Supports(sessionwire.HostLinkMethodDrainStatus) {
 			t.Fatalf("a running Host does not support drain and drain_status: %v", negotiated.HostLinkMethods())
 		}

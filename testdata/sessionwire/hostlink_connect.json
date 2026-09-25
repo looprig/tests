@@ -24,7 +24,8 @@
           "hostlink.attach",
           "hostlink.drain",
           "hostlink.drain_status",
-          "hostlink.command.gate_response"
+          "hostlink.command.gate_response",
+          "hostlink.attribution.principal"
         ],
         "version": 1
       },

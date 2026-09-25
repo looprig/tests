@@ -260,7 +260,7 @@ func TestOrchestrationTestKit(t *testing.T) {
 			ID: "orchestrationtest-host-running", Generation: 3, Agent: kitAgent,
 			Compatibility: kitCompatibility, StorageBindingID: "orchestrationtest-binding",
 		})
-		AssertHostCapabilities(t, ProbeHostCapabilities(t, running), HostLinkSurfaceAtV040())
+		AssertHostCapabilities(t, ProbeHostCapabilities(t, running), HostLinkSurfaceAtV011())
 	})
 
 	t.Run("host refuses an invalid composition", func(t *testing.T) {
@@ -688,21 +688,22 @@ func TestOrchestrationTestKitAssertionsCanFail(t *testing.T) {
 		// The positive control for AssertHostCapabilities. The subject is a Core
 		// negotiation built with Core's own builder, so the wire is exercised on
 		// the exact type a Host reply decodes into.
-		v021 := sessionwire.VersionNegotiationResponse{Version: sessionwire.CurrentWireVersion}.
-			WithHostLinkMethods(HostLinkSurfaceAtV040()...)
-		AssertHostCapabilities(t, v021, HostLinkSurfaceAtV040())
+		v011 := sessionwire.VersionNegotiationResponse{Version: sessionwire.CurrentWireVersion}.
+			WithHostLinkMethods(HostLinkSurfaceAtV011()...)
+		AssertHostCapabilities(t, v011, HostLinkSurfaceAtV011())
 
 		withoutAttach := sessionwire.VersionNegotiationResponse{Version: sessionwire.CurrentWireVersion}.
 			WithHostLinkMethods(sessionwire.HostLinkMethodBind, sessionwire.HostLinkMethodUnbind,
 				sessionwire.HostLinkMethodDrain, sessionwire.HostLinkMethodDrainStatus,
-				sessionwire.HostLinkCapabilityGateResponse)
+				sessionwire.HostLinkCapabilityGateResponse,
+				sessionwire.HostLinkCapabilityAttributionPrincipal)
 		mustFail(t, "lost [hostlink.attach]", func(tb TB) {
-			AssertHostCapabilities(tb, withoutAttach, HostLinkSurfaceAtV040())
+			AssertHostCapabilities(tb, withoutAttach, HostLinkSurfaceAtV011())
 		})
 		grown := sessionwire.VersionNegotiationResponse{Version: sessionwire.CurrentWireVersion}.
-			WithHostLinkMethods(append(HostLinkSurfaceAtV040(), "hostlink.future")...)
+			WithHostLinkMethods(append(HostLinkSurfaceAtV011(), "hostlink.future")...)
 		mustFail(t, "gained [hostlink.future]", func(tb TB) {
-			AssertHostCapabilities(tb, grown, HostLinkSurfaceAtV040())
+			AssertHostCapabilities(tb, grown, HostLinkSurfaceAtV011())
 		})
 		// The vacuity guard: a Host advertising nothing is a pre-v0.9.0 Host,
 		// not a Host with an empty set that happens to match an empty want.

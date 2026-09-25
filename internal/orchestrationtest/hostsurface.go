@@ -41,10 +41,11 @@ import (
 // still lacks is a DRAIN CALLER -- Factory has none and the D2.2 ruling puts it
 // in looprig/controller -- which is not a Host capability and is not pinned here.
 
-// HostLinkSurfaceAtV040 is the exact hostlink_methods set released host v0.4.0
+// HostLinkSurfaceAtV011 is the exact hostlink_methods set released host v0.11.0
 // advertises, spelled in Core's constants.
 //
-// It is SIX entries, not five, and the sixth is not a method. host v0.4.0
+// The first six entries are the five RPC methods plus the gate-response
+// capability token. host v0.4.0
 // advertises Core's capability TOKEN hostlink.command.gate_response in the same
 // reply member, after the five reserved methods, and only when its composition
 // wires both gate seams (host.Compose always does). Nothing dispatches it: it
@@ -55,10 +56,11 @@ import (
 // new field on the capacity report or the registry observation would be refused
 // by every existing Factory.
 //
-// The pin moved from five to six on the host v0.2.1 -> v0.4.0 bump, and the
-// move was made by auditing Factory's gate rather than by accepting whatever
-// the Host said: factory v0.5.0 gates on exactly this token.
-func HostLinkSurfaceAtV040() []string {
+// The seventh entry, hostlink.attribution.principal, arrived in host v0.11.0.
+// Factory v0.12.0 gates stamped placement and dispatch on this exact token.
+// Thus both added capabilities are backed by Factory gates, not inferred from
+// Host registration or silently accepted as an arbitrary change to the wire.
+func HostLinkSurfaceAtV011() []string {
 	return []string{
 		sessionwire.HostLinkMethodBind,
 		sessionwire.HostLinkMethodUnbind,
@@ -66,6 +68,7 @@ func HostLinkSurfaceAtV040() []string {
 		sessionwire.HostLinkMethodDrain,
 		sessionwire.HostLinkMethodDrainStatus,
 		sessionwire.HostLinkCapabilityGateResponse,
+		sessionwire.HostLinkCapabilityAttributionPrincipal,
 	}
 }
 
@@ -141,8 +144,8 @@ func AssertHostCapabilities(tb TB, got sessionwire.VersionNegotiationResponse, w
 	}
 	tb.Fatalf("orchestrationtest: the Host's HostLink capability set moved: gained %v, lost %v (advertised %v). "+
 		"A LOST method is one a Factory now refuses locally -- losing hostlink.attach takes this Host out of B5 "+
-		"placement, losing hostlink.drain re-blocks runbook 07 I2.3. A GAINED method is new Host behaviour no "+
-		"Factory gates yet: audit Factory's capability gate and the integration lane, then move this pin", gained, lost, methods)
+		"placement, losing hostlink.drain re-blocks runbook 07 I2.3. A GAINED method or capability "+
+		"requires auditing Factory's gate and the integration lane before moving this pin", gained, lost, methods)
 }
 
 // AssertFactorySubscribesToNoHostChannel was I1.1 cases 3-4 and I1.4's

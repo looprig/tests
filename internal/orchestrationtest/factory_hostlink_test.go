@@ -281,7 +281,7 @@ func TestFactoryHostLinkDialsAReleasedHost(t *testing.T) {
 		negotiated := DecodeHostCapabilities(t, reply.Connect.Data)
 		// EXACTLY the set, in either direction -- the capability wire, applied
 		// to the reply Factory itself received on its own connection.
-		AssertHostCapabilities(t, negotiated, HostLinkSurfaceAtV040())
+		AssertHostCapabilities(t, negotiated, HostLinkSurfaceAtV011())
 		if !negotiated.Supports(sessionwire.HostLinkMethodAttach) {
 			t.Fatalf("Supports(hostlink.attach) = false on the negotiation Factory received")
 		}
@@ -562,7 +562,7 @@ func TestHostLinkB8RegressionControls(t *testing.T) {
 		if !control.Connected {
 			t.Fatalf("Host refused Core's bare request too (%+v); the 4501 above proves nothing", control)
 		}
-		AssertHostCapabilities(t, DecodeHostCapabilities(t, control.ReplyData), HostLinkSurfaceAtV040())
+		AssertHostCapabilities(t, DecodeHostCapabilities(t, control.ReplyData), HostLinkSurfaceAtV011())
 	})
 }
 
