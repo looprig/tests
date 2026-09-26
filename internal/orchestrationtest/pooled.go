@@ -3,6 +3,7 @@
 package orchestrationtest
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -34,6 +35,7 @@ import (
 	"github.com/looprig/harness/pkg/runtimecommand"
 	"github.com/looprig/harness/pkg/session"
 	harnessstore "github.com/looprig/harness/pkg/sessionstore"
+	harnesswire "github.com/looprig/harness/pkg/sessionwire"
 	"github.com/looprig/harness/pkg/tool"
 	"github.com/looprig/host"
 	"github.com/looprig/host/department"
@@ -132,6 +134,13 @@ var PooledBearersAlt = map[sessionwire.TenantID]string{
 // PooledTurn is one scripted model turn: either plain text, or a tool call.
 type PooledTurn struct {
 	Text string
+	// Chunks, when set, are emitted verbatim by the scripted streaming model.
+	Chunks []content.Chunk
+	// BeforeChunk gates individual chunks so a test can observe each delivery
+	// before allowing the next model delta or the final StepDone.
+	BeforeChunk []<-chan struct{}
+	// BeforeFinish holds EOF until the test has observed the last delta.
+	BeforeFinish <-chan struct{}
 
 	// ToolName and ToolInput, when ToolName is set, make the turn a tool call
 	// instead. The turn AFTER a tool call is the model's reply to the result.
@@ -154,6 +163,7 @@ type PooledLLM struct {
 	turns    []PooledTurn
 	next     int
 	requests []inference.Request
+	emitted  []content.Chunk
 	// respond, when set, chooses every turn from the request itself and the
 	// script is ignored. See Respond.
 	respond func(inference.Request) PooledTurn
@@ -230,7 +240,9 @@ func (l *PooledLLM) Stream(ctx context.Context, request inference.Request) (*str
 	}
 
 	chunks := []content.Chunk{}
-	if turn.ToolName != "" {
+	if len(turn.Chunks) != 0 {
+		chunks = append(chunks, turn.Chunks...)
+	} else if turn.ToolName != "" {
 		chunks = append(chunks, &content.ToolUseChunk{
 			Index:     0,
 			ID:        fmt.Sprintf("orchestrationtest-call-%d", call),
@@ -247,10 +259,27 @@ func (l *PooledLLM) Stream(ctx context.Context, request inference.Request) (*str
 	sent := 0
 	return stream.NewStreamReader(func() (content.Chunk, error) {
 		if sent >= len(chunks) {
+			if turn.BeforeFinish != nil {
+				select {
+				case <-turn.BeforeFinish:
+				case <-ctx.Done():
+					return nil, ctx.Err()
+				}
+			}
 			return nil, io.EOF
+		}
+		if sent < len(turn.BeforeChunk) && turn.BeforeChunk[sent] != nil {
+			select {
+			case <-turn.BeforeChunk[sent]:
+			case <-ctx.Done():
+				return nil, ctx.Err()
+			}
 		}
 		chunk := chunks[sent]
 		sent++
+		l.mu.Lock()
+		l.emitted = append(l.emitted, chunk)
+		l.mu.Unlock()
 		return chunk, nil
 	}, nil), nil
 }
@@ -260,6 +289,13 @@ func (l *PooledLLM) Requests() []inference.Request {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	return append([]inference.Request(nil), l.requests...)
+}
+
+// EmittedChunks reports the scripted deltas the real Harness stream consumed.
+func (l *PooledLLM) EmittedChunks() []content.Chunk {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return append([]content.Chunk(nil), l.emitted...)
 }
 
 // UserBlocksContaining returns the BLOCKS of the first user message, in any
@@ -1166,6 +1202,63 @@ func (s *pooledSession) SubscribeCommitted(context.Context, sessionwire.EventID)
 	return s.tails.subscribe(s.key), nil
 }
 
+// SubscribeLivePublic exposes the real Harness event stream to Host's opt-in
+// relay. The existing committed bridge remains the source for legacy worlds.
+func (s *pooledSession) SubscribeLivePublic(ctx context.Context) (<-chan department.LivePublication, error) {
+	subscription, err := s.controller.SubscribeEvents(event.EventFilter{
+		Enduring: event.LoopScope{All: true}, Ephemeral: event.LoopScope{All: true},
+	})
+	if err != nil {
+		return nil, err
+	}
+	out := make(chan department.LivePublication)
+	go func() {
+		defer close(out)
+		defer func() { _ = subscription.Close() }()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case delivery, open := <-subscription.Events():
+				if !open || delivery.Event == nil {
+					return
+				}
+				var publication department.LivePublication
+				if delivery.Event.Class() == event.Enduring {
+					if !delivery.Committed() {
+						return
+					}
+					publication.Enduring = &sessionwire.EnduringPublication{
+						TenantID: s.key.tenant, SessionID: s.key.session,
+						EventID: sessionwire.EventID(delivery.EventID), JournalSeq: delivery.JournalSeq,
+						CoveredThrough: delivery.CoveredThrough, Body: delivery.PublicBody,
+					}
+				} else if delta, ok := delivery.Event.(event.TokenDelta); ok {
+					chunk, ok := delta.Chunk.(*content.TextChunk)
+					if !ok || chunk == nil || chunk.Text == "" {
+						continue
+					}
+					projected, err := harnesswire.Project(s.key.tenant, s.key.session, delta)
+					if err != nil || projected.Class != harnesswire.PublicEphemeral {
+						continue
+					}
+					publication.Ephemeral = &sessionwire.EphemeralPublication{
+						TenantID: s.key.tenant, SessionID: s.key.session, Body: projected.Body,
+					}
+				} else {
+					continue
+				}
+				select {
+				case out <- publication:
+				case <-ctx.Done():
+					return
+				}
+			}
+		}
+	}()
+	return out, nil
+}
+
 // ApplyCommand satisfies department.CommandApplier, through HARNESS'S OWN
 // runtime-command seam, FOR ALL FIVE ADMITTED KINDS.
 //
@@ -1584,6 +1677,7 @@ type PooledWorld struct {
 	presenter  present.Presenter
 	hustles    []hustle.Definition
 	toolLimits loop.ToolLimits
+	liveText   *host.LiveTextOptions
 	// spillBases are the capture spill bases every rig in this world was
 	// composed with. See spillBase.
 	spillMu    sync.Mutex
@@ -1592,6 +1686,9 @@ type PooledWorld struct {
 
 // PooledWorldOptions chooses what a case's agent can do.
 type PooledWorldOptions struct {
+	// LiveText enables the Host's opt-in transient text relay. Nil preserves
+	// the released committed-only composition used by existing lanes.
+	LiveText *host.LiveTextOptions
 	// Tenants are the tenants this world serves. Empty means both.
 	Tenants []sessionwire.TenantID
 	// WithAskTool gives the agent the tool that raises a real ask_user gate.
@@ -1692,6 +1789,7 @@ func NewPooledWorld(tb TB, ctx context.Context, options PooledWorldOptions) *Poo
 		Tails:           NewPooledTails(),
 		tenants:         tenants,
 		gated:           options.WithAskTool,
+		liveText:        options.LiveText,
 		hostLogs:        options.HostLogs,
 		journalOptions:  options.JournalOptions,
 		presenter:       options.Presenter,
@@ -2176,6 +2274,7 @@ func (world *PooledWorld) hostComposition(tb TB, id sessionwire.HostID, generati
 	}
 
 	blueprint := host.Composition{
+		LiveText: world.liveText,
 		Options: host.Options{
 			HostID:           id,
 			InternalEndpoint: base,
@@ -2764,6 +2863,7 @@ type PooledViewer struct {
 
 	mu      sync.Mutex
 	records []string
+	frames  [][]byte
 	strays  []string
 	// arrived stamps each record with its arrival time, index for index.
 	arrived []string
@@ -2841,6 +2941,7 @@ func (v *PooledViewer) Watch(tb TB, ctx context.Context, tenant sessionwire.Tena
 		v.mu.Lock()
 		defer v.mu.Unlock()
 		v.records = append(v.records, summary)
+		v.frames = append(v.frames, bytes.Clone(e.Data))
 		if recordTenant != tenant || recordSession != s {
 			v.strays = append(v.strays, fmt.Sprintf("%s(%s/%s)", summary, recordTenant, recordSession))
 		}
@@ -2867,6 +2968,17 @@ func (v *PooledViewer) Records() []string {
 	v.mu.Lock()
 	defer v.mu.Unlock()
 	return append([]string(nil), v.records...)
+}
+
+// Frames returns the complete ClientLink publication payloads in receive order.
+func (v *PooledViewer) Frames() [][]byte {
+	v.mu.Lock()
+	defer v.mu.Unlock()
+	out := make([][]byte, len(v.frames))
+	for i, frame := range v.frames {
+		out[i] = bytes.Clone(frame)
+	}
+	return out
 }
 
 // Strays reports every record naming another tenant or session.
