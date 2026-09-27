@@ -1714,11 +1714,41 @@ func (s *stress) verifyViewers() {
 	deadline := time.Now().Add(60 * time.Second)
 	for {
 		var behind []string
-		trailing, hinted := 0, 0
+		var firstBehind *stressEpoch
+		trailing, hinted, repairedFromHint := 0, 0, 0
 		for _, epoch := range final {
 			records := epoch.viewer.Records()
 			covered, err := orchestrationtest.PooledCoveredThroughPublic(records, epoch.start, public[epoch.session.id])
 			target := targets[epoch.session.id]
+			// A journal_tip is a prompt to read, not a record covering the gap.
+			// This viewer records wire frames rather than acting as a browser,
+			// so exercise the browser's durable read here and require every
+			// public sequence still missing from live delivery to be present.
+			if err == nil && covered < target && stressHintedThrough(records) >= target {
+				// from_seq is inclusive, as in PooledBrowser.repair.
+				repair := orchestrationtest.ReadPooledJournalFrom(s.t, s.ctx, epoch.replica.f,
+					epoch.session.tenant, epoch.session.id, covered+1)
+				seen := map[uint64]bool{}
+				ordered := true
+				previous := covered
+				for _, event := range repair.Events {
+					if event.JournalSeq <= previous {
+						ordered = false
+					}
+					previous = event.JournalSeq
+					seen[event.JournalSeq] = true
+				}
+				complete := ordered && repair.CoveredThrough >= target
+				for _, seq := range public[epoch.session.id] {
+					if seq > covered && seq <= target && !seen[seq] {
+						complete = false
+					}
+				}
+				if complete {
+					repairedFromHint++
+					continue
+				}
+			}
 			switch {
 			case err != nil || covered >= target:
 			case covered >= before[epoch.session.id] && releasedLast[epoch.session.id]:
@@ -1727,15 +1757,26 @@ func (s *stress) verifyViewers() {
 					hinted++
 				}
 			default:
+				if firstBehind == nil {
+					firstBehind = epoch
+				}
 				behind = append(behind, fmt.Sprintf("%s via %s covered %d < %d", epoch.session.id, epoch.replica.name, covered, target))
 			}
 		}
 		if len(behind) == 0 {
-			s.t.Logf("V3 %d final viewers are covered through their sessions' tips; %d viewer connections checked in all", len(final), len(epochs))
+			s.t.Logf("V3 %d final viewers are covered through their sessions' tips, including %d verified journal repairs prompted by hints; %d viewer connections checked in all", len(final), repairedFromHint, len(epochs))
 			s.observeTrailing(trailing, hinted, len(final))
 			return
 		}
 		if time.Now().After(deadline) {
+			if firstBehind != nil {
+				owner, found, err := firstBehind.replica.f.Directory.Owner(s.ctx, firstBehind.session.tenant, firstBehind.session.id)
+				records := firstBehind.viewer.Records()
+				timeline := s.world.Tails.Timeline(firstBehind.session.tenant, firstBehind.session.id)
+				s.t.Logf("V3 diagnostic %s via %s: owner found=%t observation=%+v err=%v viewer=%v timeline tail=%v",
+					firstBehind.session.id, firstBehind.replica.name, found, owner, err,
+					records[max(0, len(records)-24):], timeline[max(0, len(timeline)-24):])
+			}
 			sort.Strings(behind)
 			s.t.Errorf("V3: %d final viewers are not covered through their session's tip 60s after the fleet went quiet: %v", len(behind), behind)
 			return
