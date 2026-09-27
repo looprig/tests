@@ -28,8 +28,9 @@
 //	        (a) A GENUINE QUEUE OVERFLOW. The composed HostBinding bound is the
 //	        live-tail plane's per-session mailbox (MailboxLimit =
 //	        routing.DefaultRepairLimits().HostBindingQueue = 1024 frames), and
-//	        a burst of 8,192 frames injected on X's HostLink -- with the
-//	        product committing enduring records through it -- overflows it:
+//	        a burst of 8,192 non-droppable enduring frames from an actual
+//	        committed event, injected on X's HostLink -- with the product
+//	        committing more enduring records through it -- overflows it:
 //	        Factory drops the queued backlog, fences the tail's generation and
 //	        repairs. Measured: several Factory-authored resets per browser, and
 //	        some of the burst's enduring records reach browsers only through
@@ -263,10 +264,9 @@ func TestRealtimeFailureBlastRadiusIsBoundedByTheSession(t *testing.T) {
 		// drainer cannot keep up with fills it; the plane then DROPS the
 		// queued backlog, fences the tail's generation so later frames are
 		// dropped too, and queues the repair (evLost -> Relay.HostLinkClosed).
-		// The burst is ephemeral records -- the only records a Host can send
-		// faster than the product commits -- with the product committing
-		// enduring records THROUGH it, so the dropped backlog can hold
-		// enduring frames that only the repair can give back.
+		// Precommit distinct enduring publications without sending them yet,
+		// then inject their exact wire records in a burst. Every injected
+		// record has a durable journal counterpart and is non-droppable.
 		const burst = slowConsumerMailboxBurst
 		committedBurst := world.Tails.Committed(tenantA, sessionA)
 		tipBeforeBurst := committedBurst[len(committedBurst)-1].JournalSeq
@@ -279,16 +279,13 @@ func TestRealtimeFailureBlastRadiusIsBoundedByTheSession(t *testing.T) {
 			liveBefore[b] = len(b.LiveEnduring())
 		}
 		yBefore := len(onY.Log())
-		for n := 1; n <= burst; n++ {
-			record, err := orchestrationtest.EphemeralRecord(tenantA, sessionA, []byte(fmt.Sprintf(`{"n":%d}`, slowConsumerBurstBase+n)))
-			if err != nil {
-				t.Fatalf("encoding burst record %d: %v", n, err)
-			}
+		burstRecords := world.Tails.CommitUnpublished(tenantA, sessionA, burst)
+		if len(burstRecords) != burst {
+			t.Fatalf("precommitted %d of %d enduring burst records: %v", len(burstRecords), burst, world.Tails.DurableFailures())
+		}
+		for n, record := range burstRecords {
 			if _, err := injector.Push(tenantA, sessionA, record); err != nil {
 				t.Fatalf("injecting burst record %d: %v", n, err)
-			}
-			if n%(burst/8) == 0 {
-				world.Tails.Commit(tenantA, sessionA)
 			}
 		}
 		world.Tails.Commit(tenantA, sessionA)
@@ -308,7 +305,9 @@ func TestRealtimeFailureBlastRadiusIsBoundedByTheSession(t *testing.T) {
 			}
 			assertHoldsAll(t, fmt.Sprintf("browser %d after the mailbox overflow", i), b, committedAfter)
 			got := b.Ephemeral()[ephemeralBefore[b]:]
-			assertBoundedEphemeral(t, fmt.Sprintf("browser %d's burst", i), got, slowConsumerBurstBase+1, slowConsumerBurstBase+burst)
+			if len(got) != 0 {
+				t.Fatalf("browser %d received %d ephemeral records during an enduring-only burst", i, len(got))
+			}
 			// What the overflow cost this browser, measured: burst frames it
 			// never saw, and enduring records it got from the repair rather
 			// than live.
@@ -318,8 +317,8 @@ func TestRealtimeFailureBlastRadiusIsBoundedByTheSession(t *testing.T) {
 					liveNew++
 				}
 			}
-			t.Logf("case 2 overflow: browser %d got %d resets (%v), %d of %d burst frames, %d of %d new enduring records live",
-				i, len(resets), resets, len(got), burst, liveNew, len(committedAfter)-len(committedBurst))
+			t.Logf("case 2 enduring overflow: browser %d got %d resets (%v), %d of %d new enduring records live",
+				i, len(resets), resets, liveNew, len(committedAfter)-len(committedBurst))
 		}
 		for _, entry := range onY.Log()[yBefore:] {
 			if entry.Kind != "E" {
@@ -422,8 +421,7 @@ func TestRealtimeFailureBlastRadiusIsBoundedByTheSession(t *testing.T) {
 		orchestrationtest.PooledWait(t, "Factory re-opened a HostLink to Host X", 60*time.Second, func() bool { return injector.Live() > 0 })
 		awaitLive(t, peer)
 
-		// Case 4 counts only its own ephemeral records: case 2's burst came
-		// before it on the same browsers.
+		// Count only case 4's ephemeral records on these long-lived browsers.
 		epStart := map[*orchestrationtest.PooledBrowser]int{}
 		for _, b := range onA {
 			epStart[b] = len(b.Ephemeral())
@@ -567,10 +565,8 @@ const (
 
 	// slowConsumerMailboxBurst is I1.4 case 2's overflow: well above the
 	// live-tail mailbox Factory composes (1024 frames), small-bodied so the
-	// ClientLink budget is not what it measures. Burst records are numbered
-	// from slowConsumerBurstBase so they cannot be read as case 4's.
+	// ClientLink budget is not what it measures.
 	slowConsumerMailboxBurst = 8192
-	slowConsumerBurstBase    = 1_000_000
 )
 
 // TestCentrifugeSlowConsumerThresholdAndItsBlastRadius is I1.4 CASE 3,

@@ -799,6 +799,34 @@ func (t *PooledTails) Commit(tenant sessionwire.TenantID, s sessionwire.SessionI
 	t.emit(key, 1)
 }
 
+// CommitUnpublished appends distinct enduring records to a DurableTail
+// journal and returns their exact HostLink bytes without publishing them.
+// A test can then inject the batch quickly enough to exercise the bounded
+// Factory mailbox while every frame remains backed by the real journal.
+func (t *PooledTails) CommitUnpublished(tenant sessionwire.TenantID, s sessionwire.SessionID, count int) [][]byte {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if t.durable == nil {
+		t.failures = append(t.failures, fmt.Errorf("orchestrationtest: CommitUnpublished(%s/%s) outside a DurableTail world", tenant, s))
+		return nil
+	}
+	key := pooledTailKey{tenant, s}
+	out := make([][]byte, 0, count)
+	for range count {
+		publication, ok := t.commitDurable(key, 0)
+		if !ok {
+			return out
+		}
+		encoded, err := publication.MarshalJSON()
+		if err != nil {
+			t.failures = append(t.failures, fmt.Errorf("encoding unpublished %s: %w", publication.EventID, err))
+			return out
+		}
+		out = append(out, encoded)
+	}
+	return out
+}
+
 // CommitPadded is Commit with this one record's body padded to pad bytes
 // instead of the world's TailPadBytes: how a case bursts a session with real
 // bytes without making every record that large.
