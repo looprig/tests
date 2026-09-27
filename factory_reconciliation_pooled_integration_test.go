@@ -98,13 +98,14 @@ func TestFactorySubscriberDemandFindsATipAppliedElsewhere(t *testing.T) {
 	// relayed it -- the position replica A's hint must come to name.
 	tip := world.AwaitQuietTip(t, tenant, session, 0)
 
-	// THE BOUND IS FACTORY'S OWN COMPOSITION, restated from its inputs: the
-	// next poll is armed OwnershipPollInterval after the last one FINISHED, and
+	// THE BOUND covers both released Factory's debounce-derived cadence and
+	// the branch's 5-second default for unbound watched sessions. The next
+	// poll is armed after the last one FINISHED, and
 	// one poll -- the failing bind, the tip read and the publish -- is bounded
 	// by DemandTimeout. A tip that moved just after a hint was read is therefore
 	// in the next hint at most one gap plus one poll later. The 250ms is
 	// scheduling slack for this process, not a Factory figure.
-	bound := watcher.OwnershipPollInterval + watcher.DemandTimeout + 250*time.Millisecond
+	bound := max(watcher.OwnershipPollInterval, 5*time.Second) + watcher.DemandTimeout + 250*time.Millisecond
 	elapsed := orchestrationtest.PooledWait(t, fmt.Sprintf("replica A's viewer learned tip %d", tip), bound, func() bool {
 		got, ok := highestTipHint(viewer.Records())
 		return ok && got >= tip
