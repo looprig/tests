@@ -1205,6 +1205,14 @@ func (s *pooledSession) SubscribeCommitted(context.Context, sessionwire.EventID)
 // SubscribeLivePublic exposes the real Harness event stream to Host's opt-in
 // relay. The existing committed bridge remains the source for legacy worlds.
 func (s *pooledSession) SubscribeLivePublic(ctx context.Context) (<-chan department.LivePublication, error) {
+	return s.subscribeLivePublic(ctx, false)
+}
+
+func (s *pooledSession) SubscribeLivePublicWithReasoning(ctx context.Context) (<-chan department.LivePublication, error) {
+	return s.subscribeLivePublic(ctx, true)
+}
+
+func (s *pooledSession) subscribeLivePublic(ctx context.Context, includeReasoning bool) (<-chan department.LivePublication, error) {
 	subscription, err := s.controller.SubscribeEvents(event.EventFilter{
 		Enduring: event.LoopScope{All: true}, Ephemeral: event.LoopScope{All: true},
 	})
@@ -1234,8 +1242,14 @@ func (s *pooledSession) SubscribeLivePublic(ctx context.Context) (<-chan departm
 						CoveredThrough: delivery.CoveredThrough, Body: delivery.PublicBody,
 					}
 				} else if delta, ok := delivery.Event.(event.TokenDelta); ok {
-					chunk, ok := delta.Chunk.(*content.TextChunk)
-					if !ok || chunk == nil || chunk.Text == "" {
+					visible := false
+					switch chunk := delta.Chunk.(type) {
+					case *content.TextChunk:
+						visible = chunk != nil && chunk.Text != ""
+					case *content.ThinkingChunk:
+						visible = includeReasoning && chunk != nil && chunk.Thinking != ""
+					}
+					if !visible {
 						continue
 					}
 					projected, err := harnesswire.Project(s.key.tenant, s.key.session, delta)
@@ -2586,8 +2600,13 @@ func pooledFactoryOptions(tb TB, world *PooledWorld, cfg PooledFactoryConfig, pl
 	if cfg.ApplyDeadline > 0 {
 		reconcile.ApplyDeadline = cfg.ApplyDeadline
 	}
+	if reconcile.PassTimeout >= reconcile.ClaimTTL {
+		reconcile.PassTimeout = reconcile.ClaimTTL / 2
+	}
 	clientLink := factory.DefaultClientLinkLimits()
-	clientLink.DemandReleaseDebounce = reconcileDebounce
+	if !cfg.UseDefaultDemandReleaseDebounce {
+		clientLink.DemandReleaseDebounce = reconcileDebounce
+	}
 	if cfg.DemandTimeout > 0 {
 		clientLink.DemandTimeout = cfg.DemandTimeout
 	}

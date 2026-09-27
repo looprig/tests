@@ -89,6 +89,8 @@ type PooledFactoryConfig struct {
 	// DemandTimeout bounds one subscriber-demand poll. Zero takes Factory's
 	// default.
 	DemandTimeout time.Duration
+	// UseDefaultDemandReleaseDebounce leaves Factory's production default intact.
+	UseDefaultDemandReleaseDebounce bool
 
 	// Interval and ClaimTTL override the sweep cadence and the claim
 	// lifetime. Zero takes ReconcileSweepInterval and ReconcileClaimTTL.
