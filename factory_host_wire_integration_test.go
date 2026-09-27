@@ -90,11 +90,12 @@ import (
 )
 
 const (
-	wireTenant   = orchestrationtest.PooledTenantA
-	wireSessionA = sessionwire.SessionID("session-wire-a")
-	wireSessionB = sessionwire.SessionID("session-wire-b")
-	wireHostID   = sessionwire.HostID("orchestrationtest-wire-host")
-	wireHostGen  = uint64(7)
+	wireTenant         = orchestrationtest.PooledTenantA
+	wireSessionA       = sessionwire.SessionID("session-wire-a")
+	wireSessionB       = sessionwire.SessionID("session-wire-b")
+	wireSessionUnbound = sessionwire.SessionID("session-wire-unbound")
+	wireHostID         = sessionwire.HostID("orchestrationtest-wire-host")
+	wireHostGen        = uint64(7)
 
 	// wireGateAnswer is the user's raw answer. It must reach the agent and
 	// must never appear on either wire: a gate answer is private payload that
@@ -358,6 +359,7 @@ func TestFactoryHostWireGoldens(t *testing.T) {
 	capture := runWireScenario(t, ctx)
 	sessions := []sessionwire.SessionID{wireSessionA, wireSessionB}
 	n := liveNormalizer(capture.host.Base, sessions, wireCommandList())
+	n.substitute(string(wireSessionUnbound), "${session}")
 	hostLines := capture.hostLinesBeforeSever
 	hostExchanges := wireExchanges(hostLines)
 	const factorySource = "factory -> host (released versions pinned in go.mod), captured live"
@@ -405,6 +407,37 @@ func TestFactoryHostWireGoldens(t *testing.T) {
 				byType[recordType] = push
 			}
 		}
+		// The live scenario binds both sessions promptly. A separate admitted
+		// session with no Host remains watched and unbound, so Demand emits the
+		// journal_tip frame whose frozen wire shape is still part of this gate.
+		unboundWorld := orchestrationtest.NewPooledWorld(t, ctx, orchestrationtest.PooledWorldOptions{
+			Tenants: []sessionwire.TenantID{wireTenant},
+		})
+		unboundTap := orchestrationtest.NewHostLinkTap()
+		unboundFactory := orchestrationtest.StartPooledFactoryWith(t, ctx, unboundWorld, orchestrationtest.PooledFactoryConfig{
+			Replica: "orchestrationtest-wire-unbound-replica", Listener: unboundTap.WrapListener,
+		})
+		status, body := unboundFactory.Post(t, ctx, wireTenant, "/v1/sessions", sessionwire.CreateRequest{
+			CommandEnvelope: orchestrationtest.PooledEnvelope("command-wire-unbound-create"),
+			SessionID:       wireSessionUnbound, AgentID: orchestrationtest.PooledAgent,
+		})
+		if status != http.StatusCreated {
+			t.Fatalf("admitting the unbound session answered %d: %s", status, body)
+		}
+		unboundViewer := orchestrationtest.ConnectPooledViewer(t, ctx, unboundFactory, wireTenant)
+		if err := unboundViewer.Watch(t, ctx, wireTenant, wireSessionUnbound); err != nil {
+			t.Fatalf("the unbound viewer's subscribe was refused: %v", err)
+		}
+		orchestrationtest.PooledWait(t, "the unbound viewer received a journal tip", 30*time.Second, func() bool {
+			for _, push := range wirePushes(wireLines(t, unboundTap)) {
+				if member(push.Object, "push", "channel") == orchestrationtest.ClientLinkChannel(wireTenant, wireSessionUnbound) &&
+					member(push.Object, "push", "pub", "data", "type") == string(sessionwire.SessionRecordTypeJournalTip) {
+					byType[string(sessionwire.SessionRecordTypeJournalTip)] = push
+					return true
+				}
+			}
+			return false
+		})
 		frozen := map[string]string{
 			"clientlink_journal_tip":          string(sessionwire.SessionRecordTypeJournalTip),
 			"clientlink_session_reset":        string(sessionwire.SessionRecordTypeSessionReset),
