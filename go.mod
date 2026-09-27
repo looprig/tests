@@ -14,11 +14,11 @@ require (
 	github.com/looprig/core v0.12.0
 	github.com/looprig/credentials v0.2.1
 	github.com/looprig/eval v0.2.2
-	github.com/looprig/factory v0.12.1
+	github.com/looprig/factory v0.13.0
 	github.com/looprig/foreignloops v0.3.3
 	github.com/looprig/fsstore v0.6.0
 	github.com/looprig/harness v0.41.1
-	github.com/looprig/host v0.12.0
+	github.com/looprig/host v0.13.0
 	github.com/looprig/inference v0.14.0
 	github.com/looprig/llm v0.15.0
 	github.com/looprig/mcp v0.7.2
