@@ -424,6 +424,16 @@ func TestASuccessorClosesAStrandedCreateAndTheStreamUnblocks(t *testing.T) {
 		}
 	})
 
+	// Remove the only eligible Host before admitting the following input.
+	// Admission-time placement can otherwise select a successor during the
+	// blocked-state observation and close the create before that observation.
+	predecessor.Stop()
+	orchestrationtest.PooledWait(t, "the registry stops reporting a live owner", 60*time.Second, func() bool {
+		owner, found, _ := served.Directory.Owner(ctx, orchestrationtest.PooledTenantA, session)
+		return !found || owner.Residency != sessionwire.SessionResidencyResident ||
+			!owner.Accepting || !owner.ExpiresAt.After(time.Now())
+	})
+
 	t.Run("and everything behind it is blocked", func(t *testing.T) {
 		status, body := served.Post(t, ctx, orchestrationtest.PooledTenantA, "/v1/sessions/"+string(session)+"/input",
 			sessionwire.InputRequest{
@@ -438,6 +448,16 @@ func TestASuccessorClosesAStrandedCreateAndTheStreamUnblocks(t *testing.T) {
 		// will not advance its cursor past a non-terminal record, so the input
 		// must stay unapplied for as long as the create is stranded.
 		time.Sleep(3 * time.Second)
+		createEntry, err := world.Store.GetDispositionCommand(ctx, sessionstore.GetDispositionCommandRequest{
+			TenantID: orchestrationtest.PooledTenantA, SessionID: session, CommandID: create,
+		})
+		if err != nil {
+			t.Fatalf("reading the create during the blocked interval: %v", err)
+		}
+		if createEntry.Record.State != sessionstore.InboxStateApplying || createEntry.Record.Outcome != nil {
+			t.Fatalf("the create is no longer stranded during the blocked interval: state=%q outcome=%+v",
+				createEntry.Record.State, createEntry.Record.Outcome)
+		}
 		if state := world.CommandState(ctx, orchestrationtest.PooledTenantA, session, input); state == sessionstore.InboxStateApplied {
 			t.Fatalf("the input behind a stranded create settled %q; the premise that the stream is blocked is false", state)
 		}
@@ -447,12 +467,6 @@ func TestASuccessorClosesAStrandedCreateAndTheStreamUnblocks(t *testing.T) {
 	})
 
 	t.Run("a successor closes the attempt not_applied and the stream continues", func(t *testing.T) {
-		predecessor.Stop()
-		orchestrationtest.PooledWait(t, "the registry stops reporting a live owner", 60*time.Second, func() bool {
-			owner, found, _ := served.Directory.Owner(ctx, orchestrationtest.PooledTenantA, session)
-			return !found || owner.Residency != sessionwire.SessionResidencyResident ||
-				!owner.Accepting || !owner.ExpiresAt.After(time.Now())
-		})
 		successor := orchestrationtest.StartPooledHost(t, ctx, world, "orchestrationtest-successor-host", 7)
 		orchestrationtest.AwaitAdvertised(t, world, successor.ID)
 
@@ -496,6 +510,31 @@ func TestASuccessorClosesAStrandedCreateAndTheStreamUnblocks(t *testing.T) {
 		orchestrationtest.PooledWait(t, "the input behind the strand settled", 120*time.Second, func() bool {
 			return world.CommandState(ctx, orchestrationtest.PooledTenantA, session, input) == sessionstore.InboxStateApplied
 		})
+		inputEntry, err := world.Store.GetDispositionCommand(ctx, sessionstore.GetDispositionCommandRequest{
+			TenantID: orchestrationtest.PooledTenantA, SessionID: session, CommandID: input,
+		})
+		if err != nil {
+			t.Fatalf("reading the applied input: %v", err)
+		}
+		if inputEntry.Record.Outcome == nil || inputEntry.Record.Outcome.Kind != sessionstore.DispositionApplied {
+			t.Fatalf("the input has outcome %+v, want applied", inputEntry.Record.Outcome)
+		}
+		createOutcome, inputOutcome := entry.Record.Outcome, inputEntry.Record.Outcome
+		if inputOutcome.AuthorJournalEpoch < createOutcome.AuthorJournalEpoch ||
+			(inputOutcome.AuthorJournalEpoch == createOutcome.AuthorJournalEpoch && inputOutcome.DispositionSeq <= createOutcome.DispositionSeq) {
+			t.Fatalf("input applied at journal epoch/seq %d/%d before the create closed at %d/%d",
+				inputOutcome.AuthorJournalEpoch, inputOutcome.DispositionSeq,
+				createOutcome.AuthorJournalEpoch, createOutcome.DispositionSeq)
+		}
+		journal := orchestrationtest.ReadCommandEvidence(t, world, orchestrationtest.PooledTenantA,
+			world.RuntimeSessionID(t, ctx, orchestrationtest.PooledTenantA, session))
+		createFrames, inputFrames := journal.DispositionsOf(create), journal.DispositionsOf(input)
+		if len(createFrames) != 1 || len(inputFrames) != 1 ||
+			createFrames[0].Seq != createOutcome.DispositionSeq || inputFrames[0].Seq != inputOutcome.DispositionSeq ||
+			createFrames[0].Seq >= inputFrames[0].Seq {
+			t.Fatalf("journal dispositions do not put the create closure before input application: create=%+v input=%+v outcomes=%+v/%+v",
+				createFrames, inputFrames, createOutcome, inputOutcome)
+		}
 		orchestrationtest.PooledWait(t, "the input behind the strand reached the model", 60*time.Second, func() bool {
 			return world.LLM.SawInRequest(0, behindWord)
 		})
