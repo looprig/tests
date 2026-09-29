@@ -1027,6 +1027,9 @@ type PooledRig struct {
 	creates       []PooledLaunch
 	restores      []PooledLaunch
 	refuseCreates bool
+	// hold, when set, parks every launch AFTER harness has launched the
+	// runtime (and so holds its journal lease). See HoldLaunches.
+	hold *launchHold
 	// live is the latest runtime launched for each session on this Host.
 	live map[pooledTailKey]*pooledSession
 	// workspaceRoots is the WorkspaceRoot Host handed each launch, in order.
@@ -1053,6 +1056,41 @@ func (p *PooledRig) RefuseCreates(refuse bool) {
 	p.refuseCreates = refuse
 }
 
+// launchHold is one HoldLaunches arming.
+type launchHold struct {
+	launched chan struct{}
+	once     sync.Once
+	release  chan struct{}
+}
+
+// HoldLaunches parks this Host's NEXT runtime launches, create or restore,
+// after harness has launched the runtime -- so the runtime holds its journal
+// lease -- and before Host sees the launch return. launched closes when the
+// first launch parks; release lets every parked launch continue, and later
+// ones pass straight through.
+//
+// It exists to hold an attach inside its hydrate step, which is the window a
+// drain beginning concurrently has to account for.
+func (p *PooledRig) HoldLaunches() (launched <-chan struct{}, release func()) {
+	hold := &launchHold{launched: make(chan struct{}), release: make(chan struct{})}
+	p.mu.Lock()
+	p.hold = hold
+	p.mu.Unlock()
+	var once sync.Once
+	return hold.launched, func() { once.Do(func() { close(hold.release) }) }
+}
+
+func (p *PooledRig) parkLaunch() {
+	p.mu.Lock()
+	hold := p.hold
+	p.mu.Unlock()
+	if hold == nil {
+		return
+	}
+	hold.once.Do(func() { close(hold.launched) })
+	<-hold.release
+}
+
 func (p *PooledRig) refusingCreates() bool {
 	p.mu.Lock()
 	defer p.mu.Unlock()
@@ -1076,6 +1114,7 @@ func (p *PooledRig) NewSession(ctx context.Context, req department.RigCreateRequ
 	p.mu.Lock()
 	p.creates = append(p.creates, PooledLaunch{req.TenantID, req.RigSessionID})
 	p.mu.Unlock()
+	p.parkLaunch()
 	return p.adapt(controller, pooledTailKey{req.TenantID, req.SessionID}, req.WorkspaceRoot), nil
 }
 
@@ -1092,6 +1131,7 @@ func (p *PooledRig) RestoreSession(ctx context.Context, id uuid.UUID, req depart
 	p.mu.Lock()
 	p.restores = append(p.restores, PooledLaunch{req.TenantID, id})
 	p.mu.Unlock()
+	p.parkLaunch()
 	return p.adapt(controller, pooledTailKey{req.TenantID, req.SessionID}, req.WorkspaceRoot), nil
 }
 
