@@ -4,7 +4,6 @@ package tests
 
 import (
 	"net/http"
-	"os"
 	"testing"
 	"time"
 
@@ -31,12 +30,8 @@ import (
 // lives, and its commands never settle -- the stress's C1 failure, with its
 // interrupt left applying and every input behind it pending.
 //
-// It is gated by LOOPRIG_REPRO_ATTACH_DRAIN=1 while the defect is open; it
-// fails on host v0.13.0.
+// It failed on host v0.13.0 through v0.15.0; host v0.15.1 fixes it.
 func TestAnAttachInFlightWhenAHostStopsIsReleasedByTheStop(t *testing.T) {
-	if os.Getenv("LOOPRIG_REPRO_ATTACH_DRAIN") != "1" {
-		t.Skip("reproduces an open host defect; set LOOPRIG_REPRO_ATTACH_DRAIN=1")
-	}
 	ctx := placementContext(t)
 	tenant := orchestrationtest.PooledTenantA
 	const (
