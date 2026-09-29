@@ -280,18 +280,23 @@ func hostLinkSessionFrames(t *testing.T, tap *orchestrationtest.HostLinkTap) [][
 			if !message.FromHost {
 				continue
 			}
-			var push struct {
-				Push struct {
-					Pub struct {
-						Data json.RawMessage `json:"data"`
-					} `json:"pub"`
-				} `json:"push"`
-			}
-			if json.Unmarshal(message.Payload, &push) != nil || len(push.Push.Pub.Data) == 0 {
-				continue
-			}
-			if _, err := sessionwire.SessionRecordTypeOf(push.Push.Pub.Data); err == nil {
-				frames = append(frames, push.Push.Pub.Data)
+			// Centrifuge batches several replies into one WebSocket message,
+			// newline-separated; reading only whole messages missed every
+			// publication that shared one with another.
+			for _, line := range bytes.Split(message.Payload, []byte("\n")) {
+				var push struct {
+					Push struct {
+						Pub struct {
+							Data json.RawMessage `json:"data"`
+						} `json:"pub"`
+					} `json:"push"`
+				}
+				if json.Unmarshal(bytes.TrimSpace(line), &push) != nil || len(push.Push.Pub.Data) == 0 {
+					continue
+				}
+				if _, err := sessionwire.SessionRecordTypeOf(push.Push.Pub.Data); err == nil {
+					frames = append(frames, push.Push.Pub.Data)
+				}
 			}
 		}
 	}
