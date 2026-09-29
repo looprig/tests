@@ -9,27 +9,27 @@ require (
 	github.com/centrifugal/centrifuge v0.38.0
 	github.com/centrifugal/centrifuge-go v0.12.0
 	github.com/jackc/pgx/v5 v5.10.0
-	github.com/looprig/classifiers v0.2.2
+	github.com/looprig/classifiers v0.2.3
 	github.com/looprig/controller v0.2.1
-	github.com/looprig/core v0.12.0
+	github.com/looprig/core v0.13.1
 	github.com/looprig/credentials v0.2.1
-	github.com/looprig/eval v0.2.2
-	github.com/looprig/factory v0.13.0
-	github.com/looprig/foreignloops v0.3.3
+	github.com/looprig/eval v0.2.3
+	github.com/looprig/factory v0.15.0
+	github.com/looprig/foreignloops v0.3.4
 	github.com/looprig/fsstore v0.6.0
-	github.com/looprig/harness v0.41.1
-	github.com/looprig/host v0.13.0
-	github.com/looprig/inference v0.14.0
-	github.com/looprig/llm v0.15.0
-	github.com/looprig/mcp v0.7.2
-	github.com/looprig/natsstore v0.5.3
+	github.com/looprig/harness v0.42.0
+	github.com/looprig/host v0.15.0
+	github.com/looprig/inference v0.14.1
+	github.com/looprig/llm v0.15.1
+	github.com/looprig/mcp v0.7.3
+	github.com/looprig/natsstore v0.5.4
 	github.com/looprig/pgstore v0.2.1
 	github.com/looprig/s3store v0.2.1
-	github.com/looprig/sandbox v0.9.1
+	github.com/looprig/sandbox v0.9.2
 	github.com/looprig/secrets v0.2.2
 	github.com/looprig/sessionstore v0.14.0
-	github.com/looprig/storage v0.7.0
-	github.com/looprig/tools v0.14.1
+	github.com/looprig/storage v0.8.0
+	github.com/looprig/tools v0.15.0
 	github.com/nats-io/nats-server/v2 v2.14.5
 	k8s.io/client-go v0.37.0
 )
@@ -169,7 +169,7 @@ require (
 	google.golang.org/api v0.292.0 // indirect
 	google.golang.org/genai v1.67.0 // indirect
 	google.golang.org/genproto/googleapis/rpc v0.0.0-20260810153831-ec0a7760b754 // indirect
-	google.golang.org/grpc v1.83.0 // indirect
+	google.golang.org/grpc v1.83.2 // indirect
 	google.golang.org/protobuf v1.36.12 // indirect
 	gopkg.in/evanphx/json-patch.v4 v4.13.0 // indirect
 	gopkg.in/inf.v0 v0.9.1 // indirect
