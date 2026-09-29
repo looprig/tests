@@ -132,7 +132,8 @@ type stressConfig struct {
 //	LOOPRIG_STRESS_HOSTS      pooled Hosts (default 2, minimum 2)
 //	LOOPRIG_STRESS_REPLICAS   live Factory replicas (default 2, minimum 2)
 //	LOOPRIG_STRESS_OPS        operations per session after its create (default 12)
-//	LOOPRIG_STRESS_LOGDIR     write each Factory replica's JSON log here
+//	LOOPRIG_STRESS_LOGDIR     write each Factory replica's JSON log, and every
+//	                          Host's (hosts.jsonl), here
 //	LOOPRIG_STRESS_VIEWERS    viewers per session (default 2)
 //	LOOPRIG_STRESS_SETTLE     bound on the final settle (default 3m)
 func stressConfigFromEnv(t *testing.T) stressConfig {
@@ -366,7 +367,16 @@ func TestFactoryHostRaceStress(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 12*time.Minute)
 	defer cancel()
 
-	world := orchestrationtest.NewPooledWorld(t, ctx, orchestrationtest.PooledWorldOptions{WithAskTool: true})
+	worldOptions := orchestrationtest.PooledWorldOptions{WithAskTool: true}
+	if dir := os.Getenv("LOOPRIG_STRESS_LOGDIR"); dir != "" {
+		file, err := os.Create(dir + "/hosts.jsonl")
+		if err != nil {
+			t.Fatalf("opening the Hosts' log: %v", err)
+		}
+		t.Cleanup(func() { _ = file.Close() })
+		worldOptions.HostLogs = &lockedWriter{w: file}
+	}
+	world := orchestrationtest.NewPooledWorld(t, ctx, worldOptions)
 	world.AskTool.Question = "orchestrationtest stress: answer me"
 	world.LLM.Respond(stressRespond)
 
@@ -522,6 +532,19 @@ func (s *stress) startReplica() *stressReplica {
 	}
 	f := orchestrationtest.StartPooledFactoryWith(s.t, s.ctx, s.world, orchestrationtest.PooledFactoryConfig{Replica: name, Logs: logs})
 	return &stressReplica{name: name, f: f, dead: make(chan struct{})}
+}
+
+// lockedWriter serializes whole writes from the several Host loggers that
+// share one file, so JSON lines never interleave.
+type lockedWriter struct {
+	mu sync.Mutex
+	w  io.Writer
+}
+
+func (l *lockedWriter) Write(p []byte) (int, error) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.w.Write(p)
 }
 
 // ---- the model ---------------------------------------------------------------
@@ -1215,6 +1238,65 @@ func (s *stress) verifyHostsUnblocked() {
 
 // ---- the final phase -----------------------------------------------------------
 
+// stressReserve is the time the case keeps back, from whichever of the test
+// binary's deadline and the case's own context ends first, for what follows a
+// final-phase wait: the verification reads, shutdown and L1.
+const stressReserve = 90 * time.Second
+
+// progressWait bounds a final-phase wait by PROGRESS rather than by wall
+// clock, which is what makes it hold on a loaded machine without proving any
+// less.
+//
+// A wait fails when its condition has made NO progress for stall -- nothing
+// it is waiting on moved -- which is the observable definition of a wedge.
+// While the condition keeps moving (a command settles or changes state, a
+// viewer catches up), a slow machine is only slow, and the wait continues, up
+// to hard: the case's own bound less stressReserve, so a wait on a machine
+// too slow to finish still fails with its own diagnosis rather than the test
+// binary's panic.
+type progressWait struct {
+	stall    time.Duration
+	hard     time.Time
+	start    time.Time
+	moved    time.Time
+	progress string
+}
+
+func (s *stress) newProgressWait(stall time.Duration) *progressWait {
+	now := time.Now()
+	hard, _ := s.ctx.Deadline()
+	if d, ok := s.t.Deadline(); ok && d.Before(hard) {
+		hard = d
+	}
+	hard = hard.Add(-stressReserve)
+	if hard.Before(now.Add(stall)) {
+		// Too little of the case is left to give the full stall window; spend
+		// what there is rather than overrunning the binary's deadline.
+		hard = now.Add(max(hard.Sub(now), 10*time.Second))
+	}
+	return &progressWait{stall: stall, hard: hard, start: now, moved: now}
+}
+
+// expired records progress -- the condition's observable state, as a string
+// that changes whenever anything waited on moves -- and reports whether the
+// wait is over: stalled for the whole window, or out of the case's time.
+func (w *progressWait) expired(progress string) bool {
+	now := time.Now()
+	if progress != w.progress {
+		w.progress, w.moved = progress, now
+	}
+	return now.Sub(w.moved) >= w.stall || now.After(w.hard)
+}
+
+// why says which bound ended a wait, for its failure message.
+func (w *progressWait) why() string {
+	now := time.Now()
+	if now.Sub(w.moved) >= w.stall {
+		return fmt.Sprintf("with no progress for %s (%s after the wait began)", w.stall, now.Sub(w.start).Round(time.Second))
+	}
+	return fmt.Sprintf("while still progressing, when the case's time ran out %s after the wait began", now.Sub(w.start).Round(time.Second))
+}
+
 func (s *stress) awaitFinalViewers() {
 	if s.cfg.viewersPerSession == 0 {
 		return
@@ -1293,6 +1375,14 @@ func (s *stress) flush() {
 }
 
 // awaitSettled is C1: every acknowledged command reaches a terminal state.
+//
+// The bound stays a wall-clock one ON PURPOSE. Every C1 failure examined on a
+// loaded machine was a session WEDGED, not a slow one: an attach that
+// completes while its Host is draining is released by no one, and its runtime
+// keeps the session's journal lease, so every successor is refused at hydrate
+// and the session's commands stay pending or applying forever. Load only makes
+// that interleaving likelier. TestAnAttachInFlightWhenAHostStopsIsReleasedByTheStop
+// reduces it; diagnoseUnsettled prints the state that identifies it.
 func (s *stress) awaitSettled() {
 	start := time.Now()
 	deadline := start.Add(s.cfg.settle)
@@ -1316,9 +1406,48 @@ func (s *stress) awaitSettled() {
 		if time.Now().After(deadline) {
 			sort.Strings(open)
 			s.t.Errorf("C1: %d acknowledged commands never reached a terminal state within %s: %v", len(open), s.cfg.settle, open)
+			s.diagnoseUnsettled()
 			return
 		}
 		time.Sleep(250 * time.Millisecond)
+	}
+}
+
+// diagnoseUnsettled logs, for every session holding an acknowledged command
+// that is not terminal, the durable state placement decides from: the catalog
+// record, the Host registration, the reconciliation claim, whether anything
+// still holds the runtime journal lease, and each open command's record. It is
+// evidence for a failure, never a judgement.
+func (s *stress) diagnoseUnsettled() {
+	for _, session := range s.sessions {
+		var open []*stressCommand
+		for _, c := range session.snapshot() {
+			if !c.acknowledged() {
+				continue
+			}
+			state := s.world.CommandState(s.ctx, c.tenant, c.session, c.id)
+			if state != sessionstore.InboxStateApplied && state != sessionstore.InboxStateRejected {
+				open = append(open, c)
+			}
+		}
+		if len(open) == 0 {
+			continue
+		}
+		catalog, catalogErr := s.world.Store.GetCatalogEntry(s.ctx, sessionstore.GetCatalogEntryRequest{TenantID: session.tenant, SessionID: session.id})
+		registration, registrationErr := s.world.Store.GetHostRegistration(s.ctx, sessionstore.GetHostRegistrationRequest{TenantID: session.tenant, SessionID: session.id})
+		claim, claimErr := s.world.Store.GetReconciliationClaim(s.ctx, sessionstore.GetReconciliationClaimRequest{TenantID: session.tenant, SessionID: session.id})
+		// The probe briefly takes the lease; at a failure the case is over,
+		// and a held lease is exactly what identifies the known wedge.
+		leaseHeld, leaseEpoch := s.world.JournalLeaseHeld(s.t, s.ctx, session.tenant, s.world.RuntimeSessionID(s.t, s.ctx, session.tenant, session.id))
+		s.t.Logf("C1 diagnostic %s/%s:\n  catalog=%+v err=%v\n  registration=%+v err=%v\n  claim=%+v err=%v\n  runtime journal lease held=%t epoch=%d",
+			session.tenant, session.id, catalog, catalogErr, registration, registrationErr, claim, claimErr, leaseHeld, leaseEpoch)
+		for _, c := range open {
+			entry, err := s.world.Store.GetDispositionCommand(s.ctx, sessionstore.GetDispositionCommandRequest{TenantID: c.tenant, SessionID: c.session, CommandID: c.id})
+			c.mu.Lock()
+			acks := append([]stressAck(nil), c.acks...)
+			c.mu.Unlock()
+			s.t.Logf("C1 diagnostic   %s acks=%+v record=%+v err=%v", c.id, acks, entry, err)
+		}
 	}
 }
 
@@ -1682,38 +1811,56 @@ func (s *stress) verifyViewers() {
 	}
 
 	// V3: once repaired, every final viewer is covered through its session's
-	// committed tip as it stood when the fleet went quiet -- except for ONE
-	// record under a condition: a SessionResidencyReleased that is the
-	// journal's last event, of which the viewer was told by a tip hint. See
-	// observeTrailing.
+	// committed tip -- except for ONE record under a condition: a
+	// SessionResidencyReleased that is the journal's last event, of which the
+	// viewer was told by a tip hint. See observeTrailing.
+	//
+	// THE TIPS ARE RE-READ ON EVERY PASS, and the trailing condition is waited
+	// on rather than sampled, because both move after the fleet goes quiet: a
+	// Host warm-releases an idle session warmTTL after its last command, which
+	// appends the release, and Factory tells a viewer of it only on its next
+	// ownership poll -- the held route's refresh notices the owner is gone and
+	// the unbound poll then publishes the journal_tip hint. On a loaded machine
+	// that poll lands after a single read of the viewers, which failed V3 while
+	// the hint was still on its way. Waiting cannot pass a viewer that is never
+	// told: it stays one short with no hint, the state stops moving, and the
+	// wait fails on progressWait's stall.
 	final := s.finalEpochs()
-	// The target is the RUNTIME JOURNAL's last public position, read through
-	// the same resolver read Factory uses -- not the highest position the
-	// Hosts relayed, which a record committed after the tail stopped (the
-	// trailing release) sits above. before is the public position in front of
-	// the last one: where a viewer one release short stands.
-	targets := map[sessionwire.SessionID]uint64{}
-	before := map[sessionwire.SessionID]uint64{}
-	releasedLast := map[sessionwire.SessionID]bool{}
-	for _, session := range s.sessions {
-		session.mu.Lock()
-		created := session.created
-		session.mu.Unlock()
-		if !created {
-			continue
-		}
-		seqs := s.world.PublicJournalSeqs(s.t, s.ctx, session.tenant, session.id)
-		if n := len(seqs); n > 0 {
-			targets[session.id] = seqs[n-1]
-			if n > 1 {
-				before[session.id] = seqs[n-2]
+	wait := s.newProgressWait(60 * time.Second)
+	for {
+		// The target is the RUNTIME JOURNAL's last public position, read
+		// through the same resolver read Factory uses -- not the highest
+		// position the Hosts relayed, which a record committed after the tail
+		// stopped (the trailing release) sits above. before is the public
+		// position in front of the last one: where a viewer one release short
+		// stands. releasedLast is read BEFORE the positions: a release
+		// committing between the two reads then makes the target the release
+		// itself with releasedLast false, which is stricter, never laxer.
+		targets := map[sessionwire.SessionID]uint64{}
+		before := map[sessionwire.SessionID]uint64{}
+		releasedLast := map[sessionwire.SessionID]bool{}
+		released := 0
+		for _, session := range s.sessions {
+			session.mu.Lock()
+			created := session.created
+			session.mu.Unlock()
+			if !created {
+				continue
+			}
+			releasedLast[session.id] = s.lastEventIsRelease(session)
+			if releasedLast[session.id] {
+				released++
+			}
+			seqs := s.world.PublicJournalSeqs(s.t, s.ctx, session.tenant, session.id)
+			public[session.id] = seqs
+			if n := len(seqs); n > 0 {
+				targets[session.id] = seqs[n-1]
+				if n > 1 {
+					before[session.id] = seqs[n-2]
+				}
 			}
 		}
-		releasedLast[session.id] = s.lastEventIsRelease(session)
-	}
-	deadline := time.Now().Add(60 * time.Second)
-	for {
-		var behind []string
+		var behind, untold []string
 		var firstBehind *stressEpoch
 		trailing, hinted, repairedFromHint := 0, 0, 0
 		for _, epoch := range final {
@@ -1755,6 +1902,9 @@ func (s *stress) verifyViewers() {
 				trailing++
 				if stressHintedThrough(records) >= target {
 					hinted++
+				} else {
+					untold = append(untold, fmt.Sprintf("%s via %s covered %d, release at %d, hinted through %d",
+						epoch.session.id, epoch.replica.name, covered, target, stressHintedThrough(records)))
 				}
 			default:
 				if firstBehind == nil {
@@ -1763,12 +1913,15 @@ func (s *stress) verifyViewers() {
 				behind = append(behind, fmt.Sprintf("%s via %s covered %d < %d", epoch.session.id, epoch.replica.name, covered, target))
 			}
 		}
-		if len(behind) == 0 {
-			s.t.Logf("V3 %d final viewers are covered through their sessions' tips, including %d verified journal repairs prompted by hints; %d viewer connections checked in all", len(final), repairedFromHint, len(epochs))
+		if len(behind) == 0 && len(untold) == 0 {
+			s.t.Logf("V3 %d final viewers are covered through their sessions' tips, including %d verified journal repairs prompted by hints, %s after the fleet went quiet; %d of %d sessions end in their release; %d viewer connections checked in all",
+				len(final), repairedFromHint, time.Since(wait.start).Round(time.Millisecond), released, len(targets), len(epochs))
 			s.observeTrailing(trailing, hinted, len(final))
 			return
 		}
-		if time.Now().After(deadline) {
+		sort.Strings(behind)
+		sort.Strings(untold)
+		if wait.expired(strings.Join(behind, " ") + "|" + strings.Join(untold, " ")) {
 			if firstBehind != nil {
 				owner, found, err := firstBehind.replica.f.Directory.Owner(s.ctx, firstBehind.session.tenant, firstBehind.session.id)
 				records := firstBehind.viewer.Records()
@@ -1777,11 +1930,16 @@ func (s *stress) verifyViewers() {
 					firstBehind.session.id, firstBehind.replica.name, found, owner, err,
 					records[max(0, len(records)-24):], timeline[max(0, len(timeline)-24):])
 			}
-			sort.Strings(behind)
-			s.t.Errorf("V3: %d final viewers are not covered through their session's tip 60s after the fleet went quiet: %v", len(behind), behind)
+			if len(behind) != 0 {
+				s.t.Errorf("V3: %d final viewers are not covered through their session's tip, %s: %v", len(behind), wait.why(), behind)
+			}
+			s.observeTrailing(trailing, hinted, len(final))
+			if len(untold) != 0 {
+				s.t.Logf("V3 untold, %s: %v", wait.why(), untold)
+			}
 			return
 		}
-		time.Sleep(250 * time.Millisecond)
+		time.Sleep(time.Second)
 	}
 }
 
