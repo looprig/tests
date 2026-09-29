@@ -1273,14 +1273,23 @@ func (s *pooledSession) SubscribeCommitted(context.Context, sessionwire.EventID)
 // SubscribeLivePublic exposes the real Harness event stream to Host's opt-in
 // relay. The existing committed bridge remains the source for legacy worlds.
 func (s *pooledSession) SubscribeLivePublic(ctx context.Context) (<-chan department.LivePublication, error) {
-	return s.subscribeLivePublic(ctx, false)
+	return s.SubscribeLivePublicWith(ctx, department.LiveOptions{})
 }
 
 func (s *pooledSession) SubscribeLivePublicWithReasoning(ctx context.Context) (<-chan department.LivePublication, error) {
-	return s.subscribeLivePublic(ctx, true)
+	return s.SubscribeLivePublicWith(ctx, department.LiveOptions{IncludeReasoning: true})
 }
 
-func (s *pooledSession) subscribeLivePublic(ctx context.Context, includeReasoning bool) (<-chan department.LivePublication, error) {
+// SubscribeLivePublicWith is host v0.15.0's department.LiveOptionsSubscriber,
+// which Host prefers over the two methods above. It is the only way a tool
+// step reaches Host: without it Host logs "tool step previews unavailable"
+// and IncludeToolSteps streams nothing, however it is composed.
+//
+// A tool step is harness's OWN public projection of ToolCallStarted and
+// ToolCallCompleted -- the redacted audit summary and the capped result
+// preview. The raw arguments stream as ToolUseChunk deltas, which this pump
+// never forwards under any option.
+func (s *pooledSession) SubscribeLivePublicWith(ctx context.Context, options department.LiveOptions) (<-chan department.LivePublication, error) {
 	subscription, err := s.controller.SubscribeEvents(event.EventFilter{
 		Enduring: event.LoopScope{All: true}, Ephemeral: event.LoopScope{All: true},
 	})
@@ -1315,12 +1324,20 @@ func (s *pooledSession) subscribeLivePublic(ctx context.Context, includeReasonin
 					case *content.TextChunk:
 						visible = chunk != nil && chunk.Text != ""
 					case *content.ThinkingChunk:
-						visible = includeReasoning && chunk != nil && chunk.Thinking != ""
+						visible = options.IncludeReasoning && chunk != nil && chunk.Thinking != ""
 					}
 					if !visible {
 						continue
 					}
 					projected, err := harnesswire.Project(s.key.tenant, s.key.session, delta)
+					if err != nil || projected.Class != harnesswire.PublicEphemeral {
+						continue
+					}
+					publication.Ephemeral = &sessionwire.EphemeralPublication{
+						TenantID: s.key.tenant, SessionID: s.key.session, Body: projected.Body,
+					}
+				} else if step, ok := liveToolStep(delivery.Event, options); ok {
+					projected, err := harnesswire.Project(s.key.tenant, s.key.session, step)
 					if err != nil || projected.Class != harnesswire.PublicEphemeral {
 						continue
 					}
@@ -1339,6 +1356,21 @@ func (s *pooledSession) subscribeLivePublic(ctx context.Context, includeReasonin
 		}
 	}()
 	return out, nil
+}
+
+var _ department.LiveOptionsSubscriber = (*pooledSession)(nil)
+
+// liveToolStep admits a tool call's start or completion when the options ask
+// for tool steps, and nothing else.
+func liveToolStep(e event.Event, options department.LiveOptions) (event.Event, bool) {
+	if !options.IncludeToolSteps {
+		return nil, false
+	}
+	switch e.(type) {
+	case event.ToolCallStarted, event.ToolCallCompleted:
+		return e, true
+	}
+	return nil, false
 }
 
 // ApplyCommand satisfies department.CommandApplier, through HARNESS'S OWN
@@ -1760,6 +1792,8 @@ type PooledWorld struct {
 	hustles    []hustle.Definition
 	toolLimits loop.ToolLimits
 	liveText   *host.LiveTextOptions
+	// extraTools is PooledWorldOptions.Tools.
+	extraTools []tool.Definition
 	// spillBases are the capture spill bases every rig in this world was
 	// composed with. See spillBase.
 	spillMu    sync.Mutex
@@ -1840,6 +1874,9 @@ type PooledWorldOptions struct {
 	ToolLimits loop.ToolLimits
 	// Hustles are registered on every rig.
 	Hustles []hustle.Definition
+	// Tools are registered on every rig beside the kit's own, under the same
+	// allow-all access gate, so each must implement tool.CallPreparer.
+	Tools []tool.Definition
 }
 
 // NewPooledWorld opens the shared durable plane and one harness journal per
@@ -1877,6 +1914,7 @@ func NewPooledWorld(tb TB, ctx context.Context, options PooledWorldOptions) *Poo
 		presenter:       options.Presenter,
 		hustles:         append([]hustle.Definition(nil), options.Hustles...),
 		toolLimits:      options.ToolLimits,
+		extraTools:      append([]tool.Definition(nil), options.Tools...),
 	}
 	world.Tails.quiet = options.TailQuiet
 	if options.WithAskTool {
@@ -2008,6 +2046,7 @@ func (w *PooledWorld) defineRig(tb TB, tenant sessionwire.TenantID, journal *har
 	if w.workspaces != nil {
 		tools = append(tools, w.WorkspaceTools.definitions()...)
 	}
+	tools = append(tools, w.extraTools...)
 	if w.toolResults != nil {
 		tools = append(tools, w.toolResults.definitions()...)
 		loopOptions = append(loopOptions, loop.WithToolLimits(w.toolResults.limits()))
