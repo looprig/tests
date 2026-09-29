@@ -41,8 +41,8 @@ import (
 // still lacks is a DRAIN CALLER -- Factory has none and the D2.2 ruling puts it
 // in looprig/controller -- which is not a Host capability and is not pinned here.
 
-// HostLinkSurfaceAtV011 is the exact hostlink_methods set released host v0.11.0
-// advertises, spelled in Core's constants.
+// HostLinkSurfaceAtV014 is the exact hostlink_methods set released host v0.14.0
+// (unchanged through v0.15.0) advertises, spelled in Core's constants.
 //
 // The first six entries are the five RPC methods plus the gate-response
 // capability token. host v0.4.0
@@ -58,9 +58,16 @@ import (
 //
 // The seventh entry, hostlink.attribution.principal, arrived in host v0.11.0.
 // Factory v0.12.0 gates stamped placement and dispatch on this exact token.
-// Thus both added capabilities are backed by Factory gates, not inferred from
+//
+// The eighth, hostlink.payload.reference (core v0.13.0), arrived in host
+// v0.14.0: the Host applies a command whose private body is stored by
+// reference above SessionStore's 64 KiB inline bound, and it is advertised
+// only when the control SessionStore reader is wired (host.Compose always
+// does). factory v0.14.0 places or wakes a session holding a pending
+// referenced body only on a Host whose reply Supports it.
+// Thus every added capability is backed by a Factory gate, not inferred from
 // Host registration or silently accepted as an arbitrary change to the wire.
-func HostLinkSurfaceAtV011() []string {
+func HostLinkSurfaceAtV014() []string {
 	return []string{
 		sessionwire.HostLinkMethodBind,
 		sessionwire.HostLinkMethodUnbind,
@@ -69,6 +76,7 @@ func HostLinkSurfaceAtV011() []string {
 		sessionwire.HostLinkMethodDrainStatus,
 		sessionwire.HostLinkCapabilityGateResponse,
 		sessionwire.HostLinkCapabilityAttributionPrincipal,
+		sessionwire.HostLinkCapabilityPayloadReference,
 	}
 }
 

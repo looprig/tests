@@ -52,7 +52,8 @@
           "hostlink.drain",
           "hostlink.drain_status",
           "hostlink.command.gate_response",
-          "hostlink.attribution.principal"
+          "hostlink.attribution.principal",
+          "hostlink.payload.reference"
         ],
         "version": 1
       },
@@ -67,7 +68,8 @@
           "hostlink.drain",
           "hostlink.drain_status",
           "hostlink.command.gate_response",
-          "hostlink.attribution.principal"
+          "hostlink.attribution.principal",
+          "hostlink.payload.reference"
         ],
         "version": 1
       },
