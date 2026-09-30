@@ -608,7 +608,7 @@ func TestDrainingAPooledHostParkedAtAGateIsCrashEquivalentAndBounded(t *testing.
 		}
 	})
 
-	t.Run("case 4: the release is crash-equivalent -- residency freed, runtime parked on its journal lease", func(t *testing.T) {
+	t.Run("case 4: the release is crash-equivalent -- residency freed, runtime abandoned and its journal lease given back", func(t *testing.T) {
 		if world.ResidencyHeld(t, ctx, tenant, s) {
 			t.Fatal("after the drain the residency lease is still held; FinishRelease must release it even when the runtime refused")
 		}
@@ -625,23 +625,26 @@ func TestDrainingAPooledHostParkedAtAGateIsCrashEquivalentAndBounded(t *testing.
 		if held := drainee.Process().HeldLeases(orchestrationtest.PlaneStore); len(held) != 0 {
 			t.Fatalf("after the drain the Host process still holds residency leases %v", held)
 		}
-		// ...but the runtime keeps its harness journal lease until the
-		// process exits. ON THE STORE: a successor runtime's take of it,
-		// through harness's own AcquireLease, is refused.
-		if held, holder := world.JournalLeaseHeld(t, ctx, tenant, runtimeID); !held {
-			t.Fatal("after the drain the parked runtime's journal lease is free on the store; a crash-equivalent drain leaves it held until the process exits")
-		} else {
-			t.Logf("the parked runtime's journal lease is held on the store at epoch %d", holder)
+		// ...and, since host v0.17.0, the runtime is ABANDONED after its
+		// refused release: it stops and hands its harness journal lease back,
+		// so a successor in this very process could restore the session. Up
+		// to host v0.16.0 it stayed parked on that lease until the process
+		// exited. ON THE STORE, through harness's own AcquireLease:
+		if held, holder := world.JournalLeaseHeld(t, ctx, tenant, runtimeID); held {
+			t.Fatalf("after the drain the gated runtime's journal lease is still held at epoch %d; host v0.17.0 abandons it", holder)
 		}
-		// PARKED, NOT CANCELLED: the journal is exactly what it was at the
-		// gate -- no GateResolved{abandoned}, no TurnInterrupted, no
-		// SessionStopped and no SessionResidencyReleased -- and the tool is
-		// still waiting inside RequestUserInput.
+		if len(report.Abandoned) != 1 || report.Abandoned[0] != (host.DrainSession{TenantID: tenant, SessionID: s}) || len(report.Parked) != 0 {
+			t.Fatalf("the drain reported abandoned %+v and parked %+v, want exactly the gated session abandoned", report.Abandoned, report.Parked)
+		}
+		// CRASH-EQUIVALENT, NOT CANCELLED: the journal is exactly what it was
+		// at the gate -- no GateResolved{abandoned}, no TurnInterrupted, no
+		// SessionStopped and no SessionResidencyReleased -- and the tool never
+		// received an answer.
 		if after := orchestrationtest.JournalTrace(t, world, tenant, runtimeID); strings.Join(after, " ") != strings.Join(parkedJournal, " ") {
-			t.Fatalf("the drain wrote to the parked runtime's journal:\nbefore %v\nafter  %v", parkedJournal, after)
+			t.Fatalf("the drain wrote to the abandoned runtime's journal:\nbefore %v\nafter  %v", parkedJournal, after)
 		}
-		if answers, err := world.AskTool.Answers(), world.AskTool.LastErr(); len(answers) != 0 || err != nil {
-			t.Fatalf("the parked tool returned (answers %v, err %v); a crash-equivalent drain leaves it waiting", answers, err)
+		if answers := world.AskTool.Answers(); len(answers) != 0 {
+			t.Fatalf("the abandoned tool returned answers %v", answers)
 		}
 	})
 

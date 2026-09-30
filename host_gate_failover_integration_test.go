@@ -14,8 +14,9 @@ package tests
 //  1. the owner CRASHES with the gate open; a successor restores the session
 //     and the gate is still open and answerable there;
 //  2. that successor is DRAINED with the restored gate open. A restored gated
-//     runtime is not idle, so the drain is crash-equivalent (host v0.9.0) and
-//     the Host must exit after it;
+//     runtime is not idle, so the drain is crash-equivalent (host v0.9.0);
+//     since host v0.17.0 it abandons the runtime and frees its journal lease,
+//     so the Host need not exit;
 //  3. a third Host restores again, and the user's answer -- admitted only now
 //     -- settles applied and reaches the waiting tool, and the turn continues.
 
@@ -130,11 +131,17 @@ func TestAReplaySafeAskUserGateSurvivesACrashAndADrainAndTheAnswerReachesTheTool
 		if world.ResidencyHeld(t, ctx, tenant, s) {
 			t.Fatal("after the drain the residency lease is still held")
 		}
-		if held, _ := world.JournalLeaseHeld(t, ctx, tenant, runtimeID); !held {
-			t.Fatal("after the crash-equivalent drain the parked runtime's journal lease is free; it is held until the process exits")
+		// host v0.17.0 ABANDONS the refused runtime, which gives its journal
+		// lease back: the drained Host need not exit (up to v0.16.0 it had
+		// to, and this row asserted the lease still held until then). The
+		// third Host below restores in this same process, with the drained
+		// Host's corpse never killed.
+		if held, holder := world.JournalLeaseHeld(t, ctx, tenant, runtimeID); held {
+			t.Fatalf("after the drain the gated runtime's journal lease is still held at epoch %d", holder)
 		}
-		// host's obligation: a Host that drained with a gate open MUST exit.
-		second.Kill(t)
+		if len(report.Abandoned) != 1 || report.Abandoned[0].SessionID != s || len(report.Parked) != 0 {
+			t.Fatalf("the drain reported abandoned %+v and parked %+v, want the gated session abandoned", report.Abandoned, report.Parked)
+		}
 		noRestoreClosure("after the drain")
 	})
 
