@@ -166,6 +166,32 @@ func (f *ProcessFault) Call() *ProcessCall {
 	}
 }
 
+// injected reports whether an armed fault catches call, firing it if so. It
+// is enter's fault check alone, for calls that must not otherwise be gated.
+func (p *HostProcess) injected(call ProcessCall) bool {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	for _, fault := range p.faults {
+		select {
+		case <-fault.fired:
+			continue
+		default:
+		}
+		if fault.match(call) {
+			p.nextCall++
+			call.Seq, call.Done, call.Err = p.nextCall, true, ErrInjectedFault
+			fault.caught = call
+			if p.record {
+				recorded := call
+				p.calls = append(p.calls, &recorded)
+			}
+			close(fault.fired)
+			return true
+		}
+	}
+	return false
+}
+
 // Fail arms a fault. It fails the FIRST call that matches, from now on.
 func (p *HostProcess) Fail(name string, match func(ProcessCall) bool) *ProcessFault {
 	fault := &ProcessFault{Name: name, match: match, fired: make(chan struct{})}
@@ -424,7 +450,7 @@ func (l processLeaser) Acquire(ctx context.Context, name string) (storage.Lease,
 	if err != nil {
 		return nil, err
 	}
-	lease := &processLease{inner: inner, lost: make(chan struct{}), stop: make(chan struct{}), name: name, plane: l.plane}
+	lease := &processLease{inner: inner, lost: make(chan struct{}), stop: make(chan struct{}), name: name, plane: l.plane, process: l.process}
 	go lease.watch()
 	l.process.mu.Lock()
 	dead := l.process.dead
@@ -453,6 +479,10 @@ type processLease struct {
 	name     string
 	plane    string
 	released atomic.Bool
+
+	// process is consulted for an armed ProcessFault on the release, so a
+	// case can make a runtime's lease hand-back fail (see Release).
+	process *HostProcess
 }
 
 func (l *processLease) watch() {
@@ -472,7 +502,16 @@ func (l *processLease) watch() {
 func (l *processLease) Epoch() uint64         { return l.inner.Epoch() }
 func (l *processLease) Lost() <-chan struct{} { return l.lost }
 func (l *processLease) closeLost()            { l.once.Do(func() { close(l.lost) }) }
+
+// Release hands the grant back. An armed ProcessFault matching
+// {Plane, Op: "lease.release", Name} fails it WITHOUT reaching the provider,
+// so the grant stays held -- the shape of a provider outage during a
+// teardown. Only faults are consulted: a dead or paused process's release is
+// not otherwise changed.
 func (l *processLease) Release(ctx context.Context) error {
+	if l.process != nil && l.process.injected(ProcessCall{Plane: l.plane, Op: "lease.release", Name: l.name}) {
+		return ErrInjectedFault
+	}
 	err := l.inner.Release(ctx)
 	if err == nil {
 		l.released.Store(true)
