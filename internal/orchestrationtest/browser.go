@@ -167,6 +167,27 @@ func OpenPooledBrowser(tb TB, ctx context.Context, f *PooledFactory, tenant sess
 	return b
 }
 
+// RPC sends one ClientLink command RPC -- "session.create", "session.input",
+// "gate.respond", ... -- with request encoded as its data, the way a browser
+// sends a command without the HTTP API, and returns the reply's data. A
+// refusal comes back as the error centrifuge-go reports, carrying Factory's
+// code, so a case can assert on it.
+func (b *PooledBrowser) RPC(tb TB, ctx context.Context, method string, request any) ([]byte, error) {
+	tb.Helper()
+	data, err := json.Marshal(request)
+	if err != nil {
+		tb.Fatalf("orchestrationtest: encoding the %s request: %v", method, err)
+		return nil, err
+	}
+	callCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	defer cancel()
+	result, err := b.client.RPC(callCtx, method, data)
+	if err != nil {
+		return nil, err
+	}
+	return result.Data, nil
+}
+
 func (b *PooledBrowser) note(entry PooledBrowserEntry) {
 	b.mu.Lock()
 	defer b.mu.Unlock()

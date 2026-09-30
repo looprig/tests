@@ -95,6 +95,7 @@ type HostProcess struct {
 	resumed  chan struct{}
 	leases   []*processLease
 	holds    []*ProcessHold
+	faults   []*ProcessFault
 	record   bool
 	calls    []*ProcessCall
 	nextCall int
@@ -135,6 +136,43 @@ func (p *HostProcess) Hold(name string, match func(ProcessCall) bool) *ProcessHo
 	}
 	p.holds = append(p.holds, hold)
 	return hold
+}
+
+// ProcessFault fails the first call matching its predicate with an injected
+// storage error, WITHOUT the call reaching the store, and lets every other call
+// through. It is a one-shot outage of one write -- the shape that latches a
+// harness runtime's persistence fault -- in a process that is otherwise alive.
+type ProcessFault struct {
+	Name  string
+	match func(ProcessCall) bool
+
+	fired  chan struct{}
+	caught ProcessCall
+}
+
+// ErrInjectedFault is what a ProcessFault answers the call it catches.
+var ErrInjectedFault = errors.New("orchestrationtest: injected durable-plane fault")
+
+// Fired is closed once the fault has failed its call.
+func (f *ProcessFault) Fired() <-chan struct{} { return f.fired }
+
+// Call reports a copy of the failed call, nil until one is.
+func (f *ProcessFault) Call() *ProcessCall {
+	select {
+	case <-f.fired:
+		return &f.caught
+	default:
+		return nil
+	}
+}
+
+// Fail arms a fault. It fails the FIRST call that matches, from now on.
+func (p *HostProcess) Fail(name string, match func(ProcessCall) bool) *ProcessFault {
+	fault := &ProcessFault{Name: name, match: match, fired: make(chan struct{})}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.faults = append(p.faults, fault)
+	return fault
 }
 
 // Record starts recording every call the view forwards.
@@ -232,6 +270,25 @@ func (p *HostProcess) enter(ctx context.Context, call ProcessCall) (context.Cont
 		p.mu.Unlock()
 		return ctx, nil, ErrHostProcessDead
 	}
+	for _, fault := range p.faults {
+		select {
+		case <-fault.fired:
+			continue
+		default:
+		}
+		if fault.match(call) {
+			p.nextCall++
+			call.Seq, call.Done, call.Err = p.nextCall, true, ErrInjectedFault
+			fault.caught = call
+			if p.record {
+				recorded := call
+				p.calls = append(p.calls, &recorded)
+			}
+			close(fault.fired)
+			p.mu.Unlock()
+			return ctx, nil, ErrInjectedFault
+		}
+	}
 	var hold *ProcessHold
 	for _, candidate := range p.holds {
 		if candidate.call == nil && candidate.match(call) {
@@ -261,6 +318,17 @@ func (p *HostProcess) enter(ctx context.Context, call ProcessCall) (context.Cont
 		return ctx, recorded, nil
 	}
 	<-wait
+	// A process that DIED while this call waited never sent it: Kill releases
+	// every waiting call, and each fails here rather than reaching the store.
+	// (A stopped process that RESUMES is different -- its request is already on
+	// the wire -- and is delivered below.)
+	p.mu.Lock()
+	dead := p.dead
+	p.mu.Unlock()
+	if dead {
+		p.leave(recorded, ErrHostProcessDead)
+		return ctx, nil, ErrHostProcessDead
+	}
 	// A request already on the wire is delivered: the cancellation a stopped
 	// process accrued does not reach the store.
 	return context.WithoutCancel(ctx), recorded, nil
@@ -280,6 +348,13 @@ func (p *HostProcess) kill() int {
 	p.dead = true
 	leases := p.leases
 	p.leases = nil
+	// Every call a hold or a pause is keeping in flight fails now (see enter):
+	// a dead process's pending request never reaches the store, and its
+	// goroutine is not left blocked for the rest of the test binary.
+	if p.resumed != nil {
+		close(p.resumed)
+		p.resumed = nil
+	}
 	p.mu.Unlock()
 	for _, lease := range leases {
 		lease.lapse()

@@ -39,6 +39,7 @@ import (
 	"github.com/looprig/harness/pkg/tool"
 	"github.com/looprig/host"
 	"github.com/looprig/host/department"
+	"github.com/looprig/host/harnessruntime"
 	"github.com/looprig/inference"
 	"github.com/looprig/inference/model"
 	"github.com/looprig/inference/stream"
@@ -1154,6 +1155,80 @@ func (p *PooledRig) adapt(controller session.SessionController, key pooledTailKe
 	return adapted
 }
 
+// harnessRigs is this product's rigs as harnessruntime.Rigs, for a
+// PooledWorldOptions.HarnessRuntime world. Each launch resolves the tenant's
+// real rig through a pooledLauncher, which records the launch and keeps the
+// live controller for the kit's helpers exactly as adapt does -- but hands the
+// controller to harnessruntime, not to pooledSession, so what crosses the
+// department seam is the public adapter's.
+func (p *PooledRig) harnessRigs() harnessruntime.Rigs {
+	return harnessruntime.RigsFunc(
+		func(_ context.Context, request department.RigCreateRequest) (harnessruntime.Launcher, error) {
+			return p.launcher(request.TenantID, request.SessionID, request.WorkspaceRoot)
+		},
+		func(_ context.Context, _ uuid.UUID, request department.RigRestoreRequest) (harnessruntime.Launcher, error) {
+			return p.launcher(request.TenantID, request.SessionID, request.WorkspaceRoot)
+		},
+	)
+}
+
+func (p *PooledRig) launcher(tenant sessionwire.TenantID, s sessionwire.SessionID, workspaceRoot string) (harnessruntime.Launcher, error) {
+	target := p.rigs[tenant]
+	if target == nil {
+		return nil, &harnessruntime.UnknownTenantError{TenantID: tenant}
+	}
+	return &pooledLauncher{product: p, rig: target, key: pooledTailKey{tenant, s}, workspaceRoot: workspaceRoot}, nil
+}
+
+// pooledLauncher is one launch's harnessruntime.Launcher over a tenant's rig.
+type pooledLauncher struct {
+	product       *PooledRig
+	rig           *rig.Rig
+	key           pooledTailKey
+	workspaceRoot string
+}
+
+var _ harnessruntime.Launcher = (*pooledLauncher)(nil)
+
+func (l *pooledLauncher) NewSession(ctx context.Context, options ...rig.SessionOption) (session.SessionController, error) {
+	controller, err := l.rig.NewSession(ctx, options...)
+	if err != nil {
+		return nil, err
+	}
+	l.product.mu.Lock()
+	l.product.creates = append(l.product.creates, PooledLaunch{l.key.tenant, controller.SessionID()})
+	l.product.mu.Unlock()
+	l.product.parkLaunch()
+	l.observe(controller)
+	return controller, nil
+}
+
+func (l *pooledLauncher) RestoreSession(ctx context.Context, id uuid.UUID) (session.SessionController, error) {
+	controller, err := l.rig.RestoreSession(ctx, id)
+	if err != nil {
+		return nil, err
+	}
+	l.product.mu.Lock()
+	l.product.restores = append(l.product.restores, PooledLaunch{l.key.tenant, id})
+	l.product.mu.Unlock()
+	l.product.parkLaunch()
+	l.observe(controller)
+	return controller, nil
+}
+
+// observe keeps the launched controller for the kit's live-runtime helpers.
+// The pooledSession recorded here is NEVER handed to Host: it is only the
+// holder liveSession returns, and nothing reads its seam methods.
+func (l *pooledLauncher) observe(controller session.SessionController) {
+	l.product.tails.bindRuntime(l.key, sessionwire.SessionID(controller.SessionID().String()))
+	l.product.mu.Lock()
+	defer l.product.mu.Unlock()
+	if l.product.live != nil {
+		l.product.live[l.key] = &pooledSession{controller: controller, tails: l.product.tails, key: l.key, rig: l.product}
+	}
+	l.product.workspaceRoots = append(l.product.workspaceRoots, l.workspaceRoot)
+}
+
 // Creates and Restores report what this Host's rig launched, in order.
 func (p *PooledRig) Creates() []PooledLaunch {
 	p.mu.Lock()
@@ -1435,7 +1510,9 @@ func liveToolStep(e event.Event, options department.LiveOptions) (event.Event, b
 // the harness adapter's (host/internal/harnessadapter until host v0.16.0 made
 // it public as harnessruntime.WithBlockDecoder), and in the default world that
 // adapter is not what this kit runs. The kit IS the product: PooledRig is the
-// department.Rig, and this method is where the obligation actually lands.
+// department.Rig, and this method is where the obligation actually lands. (A
+// PooledWorldOptions.HarnessRuntime world runs harnessruntime instead, with its
+// default DecodeInputBlocks -- the same input-shaped body.)
 //
 // So it is met in substance rather than by name, and the substance is the part
 // that matters: the create path reads the input-shaped blocks, by decoding the
@@ -1801,9 +1878,13 @@ type PooledWorld struct {
 	// every Factory's journal resolver reads through (one per deployment).
 	publicJournals *host.PublicJournals
 
-	tenants  []sessionwire.TenantID
-	gated    bool
-	hostLogs io.Writer
+	tenants []sessionwire.TenantID
+	gated   bool
+	// harnessRuntime is PooledWorldOptions.HarnessRuntime.
+	harnessRuntime bool
+	// accessRoot is the shared WorkspaceAccess root, "" otherwise.
+	accessRoot string
+	hostLogs   io.Writer
 	// journalOptions are appended after the tenant to every harness journal
 	// Open, a Mortal Host's own included. See PooledWorldOptions.JournalOptions.
 	journalOptions []harnessstore.Option
@@ -1839,6 +1920,27 @@ type PooledWorld struct {
 
 // PooledWorldOptions chooses what a case's agent can do.
 type PooledWorldOptions struct {
+	// HarnessRuntime registers every Host's agent through host v0.16.0's
+	// PUBLIC adapter, harnessruntime.Target, instead of the kit's own
+	// pooledSession. It is what a harness-backed product composes, and it is
+	// the right choice for any lane that only needs a harness runtime rather
+	// than a probe on what crossed the department seam.
+	//
+	// What it gives up is exactly that probe: the committed stream Host reads
+	// is harnessruntime's, so PooledWorld.Tails sees no publication (Timeline,
+	// Committed and Tip stay empty) and PooledRig.RefuseCreates has no effect.
+	// Creates, Restores, HoldLaunches, WorkspaceRoots and every live-runtime
+	// helper (Submit, CheckpointWorkspace, RuntimeEnded, ...) keep working: the
+	// kit wraps the rig harnessruntime launches on. It cannot be combined with
+	// DurableTail, whose stream is the kit's product journal.
+	HarnessRuntime bool
+	// WorkspaceAccess gives the agent the standard WriteFile tool over one
+	// shared directory under harness v0.44.0's loop.WithWorkspaceAccess, with
+	// its default approver (the loop's durable permission gate) and its default
+	// per-session in-memory "always" rules. See workspaceaccess.go. It cannot
+	// be combined with WithWorkspace or ToolResults: a rig has one workspace
+	// placement.
+	WorkspaceAccess bool
 	// LiveText enables the Host's opt-in transient text relay. Nil preserves
 	// the released committed-only composition used by existing lanes.
 	LiveText *host.LiveTextOptions
@@ -1945,6 +2047,7 @@ func NewPooledWorld(tb TB, ctx context.Context, options PooledWorldOptions) *Poo
 		Tails:           NewPooledTails(),
 		tenants:         tenants,
 		gated:           options.WithAskTool,
+		harnessRuntime:  options.HarnessRuntime,
 		liveText:        options.LiveText,
 		hostLogs:        options.HostLogs,
 		journalOptions:  options.JournalOptions,
@@ -1997,6 +2100,17 @@ func NewPooledWorld(tb TB, ctx context.Context, options PooledWorldOptions) *Poo
 			tb.Errorf("orchestrationtest: closing the pooled store: %v", err)
 		}
 	})
+	if options.WorkspaceAccess {
+		if options.WithWorkspace || options.ToolResults != nil {
+			tb.Fatalf("orchestrationtest: WorkspaceAccess cannot be combined with WithWorkspace or ToolResults: a rig has one workspace placement")
+			return nil
+		}
+		world.accessRoot = openWorkspaceAccessRoot(tb)
+	}
+	if options.DurableTail && options.HarnessRuntime {
+		tb.Fatalf("orchestrationtest: DurableTail and HarnessRuntime cannot be combined: a DurableTail stream is the kit's product journal, which only the kit's own runtime writes")
+		return nil
+	}
 	if options.DurableTail && options.WithAskTool {
 		// A gate is projected only when the runtime's committed stream
 		// delivers, and a DurableTail world's stream is the product journal,
@@ -2090,7 +2204,9 @@ func (w *PooledWorld) defineRig(tb TB, tenant sessionwire.TenantID, journal *har
 	} else if w.toolLimits != (loop.ToolLimits{}) {
 		loopOptions = append(loopOptions, loop.WithToolLimits(w.toolLimits))
 	}
-	if len(tools) > 0 {
+	if w.accessRoot != "" {
+		loopOptions = append(loopOptions, w.workspaceAccessLoopOptions(tools)...)
+	} else if len(tools) > 0 {
 		loopOptions = append(loopOptions,
 			loop.WithTools(tools...),
 			loop.WithAccessGate(pooledAllowAll(tb)),
@@ -2111,6 +2227,9 @@ func (w *PooledWorld) defineRig(tb TB, tenant sessionwire.TenantID, journal *har
 	}
 	if w.workspaces != nil {
 		rigOptions = append(rigOptions, pooledWorkspaceOptions(tb, workspaceDurable, workspaceBase, tenant)...)
+	}
+	if w.accessRoot != "" {
+		rigOptions = append(rigOptions, w.workspaceAccessRigOptions(tb, tenant)...)
 	}
 	if w.toolResults != nil {
 		// The SAME store the rig journals into: a capture lives beside the
@@ -2461,7 +2580,7 @@ func (world *PooledWorld) hostComposition(tb TB, id sessionwire.HostID, generati
 			Backend:       backend,
 			JournalStores: journals,
 			Registrar: host.RegistrarFunc(func(context.Context) ([]department.Registration, error) {
-				target, err := department.NewRigTarget(product, PooledCompatibility, PooledCapabilities())
+				target, err := world.pooledTarget(product)
 				if err != nil {
 					return nil, err
 				}
@@ -2477,6 +2596,27 @@ func (world *PooledWorld) hostComposition(tb TB, id sessionwire.HostID, generati
 		},
 	}
 	return blueprint, product, process
+}
+
+// pooledTarget is the launch target every Host of this world registers for
+// PooledAgent: harnessruntime.Target in a HarnessRuntime world, the kit's own
+// pooledSession adapter otherwise. Both declare Recovery (PooledCapabilities),
+// which host v0.16.0's default RuntimeProfileDurable requires.
+func (world *PooledWorld) pooledTarget(product *PooledRig) (department.LaunchTarget, error) {
+	if world.harnessRuntime {
+		return harnessruntime.Target(product.harnessRigs(), PooledCompatibility, PooledCapabilities())
+	}
+	return department.NewRigTarget(product, PooledCompatibility, PooledCapabilities())
+}
+
+// PooledHostComposition is the composition StartPooledHost serves, returned
+// instead of started, so a case can change it -- its Registrar, its
+// RuntimeProfile -- and hand it to host.Compose itself. base is only
+// advertised; nothing listens on it.
+func PooledHostComposition(tb TB, world *PooledWorld, id sessionwire.HostID, generation uint64, base sessionwire.InternalEndpoint) (host.Composition, *PooledRig) {
+	tb.Helper()
+	blueprint, product, _ := world.hostComposition(tb, id, generation, "", base, PooledHostConfig{})
+	return blueprint, product
 }
 
 // Stop drains this Host and closes its listener. It is idempotent.
