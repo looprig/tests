@@ -42,7 +42,7 @@ import (
 // in looprig/controller -- which is not a Host capability and is not pinned here.
 
 // HostLinkSurfaceAtV014 is the exact hostlink_methods set released host v0.14.0
-// (unchanged through v0.15.0) advertises, spelled in Core's constants.
+// (unchanged through v0.16.0) advertises, spelled in Core's constants.
 //
 // The first six entries are the five RPC methods plus the gate-response
 // capability token. host v0.4.0

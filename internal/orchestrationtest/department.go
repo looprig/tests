@@ -245,6 +245,24 @@ func KitCapabilities() department.Capabilities {
 	}
 }
 
+// PooledCapabilities is KitCapabilities plus both recovery capabilities, which
+// host v0.16.0's default RuntimeProfileDurable requires of every registered
+// target.
+//
+// It is declared ONLY for targets whose runtimes are real harness sessions --
+// the pooled world's pooledSession and harnessruntime.Target -- because those
+// implement department.AttemptCloser and department.PersistenceFaults for real
+// (pooledSession reports it through AttemptCloserAvailable and
+// PersistenceFaultsAvailable). A FakeRuntime implements neither, so a target
+// over one keeps KitCapabilities and its Host opts out with
+// host.RuntimeProfileBestEffort (see NewComposedHost); declaring Recovery over
+// it would be refused at the first launch.
+func PooledCapabilities() department.Capabilities {
+	capabilities := KitCapabilities()
+	capabilities.Recovery = department.Recovery{AttemptCloser: true, PersistenceFaults: true}
+	return capabilities
+}
+
 // NewDepartment builds a REAL *department.Department around one agent served
 // by rig. Only the Rig is a fake; NewRigTarget, the capability adapter and the
 // registry are the product's own code.

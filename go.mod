@@ -17,19 +17,19 @@ require (
 	github.com/looprig/factory v0.15.0
 	github.com/looprig/foreignloops v0.3.4
 	github.com/looprig/fsstore v0.6.0
-	github.com/looprig/harness v0.42.0
-	github.com/looprig/host v0.15.1
-	github.com/looprig/inference v0.14.1
+	github.com/looprig/harness v0.44.0
+	github.com/looprig/host v0.16.0
+	github.com/looprig/inference v0.15.0
 	github.com/looprig/llm v0.15.1
 	github.com/looprig/mcp v0.7.3
 	github.com/looprig/natsstore v0.5.4
 	github.com/looprig/pgstore v0.2.1
 	github.com/looprig/s3store v0.2.1
-	github.com/looprig/sandbox v0.9.2
+	github.com/looprig/sandbox v0.9.3
 	github.com/looprig/secrets v0.2.2
 	github.com/looprig/sessionstore v0.14.0
-	github.com/looprig/storage v0.8.0
-	github.com/looprig/tools v0.15.0
+	github.com/looprig/storage v0.9.0
+	github.com/looprig/tools v0.15.1
 	github.com/nats-io/nats-server/v2 v2.14.5
 	k8s.io/client-go v0.37.0
 )

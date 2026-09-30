@@ -131,7 +131,15 @@ func NewComposedHost(tb TB, ctx context.Context, store *StoreFixture, cfg Compos
 			ReconcileInterval: ComposedHostReconcileInterval,
 			ReconcileBatch:    32,
 		},
-		Generation:           cfg.Generation,
+		Generation: cfg.Generation,
+		// BEST EFFORT, EXPLICITLY. The runtime here is a FakeRuntime, which
+		// implements neither department.AttemptCloser nor
+		// department.PersistenceFaults, so its target declares no Recovery and
+		// host v0.16.0's default RuntimeProfileDurable refuses it at Compose.
+		// Declaring Recovery instead would be a lie department refuses at the
+		// first launch. Lanes that need a recoverable runtime use the pooled
+		// world, whose runtimes are real harness sessions.
+		RuntimeProfile:       host.RuntimeProfileBestEffort,
 		Link:                 host.LinkOptions{MaxBindingsPerLink: 4, MaxBindings: 8, MaxTenantLinks: 3},
 		Drain:                host.DrainOptions{Grace: 10 * time.Second, IdleBoundary: 2 * time.Second, PublishBound: 2 * time.Second},
 		CompatibilityTimeout: 5 * time.Second,

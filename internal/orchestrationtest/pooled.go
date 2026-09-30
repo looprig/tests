@@ -1187,8 +1187,9 @@ type pooledSession struct {
 
 // startBridge relays every committed public event the harness session
 // produces as the product's stream, under harness's own JournalSeq -- what
-// host's reference adapter (internal/harnessadapter) publishes, and a
-// position in the very journal Factory's resolver reads.
+// host's own adapter (harnessruntime; internal/harnessadapter before host
+// v0.16.0) publishes, and a position in the very journal Factory's resolver
+// reads.
 //
 // It is also what makes a GATE visible. Host's gate publisher folds the journal
 // only when the runtime's committed stream delivers, so without it a gate
@@ -1261,6 +1262,39 @@ func (s *pooledSession) AbandonResidency(ctx context.Context) error {
 }
 
 var _ department.PersistenceFaults = (*pooledSession)(nil)
+
+// AttemptCloserAvailable and PersistenceFaultsAvailable report whether the
+// harness session beneath can really honour the recovery methods above, which
+// pooledSession carries for EVERY session. host v0.16.0's department believes
+// these over the method set, so a pooled target that declares Recovery (see
+// PooledCapabilities) is refused at launch -- not at the first failover -- if
+// the session beneath has no closer or no fault channel. The rule is
+// harnessruntime's own: the closer is the runtime-command applier's, reached
+// through the two-result runtimecommand.Provider, and a nil fault channel
+// never fires.
+func (s *pooledSession) AttemptCloserAvailable() bool {
+	provider, ok := s.controller.(runtimecommand.Provider)
+	if !ok {
+		return false
+	}
+	applier, ok := provider.RuntimeCommands()
+	if !ok || applier == nil {
+		return false
+	}
+	_, ok = applier.(runtimecommand.AttemptCloser)
+	return ok
+}
+
+func (s *pooledSession) PersistenceFaultsAvailable() bool {
+	reporter, ok := s.controller.(session.PersistenceFaultReporter)
+	if !ok {
+		return false
+	}
+	if _, ok := s.controller.(session.ResidencyAbandoner); !ok {
+		return false
+	}
+	return reporter.PersistenceFaulted() != nil
+}
 
 func (s *pooledSession) LeaseEpoch() (uint64, bool) {
 	return s.controller.(session.LeaseEpochReporter).LeaseEpoch()
@@ -1398,10 +1432,10 @@ func liveToolStep(e event.Event, options department.LiveOptions) (event.Event, b
 //
 // host v0.5.0's consumer obligation says "a kit Host must bind a BlockDecoder,
 // and the create path assumes it reads the INPUT-SHAPED body". That option is
-// host/internal/harnessadapter's, and harnessadapter is HOST'S OWN reference
-// product adapter -- internal, and not what this kit runs. The kit IS the
-// product: PooledRig is the department.Rig, and this method is where the
-// obligation actually lands.
+// the harness adapter's (host/internal/harnessadapter until host v0.16.0 made
+// it public as harnessruntime.WithBlockDecoder), and in the default world that
+// adapter is not what this kit runs. The kit IS the product: PooledRig is the
+// department.Rig, and this method is where the obligation actually lands.
 //
 // So it is met in substance rather than by name, and the substance is the part
 // that matters: the create path reads the input-shaped blocks, by decoding the
@@ -1559,6 +1593,9 @@ func (s *pooledSession) CloseAttempt(
 	attempt string,
 	attemptJournalEpoch uint64,
 ) error {
+	if !s.AttemptCloserAvailable() {
+		return ErrRuntimeCannotClose
+	}
 	closer, ok := s.controller.(runtimecommand.AttemptCloser)
 	if !ok {
 		return ErrRuntimeCannotClose
@@ -2424,7 +2461,7 @@ func (world *PooledWorld) hostComposition(tb TB, id sessionwire.HostID, generati
 			Backend:       backend,
 			JournalStores: journals,
 			Registrar: host.RegistrarFunc(func(context.Context) ([]department.Registration, error) {
-				target, err := department.NewRigTarget(product, PooledCompatibility, KitCapabilities())
+				target, err := department.NewRigTarget(product, PooledCompatibility, PooledCapabilities())
 				if err != nil {
 					return nil, err
 				}
