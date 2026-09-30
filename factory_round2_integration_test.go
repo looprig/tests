@@ -35,7 +35,8 @@ func TestFactoryHostReasoningOnClientLink(t *testing.T) {
 			session := sessionwire.SessionID("reasoning-wire-" + name)
 			command := sessionwire.CommandID("reasoning-create-" + name)
 			world := orchestrationtest.NewPooledWorld(t, ctx, orchestrationtest.PooledWorldOptions{
-				Tenants: []sessionwire.TenantID{tenant}, LiveText: &host.LiveTextOptions{IncludeReasoning: include},
+				HarnessRuntime: true,
+				Tenants:        []sessionwire.TenantID{tenant}, LiveText: &host.LiveTextOptions{IncludeReasoning: include},
 			})
 			hold, textStart, textSecond, finish := make(chan struct{}), make(chan struct{}), make(chan struct{}), make(chan struct{})
 			world.LLM.Script(orchestrationtest.PooledTurn{Hold: hold, Chunks: []content.Chunk{
@@ -213,7 +214,7 @@ func TestFactoryPlacesColdAdmissionBeforeSweepRotation(t *testing.T) {
 	const tenant = orchestrationtest.PooledTenantA
 	const session = sessionwire.SessionID("fast-placement-11")
 	const command = sessionwire.CommandID("fast-placement-create")
-	world := orchestrationtest.NewPooledWorld(t, ctx, orchestrationtest.PooledWorldOptions{Tenants: []sessionwire.TenantID{tenant}})
+	world := orchestrationtest.NewPooledWorld(t, ctx, orchestrationtest.PooledWorldOptions{HarnessRuntime: true, Tenants: []sessionwire.TenantID{tenant}})
 	if got := world.Store.ControlShards(); got != sessionstore.DefaultControlShards {
 		t.Fatalf("control shards=%d, want %d", got, sessionstore.DefaultControlShards)
 	}
@@ -254,7 +255,7 @@ func TestFactoryEarlyViewerGetsFirstTurnLiveText(t *testing.T) {
 	}
 	const tenant = orchestrationtest.PooledTenantA
 	const session = sessionwire.SessionID("early-viewer-first-turn")
-	world := orchestrationtest.NewPooledWorld(t, ctx, orchestrationtest.PooledWorldOptions{Tenants: []sessionwire.TenantID{tenant}, LiveText: &host.LiveTextOptions{}})
+	world := orchestrationtest.NewPooledWorld(t, ctx, orchestrationtest.PooledWorldOptions{HarnessRuntime: true, Tenants: []sessionwire.TenantID{tenant}, LiveText: &host.LiveTextOptions{}})
 	hold, second, finish := make(chan struct{}), make(chan struct{}), make(chan struct{})
 	world.LLM.Script(orchestrationtest.PooledTurn{Hold: hold, Chunks: []content.Chunk{&content.TextChunk{Text: "early "}, &content.TextChunk{Text: "preview"}}, BeforeChunk: []<-chan struct{}{nil, second}, BeforeFinish: finish})
 	h := orchestrationtest.StartPooledHost(t, ctx, world, "early-viewer-host", 1)

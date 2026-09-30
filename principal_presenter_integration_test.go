@@ -78,7 +78,8 @@ func TestPrincipalMetadataAndPresenterAcrossFactoryHostHarness(t *testing.T) {
 	tenant := orchestrationtest.PooledTenantA
 	presenter := orchestrationtest.NewCountingPresenter()
 	world := orchestrationtest.NewPooledWorld(t, ctx, orchestrationtest.PooledWorldOptions{
-		Tenants: []sessionwire.TenantID{tenant}, WithAskTool: true, Presenter: presenter,
+		HarnessRuntime: true,
+		Tenants:        []sessionwire.TenantID{tenant}, WithAskTool: true, Presenter: presenter,
 	})
 	world.LLM.Respond(func(_ inference.Request) orchestrationtest.PooledTurn {
 		return orchestrationtest.PooledTurn{Text: "ok"}
@@ -342,7 +343,8 @@ func TestPresenterRenderingSurvivesRestoreFailoverAndRedelivery(t *testing.T) {
 		tenant := orchestrationtest.PooledTenantA
 		presenter := orchestrationtest.NewCountingPresenter()
 		world := orchestrationtest.NewPooledWorld(t, ctx, orchestrationtest.PooledWorldOptions{
-			Tenants: []sessionwire.TenantID{tenant}, Presenter: presenter,
+			HarnessRuntime: true,
+			Tenants:        []sessionwire.TenantID{tenant}, Presenter: presenter,
 		})
 		world.LLM.Respond(func(_ inference.Request) orchestrationtest.PooledTurn {
 			return orchestrationtest.PooledTurn{Text: "ok"}
@@ -408,7 +410,8 @@ func TestPresenterRenderingSurvivesRestoreFailoverAndRedelivery(t *testing.T) {
 		tenant := orchestrationtest.PooledTenantA
 		presenter := orchestrationtest.NewCountingPresenter()
 		world := orchestrationtest.NewPooledWorld(t, ctx, orchestrationtest.PooledWorldOptions{
-			Tenants: []sessionwire.TenantID{tenant}, Presenter: presenter,
+			HarnessRuntime: true,
+			Tenants:        []sessionwire.TenantID{tenant}, Presenter: presenter,
 		})
 		first := orchestrationtest.StartLifecycleHost(t, ctx, world, "i-present-fail-first", 1,
 			orchestrationtest.PooledHostConfig{Mortal: true})
@@ -532,7 +535,8 @@ func TestPresenterRenderingSurvivesRestoreFailoverAndRedelivery(t *testing.T) {
 		tenant := orchestrationtest.PooledTenantA
 		presenter := orchestrationtest.NewCountingPresenter()
 		world := orchestrationtest.NewPooledWorld(t, ctx, orchestrationtest.PooledWorldOptions{
-			Tenants: []sessionwire.TenantID{tenant}, Presenter: presenter,
+			HarnessRuntime: true,
+			Tenants:        []sessionwire.TenantID{tenant}, Presenter: presenter,
 		})
 		dropper := orchestrationtest.NewReplyDropper()
 		owner := orchestrationtest.StartPooledHostWith(t, ctx, world, "i-present-redeliver-host", 1, dropper.Wrap)

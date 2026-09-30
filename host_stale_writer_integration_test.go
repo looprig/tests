@@ -88,8 +88,9 @@ func TestAResumedStaleHostsWritesAreFencedByTheStores(t *testing.T) {
 		staleInput  = sessionwire.CommandID("stale-input")
 	)
 	world := orchestrationtest.NewPooledWorld(t, ctx, orchestrationtest.PooledWorldOptions{
-		Tenants:       []sessionwire.TenantID{tenant},
-		WithWorkspace: true,
+		HarnessRuntime: true,
+		Tenants:        []sessionwire.TenantID{tenant},
+		WithWorkspace:  true,
 	})
 	stale := orchestrationtest.StartLifecycleHost(t, ctx, world, "i21-stale-host", 4, orchestrationtest.PooledHostConfig{Mortal: true})
 	orchestrationtest.AwaitAdvertised(t, world, stale.ID)

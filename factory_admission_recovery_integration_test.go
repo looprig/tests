@@ -50,8 +50,9 @@ const admissionTenant = orchestrationtest.PooledTenantA
 func admissionWorld(t *testing.T, ctx context.Context, backend *storage.Composite) *orchestrationtest.PooledWorld {
 	t.Helper()
 	return orchestrationtest.NewPooledWorld(t, ctx, orchestrationtest.PooledWorldOptions{
-		Tenants: []sessionwire.TenantID{admissionTenant},
-		Backend: backend,
+		HarnessRuntime: true,
+		Tenants:        []sessionwire.TenantID{admissionTenant},
+		Backend:        backend,
 	})
 }
 

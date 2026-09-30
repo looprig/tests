@@ -208,7 +208,8 @@ func TestTheControllerDriverDrainsARealHostThroughTheDerivedAddress(t *testing.T
 		t.Run(name, func(t *testing.T) {
 			ctx := placementContext(t)
 			world := orchestrationtest.NewPooledWorld(t, ctx, orchestrationtest.PooledWorldOptions{
-				Tenants: []sessionwire.TenantID{tenant},
+				HarnessRuntime: true,
+				Tenants:        []sessionwire.TenantID{tenant},
 			})
 			const hostID = sessionwire.HostID("orchestrationtest-dedicated-host")
 			// The generation the workload was created for, which is both the

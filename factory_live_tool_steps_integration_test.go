@@ -383,7 +383,8 @@ func startLiveStepWorld(t *testing.T, ctx context.Context, name string, options 
 	t.Helper()
 	stepTool := newLiveStepTool()
 	world := orchestrationtest.NewPooledWorld(t, ctx, orchestrationtest.PooledWorldOptions{
-		Tenants: []sessionwire.TenantID{orchestrationtest.PooledTenantA}, LiveText: options,
+		HarnessRuntime: true,
+		Tenants:        []sessionwire.TenantID{orchestrationtest.PooledTenantA}, LiveText: options,
 		Tools:           []tool.Definition{stepTool.definition()},
 		JournalBackends: map[sessionwire.TenantID]*storage.Composite{orchestrationtest.PooledTenantA: slowJournalBackend()},
 	})

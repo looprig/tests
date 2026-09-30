@@ -70,8 +70,9 @@ const (
 func TestAnAgentsGateReachesFactoryAndItsAnswerSettlesApplied(t *testing.T) {
 	ctx := placementContext(t)
 	world := orchestrationtest.NewPooledWorld(t, ctx, orchestrationtest.PooledWorldOptions{
-		Tenants:     []sessionwire.TenantID{orchestrationtest.PooledTenantA},
-		WithAskTool: true,
+		HarnessRuntime: true,
+		Tenants:        []sessionwire.TenantID{orchestrationtest.PooledTenantA},
+		WithAskTool:    true,
 	})
 	world.AskTool.Question = gateQuestion
 	// Turn one calls the tool, which raises the gate and blocks inside it.
@@ -258,8 +259,9 @@ func TestAnAgentsGateReachesFactoryAndItsAnswerSettlesApplied(t *testing.T) {
 func TestAGateResponseToAHostWithoutTheCapabilityIsRefused(t *testing.T) {
 	ctx := placementContext(t)
 	world := orchestrationtest.NewPooledWorld(t, ctx, orchestrationtest.PooledWorldOptions{
-		Tenants:     []sessionwire.TenantID{orchestrationtest.PooledTenantA},
-		WithAskTool: true,
+		HarnessRuntime: true,
+		Tenants:        []sessionwire.TenantID{orchestrationtest.PooledTenantA},
+		WithAskTool:    true,
 	})
 	world.AskTool.Question = gateQuestion
 	world.LLM.Script(

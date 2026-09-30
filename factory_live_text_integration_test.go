@@ -36,7 +36,8 @@ func TestFactoryHostLiveText(t *testing.T) {
 				options = &host.LiveTextOptions{}
 			}
 			world := orchestrationtest.NewPooledWorld(t, ctx, orchestrationtest.PooledWorldOptions{
-				Tenants: []sessionwire.TenantID{orchestrationtest.PooledTenantA}, LiveText: options,
+				HarnessRuntime: true,
+				Tenants:        []sessionwire.TenantID{orchestrationtest.PooledTenantA}, LiveText: options,
 			})
 			hold, second, third, finish := make(chan struct{}), make(chan struct{}), make(chan struct{}), make(chan struct{})
 			const thinking = "PRIVATE_THINKING_SENTINEL"
@@ -411,8 +412,9 @@ func TestFactoryHostLiveTextSlowSubscriber(t *testing.T) {
 	const session = sessionwire.SessionID("live-text-slow-session")
 	const command = sessionwire.CommandID("live-text-slow-create")
 	world := orchestrationtest.NewPooledWorld(t, ctx, orchestrationtest.PooledWorldOptions{
-		Tenants:  []sessionwire.TenantID{tenant},
-		LiveText: &host.LiveTextOptions{RateBytesPerSecond: 1, BurstBytes: 4096},
+		HarnessRuntime: true,
+		Tenants:        []sessionwire.TenantID{tenant},
+		LiveText:       &host.LiveTextOptions{RateBytesPerSecond: 1, BurstBytes: 4096},
 	})
 	hold, first, rest := make(chan struct{}), make(chan struct{}), make(chan struct{})
 	chunks := make([]content.Chunk, 0, 1201)

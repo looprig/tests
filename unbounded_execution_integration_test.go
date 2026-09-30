@@ -23,7 +23,8 @@ func TestUnboundedOpaqueToolInputSurvivesRestore(t *testing.T) {
 	t.Cleanup(cancel)
 	tenant := orchestrationtest.PooledTenantA
 	world := orchestrationtest.NewPooledWorld(t, ctx, orchestrationtest.PooledWorldOptions{
-		Tenants: []sessionwire.TenantID{tenant}, WithWorkspace: true,
+		HarnessRuntime: true,
+		Tenants:        []sessionwire.TenantID{tenant}, WithWorkspace: true,
 	})
 	const duplicateInput = `{"path":"a.txt","path":"b.txt","content":"x"}`
 	world.LLM.Script(
@@ -108,7 +109,8 @@ func TestUnboundedToolLoopPassesTheFormerIterationCap(t *testing.T) {
 			t.Cleanup(cancel)
 			tenant := orchestrationtest.PooledTenantA
 			world := orchestrationtest.NewPooledWorld(t, ctx, orchestrationtest.PooledWorldOptions{
-				Tenants: []sessionwire.TenantID{tenant}, WithWorkspace: true, ToolLimits: row.limits,
+				HarnessRuntime: true,
+				Tenants:        []sessionwire.TenantID{tenant}, WithWorkspace: true, ToolLimits: row.limits,
 			})
 			turns := make([]orchestrationtest.PooledTurn, 0, 31)
 			for range 30 {
@@ -166,7 +168,8 @@ func TestUnboundedZeroTimeoutHustleRestores(t *testing.T) {
 	t.Cleanup(cancel)
 	tenant := orchestrationtest.PooledTenantA
 	world := orchestrationtest.NewPooledWorld(t, ctx, orchestrationtest.PooledWorldOptions{
-		Tenants: []sessionwire.TenantID{tenant}, WithWorkspace: true, Hustles: []hustle.Definition{definition},
+		HarnessRuntime: true,
+		Tenants:        []sessionwire.TenantID{tenant}, WithWorkspace: true, Hustles: []hustle.Definition{definition},
 	})
 	first := orchestrationtest.StartPooledHost(t, ctx, world, "i-zero-hustle-first", 1)
 	served := orchestrationtest.StartPooledFactory(t, ctx, world, "i-zero-hustle-factory", nil)
