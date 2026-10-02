@@ -1,2 +1,5 @@
 /vendor/
 /.kind-d31/
+
+# Git worktrees
+.worktrees/
