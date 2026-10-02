@@ -67,8 +67,8 @@
 //	    reaches first -- and repairs exactly; no other browser is closed;
 //	S6  no leak after shutdown: when the clients leave, the server returns to
 //	    its pre-client goroutine and FD baseline; when the fleet stops,
-//	    goroutines return to the case's baseline (the centrifuge eagle leak
-//	    accounted as in I3.1); the client process exits 0.
+//	    goroutines return to the case's baseline, with no upstream leak
+//	    allowance (as in I3.1); the client process exits 0.
 //
 // Every sample, checkpoint and percentile is written under LOOPRIG_SOAK_OUT
 // (resources_server.csv, resources_client.csv, checkpoints.csv, summary.json,
@@ -674,7 +674,7 @@ func TestFactoryHostClientLinkSoak5000(t *testing.T) {
 	world := orchestrationtest.NewPooledWorld(t, ctx, orchestrationtest.PooledWorldOptions{
 		DurableTail: true, TailPadBytes: cfg.pad, TailStampBodies: true, TailQuiet: true,
 	})
-	baseline, baselineEagles := runtime.NumGoroutine(), stressEagles()
+	baseline := runtime.NumGoroutine()
 
 	s := &soak{t: t, ctx: ctx, cfg: cfg, world: world, start: time.Now(), queue: 64}
 	// Capacity is just above an even split, so Factory's placement has to use
@@ -785,7 +785,7 @@ func TestFactoryHostClientLinkSoak5000(t *testing.T) {
 
 	// ---- S6: the fleet stops; goroutines return to the case's baseline -------
 	s.shutdown()
-	soakGoroutinesSettle(t, baseline, baselineEagles, s.started+cfg.hosts*2)
+	soakGoroutinesSettle(t, baseline)
 	t.Logf("I3.2 evidence written to %s", cfg.out)
 }
 
@@ -1427,23 +1427,23 @@ func (s *soak) shutdown() {
 	}
 }
 
-// soakGoroutinesSettle is I3.1's L1 with the same accounting for the
-// centrifuge eagle leak (see assertGoroutinesSettle).
-func soakGoroutinesSettle(t *testing.T, baseline, baselineEagles, nodes int) {
+// soakGoroutinesSettle is I3.1's L1 (see assertGoroutinesSettle): with
+// centrifuge v0.39.x no upstream leak is accounted for, so every goroutine
+// above the baseline counts.
+func soakGoroutinesSettle(t *testing.T, baseline int) {
 	const slack = 4
 	deadline := time.Now().Add(60 * time.Second)
 	for {
-		var dump strings.Builder
-		_ = pprof.Lookup("goroutine").WriteTo(&dump, 1)
-		eagles := stressGroupCount(dump.String(), stressEagleFrame) - baselineEagles
-		others := runtime.NumGoroutine() - eagles - baseline
-		if others <= slack && eagles <= nodes {
-			t.Logf("I3.2 S6 goroutines settled after shutdown: %d above the baseline of %d, plus %d unclosed centrifuge eagle aggregators (at most %d Nodes)", others, baseline, eagles, nodes)
+		others := runtime.NumGoroutine() - baseline
+		if others <= slack {
+			t.Logf("I3.2 S6 goroutines settled after shutdown: %d above the baseline of %d", others, baseline)
 			return
 		}
 		if time.Now().After(deadline) {
-			t.Errorf("S6: %d goroutines above the baseline of %d remain 60s after the fleet stopped, plus %d eagle aggregators for at most %d Nodes:\n%s",
-				others, baseline, eagles, nodes, stressLeakSummary(dump.String()))
+			var dump strings.Builder
+			_ = pprof.Lookup("goroutine").WriteTo(&dump, 1)
+			t.Errorf("S6: %d goroutines above the baseline of %d remain 60s after the fleet stopped:\n%s",
+				others, baseline, stressLeakSummary(dump.String()))
 			return
 		}
 		time.Sleep(200 * time.Millisecond)

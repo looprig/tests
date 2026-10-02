@@ -54,8 +54,6 @@
 //     places on nor relays from the successor until its 60s idle reaper runs
 //     (TestASessionIsRePlacedPromptlyOnAHostRestartedUnderItsHostID).
 //
-// L1 also accounts for one upstream leak rather than failing on it; see
-// assertGoroutinesSettle.
 //
 // # Reproducing a run
 //
@@ -383,7 +381,7 @@ func TestFactoryHostRaceStress(t *testing.T) {
 	// THE BASELINE is taken with the durable plane open and nothing serving,
 	// so what L1 compares is exactly what the Factories, Hosts, runtimes and
 	// clients started.
-	baseline, baselineEagles := runtime.NumGoroutine(), stressEagles()
+	baseline := runtime.NumGoroutine()
 
 	// Total capacity is three quarters of the sessions, so placement contends
 	// and warm release has to free room for the next command.
@@ -491,7 +489,7 @@ func TestFactoryHostRaceStress(t *testing.T) {
 	viewers.Wait()
 	s.shutdown()
 	s.logCounters()
-	s.assertGoroutinesSettle(baseline, baselineEagles)
+	s.assertGoroutinesSettle(baseline)
 }
 
 // ---- construction ------------------------------------------------------------
@@ -2041,68 +2039,33 @@ func (s *stress) logCounters() {
 // goroutines and connections a peer is still closing; a leak of one goroutine
 // per session or per connection is far above it.
 //
-// # The one leak it accounts for rather than fails on
+// # No upstream leak is accounted for any more
 //
-// centrifuge v0.38.0 starts an eagle metrics aggregator for EVERY Node
-// (node.go initMetrics: eagle.New, whose aggregate loop exits only on
-// Eagle.Close) and Node.Shutdown never closes it, so each Node leaks one
-// goroutine -- eagle.(*Eagle).aggregate, a 60s ticker loop -- for the life of
-// the process. Factory builds one Node per ClientLink server and Host one per
-// tenant HostLink server, so a case that starts and stops them leaks exactly
-// that many. They are counted separately, bounded by the Nodes this case could
-// have started, and reported; anything else above the baseline fails.
-func (s *stress) assertGoroutinesSettle(baseline, baselineEagles int) {
+// Up to centrifuge v0.38.0 every Node leaked its eagle metrics aggregator
+// (eagle.(*Eagle).aggregate, a 60s ticker loop) because Node.Shutdown never
+// closed it, and Factory builds one Node per ClientLink server and Host one per
+// tenant HostLink server, so this check used to count those goroutines
+// separately, bounded by the Nodes the case could have started. centrifuge
+// v0.39.0 closes the exporter in Shutdown, so the allowance is gone and an
+// aggregator that outlives its Node is now an ordinary leak that fails L1.
+func (s *stress) assertGoroutinesSettle(baseline int) {
 	const slack = 4
-	s.fleet.mu.RLock()
-	nodes := s.fleet.started + len(s.fleet.every)*2
-	s.fleet.mu.RUnlock()
 	deadline := time.Now().Add(30 * time.Second)
 	for {
-		var dump strings.Builder
-		_ = pprof.Lookup("goroutine").WriteTo(&dump, 1)
-		eagles := stressGroupCount(dump.String(), stressEagleFrame) - baselineEagles
-		others := runtime.NumGoroutine() - eagles - baseline
-		if others <= slack && eagles <= nodes {
-			s.t.Logf("L1 goroutines settled: %d above the baseline of %d, plus %d unclosed centrifuge eagle aggregators (this case started at most %d Nodes)",
-				others, baseline, eagles, nodes)
+		others := runtime.NumGoroutine() - baseline
+		if others <= slack {
+			s.t.Logf("L1 goroutines settled: %d above the baseline of %d", others, baseline)
 			return
 		}
 		if time.Now().After(deadline) {
-			s.t.Errorf("L1: %d goroutines above the baseline of %d remain 30s after every Factory, Host and viewer stopped, plus %d eagle aggregators for at most %d Nodes:\n%s",
-				others, baseline, eagles, nodes, stressLeakSummary(dump.String()))
+			var dump strings.Builder
+			_ = pprof.Lookup("goroutine").WriteTo(&dump, 1)
+			s.t.Errorf("L1: %d goroutines above the baseline of %d remain 30s after every Factory, Host and viewer stopped:\n%s",
+				others, baseline, stressLeakSummary(dump.String()))
 			return
 		}
 		time.Sleep(200 * time.Millisecond)
 	}
-}
-
-const stressEagleFrame = "github.com/FZambia/eagle.(*Eagle).aggregate"
-
-// stressEagles counts the unclosed eagle aggregators alive now -- earlier cases
-// in the same test binary leave theirs too.
-func stressEagles() int {
-	var dump strings.Builder
-	_ = pprof.Lookup("goroutine").WriteTo(&dump, 1)
-	return stressGroupCount(dump.String(), stressEagleFrame)
-}
-
-// stressGroupCount sums the goroutines of every profile group naming frame.
-func stressGroupCount(dump, frame string) int {
-	total := 0
-	for _, group := range strings.Split(dump, "\n\n") {
-		if !strings.Contains(group, frame) {
-			continue
-		}
-		count := 0
-		if _, err := fmt.Sscanf(strings.TrimPrefix(group, "goroutine profile: "), "%d @", &count); err != nil {
-			// The first group follows the "goroutine profile: total N" line.
-			if lines := strings.SplitN(group, "\n", 2); len(lines) == 2 {
-				_, _ = fmt.Sscanf(lines[1], "%d @", &count)
-			}
-		}
-		total += count
-	}
-	return total
 }
 
 // stressLeakSummary keeps every goroutine group but the test binary's own,

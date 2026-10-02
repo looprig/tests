@@ -171,7 +171,7 @@ func (w *tapWriter) Hijack() (net.Conn, *bufio.ReadWriter, error) {
 	// THE READWRITER IS REPLACED, NOT PASSED THROUGH, and that is load-bearing.
 	// The server's bufio.Reader reads the RAW connection, and centrifuge's
 	// upgrader reuses it as the connection's read buffer whenever it is large
-	// enough (centrifuge@v0.38.0/internal/websocket/server.go:262-264). Handing
+	// enough (centrifuge@v0.39.3/internal/websocket/server.go:262-264). Handing
 	// it back would route every client frame around this tap and leave the
 	// Factory-to-Host direction silently unobserved. Bytes the server had
 	// already buffered are the client's too: they are observed here and
